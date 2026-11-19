@@ -1,0 +1,13 @@
+/aggregation-platform-4/
+.local/
+.dotflow-exchange/
+node_modules/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.skillenv
+*.pem
+*.key
+.DS_Store

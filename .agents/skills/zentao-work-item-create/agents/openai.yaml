@@ -1,0 +1,3 @@
+interface:
+  display_name: "禅道建单与材料留痕"
+  short_description: "接收前由Codex按目录标识提交需求，管理材料附件和建单回执"

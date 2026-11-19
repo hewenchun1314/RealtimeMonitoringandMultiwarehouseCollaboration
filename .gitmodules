@@ -1,0 +1,4 @@
+[submodule "req-demo"]
+	path = req-demo
+	url = https://cnb.cool/tetlab/sdd/health-management-req
+	branch = welllog/dev

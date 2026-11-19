@@ -1,0 +1,111 @@
+{
+  "zentao": {
+    "base_url": "http://127.0.0.1:8088",
+    "credential_ref": "windows-dpapi:dotflow/zentao",
+    "project_name": "海能发地质工程一体化",
+    "assigned_to_accounts": ["DOt-hwc"],
+    "accepted_statuses": {
+      "story": ["reviewing", "active"],
+      "bug": []
+    }
+  },
+  "workspaces": {
+    "requirement": "../req-demo",
+    "frontend": "../aggregation-platform-4"
+  },
+  "monitor": {
+    "enabled": true,
+    "interval_minutes": 3
+  },
+  "runtime": {
+    "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
+    "require_unattended_approval": true
+  },
+  "development": {
+    "allowed_requirement_types": ["frontend_only"],
+    "max_concurrent_items": 1,
+    "max_retries_per_step": 3,
+    "frontend_bundle": {
+      "name": "micro-hnf-universal-subapp",
+      "applications": {
+        "aggregation-platform": {
+          "branch": "hnf-hangzhou-universal-subapp",
+          "repository": "."
+        },
+        "micro-data-pool": {
+          "branch": "hnf-hangzhou-universal-subapp",
+          "repository": "root/micro-data-pool"
+        },
+        "shell-hub": { "branch": "hnf", "repository": "root/shell-hub" },
+        "sso": {
+          "branch": "hnf-hangzhou-universal-subapp",
+          "repository": "root/sso"
+        },
+        "cooperation": { "branch": "hnf", "repository": "root/cooperation" },
+        "fracturing-design": {
+          "branch": "hnf-hangzhou",
+          "repository": "children/fracturing-design"
+        },
+        "micro-dp-load-page": {
+          "branch": "hnf-hangzhou-universal-subapp",
+          "repository": "children/micro-dp-load-page"
+        },
+        "micro-double-sweet-spot": {
+          "branch": "micro-dev",
+          "repository": "children/micro-double-sweet-spot"
+        },
+        "tet-smart-log": {
+          "branch": "hnf-hangzhou",
+          "repository": "children/tet-smart-log"
+        },
+        "micro-pure-model-page": {
+          "branch": "hnf-hangzhou-universal-subapp",
+          "repository": "children/micro-pure-model-page"
+        },
+        "llm-web": { "branch": "micro-dev", "repository": "children/llm-web" },
+        "SmartLogging-SPARK": {
+          "branch": "hnf-hangzhou-universal-subapp",
+          "repository": "children/smart-logging-spark"
+        },
+        "TetDMSWeb": {
+          "branch": "micro-dev-universal-subapp",
+          "repository": "children/dms-web"
+        },
+        "micro-drilling-track": {
+          "branch": "micro-dev",
+          "repository": "children/micro-drilling-track"
+        },
+        "digital-twin": {
+          "branch": "micro-dev",
+          "repository": "children/digital-twin"
+        }
+      }
+    },
+    "step_timeout_minutes": {
+      "material_check": 10,
+      "design": 45,
+      "plan": 45,
+      "branch_check": 15,
+      "coding": 120,
+      "unit_test": 45,
+      "code_review": 45,
+      "e2e": 90,
+      "integration": 45
+    }
+  },
+  "e2e": {
+    "workspace": "frontend",
+    "start_command": "npm run serve-shell-hub --gateway=http://10.10.4.140:31111/",
+    "ready_url": null,
+    "platform_entry_path": "/aggregation-platform/sso/home-page/platform",
+    "login": {
+      "path": "/aggregation-platform/sso/login",
+      "username": "hewenchun",
+      "credential_ref": "windows-dpapi:hnf-frontend/e2e"
+    },
+    "default_work_area": {
+      "id": "fa02e06b9cfb4b7a9b959b0a33cbf36c",
+      "name": "海能发陆上示范区工区"
+    }
+  }
+}

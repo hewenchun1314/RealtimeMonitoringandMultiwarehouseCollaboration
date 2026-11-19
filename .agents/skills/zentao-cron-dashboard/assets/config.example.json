@@ -1,0 +1,9 @@
+{
+  "_说明": "复制为 config.json 后填写。config.json 含明文密码，不要提交到版本库。",
+  "base_url": "http://zentao.example.com:8080",
+  "account": "your-account",
+  "password": "your-password",
+  "assignee": "your-account",
+  "api_version": "auto",
+  "categories": ["requirement", "story", "task", "bug"]
+}
