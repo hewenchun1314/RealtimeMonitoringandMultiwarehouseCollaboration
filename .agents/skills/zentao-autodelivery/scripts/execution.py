@@ -249,10 +249,12 @@ def attempt_finish(store, item, data, branches_verified=False):
     development = json.loads(item['config_snapshot'])['development']
     stages = workflow_stages(development)
     finished = outcome == 'success'
-    retry = (not finished and data.get('retryable', True)
-             and trial['retry_number'] < development['max_retries_per_step'])
     stage = item['stage']
     evidence = data.get('evidence')
+    missing_file = (item['kind'] == 'story' and stage == 'material_check' and outcome == 'failed'
+                    and isinstance(evidence, dict) and evidence.get('material_file_status') == 'missing')
+    retry = (not finished and not missing_file and data.get('retryable', True)
+             and trial['retry_number'] < development['max_retries_per_step'])
     if finished and stage == 'plan' and 'branch_check' in stages and not planned_applications(evidence):
         return message('applications_required')
     if finished and stage == 'branch_check':
@@ -261,10 +263,14 @@ def attempt_finish(store, item, data, branches_verified=False):
         if not branches_verified:
             return message('branch_worktree_unverified')
     number = stages.index(stage)
-    next_stage = stages[number + 1] if finished and number + 1 < len(stages) else None
+    next_stage = stages[number + 1] if not missing_file and number + 1 < len(stages) else None
     result = {'summary': summary, 'evidence': evidence, 'stop_evidence': data.get('stop_evidence'),
               'terminal_step': not retry, 'phase': phase, 'repair_phases': completed_phases,
               'repair_required': repair_required or phase != 'verify'}
+    if not finished and not retry:
+        result['completion'] = '待补材料' if missing_file else data.get('completion', '阻断')
+        if result['completion'] not in ('待补材料', '待验证', '阻断'):
+            raise ValueError('Invalid completion for a blocked step')
     store.conn.execute('UPDATE attempts SET ended_at=?,outcome=?,result=? WHERE attempt_id=?',
                        (store.time, outcome, encode(result), attempt_id))
 
@@ -284,10 +290,9 @@ def attempt_finish(store, item, data, branches_verified=False):
             disposition = 'next'
             store.update_item(item, stage=next_stage)
         else:
-            disposition = 'close' if finished else 'blocked'
-            conclusion = '已交付' if finished else data.get('completion', '阻断')
-            if conclusion not in ('已交付', '待补材料', '待验证', '阻断') or (not finished and conclusion == '已交付'):
-                raise ValueError('Invalid completion for a blocked step')
+            conclusion = next((step['completion'] for step in terminal_steps(store, item)
+                               if step['outcome'] == 'failed'), '已交付')
+            disposition = 'close' if conclusion == '已交付' else 'blocked'
             store.update_item(item, state='closing', conclusion=conclusion)
     return message('attempt_finished', attempt_id=attempt_id, step=stage, next_stage=next_stage, outcome=outcome,
                    attempts_used=trial['retry_number'] + 1, disposition=disposition, operation_id=operation_id)
@@ -297,7 +302,11 @@ def terminal_steps(store, item):
     rows = store.conn.execute('''SELECT * FROM attempts WHERE item_seq=? AND outcome IS NOT NULL
                                   ORDER BY run_round DESC, retry_number DESC''', (item['seq'],))
     results = {}
+    missing_material_closeout = (item['kind'] == 'story' and item['stage'] == 'material_check'
+                                 and item['conclusion'] == '待补材料')
     for row in rows:
+        if missing_material_closeout and row['run_round'] != item['run_round']:
+            continue
         if row['stage'] in results:
             continue
         detail = json.loads(row['result'])
@@ -306,9 +315,13 @@ def terminal_steps(store, item):
                                      'summary': detail['summary'], 'evidence': detail['evidence'],
                                      'started_at': row['started_at'], 'ended_at': row['ended_at'],
                                      'retries': row['retry_number']}
+            if row['outcome'] != 'success':
+                results[row['stage']]['completion'] = detail.get('completion', '阻断')
     steps = []
     skip_reason = ('因用户要求主动停跑而跳过' if item['conclusion'] == '主动停跑'
                    else f'因 {item["stage"]} 阻断跳过')
+    if missing_material_closeout:
+        skip_reason = '因需求评审确认缺少需求文件而跳过'
     development = json.loads(item['config_snapshot'])['development']
     for stage in workflow_stages(development):
         step = results.get(stage)
@@ -385,6 +398,8 @@ def recover(store, item, data):
     store.conn.execute('INSERT INTO recoveries(item_seq,recovery_id,evidence) VALUES(?,?,?)',
                        (item['seq'], recovery_id, evidence))
     state = 'queued' if item['eligible'] else 'ineligible'
-    store.update_item(item, state=state, conclusion=None, run_round=item['run_round'] + 1)
-    return message('recovered', item_state=state, stage=item['stage'], chat_id=item['chat_id'],
+    stage = next((step['stage'] for step in terminal_steps(store, item)
+                  if step['outcome'] == 'failed'), item['stage'])
+    store.update_item(item, state=state, stage=stage, conclusion=None, run_round=item['run_round'] + 1)
+    return message('recovered', item_state=state, stage=stage, chat_id=item['chat_id'],
                    run_round=item['run_round'] + 1)

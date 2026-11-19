@@ -318,18 +318,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(again['repository'], first['repository'])
         self.assertEqual(git('branch', '--show-current'), 'wrong')
 
-    def test_branch_blocker_records_skips_enqueues_writebacks_and_releases_queue(self):
+    def test_branch_blocker_advances_and_releases_queue_only_after_integration(self):
         context, attempt = self.start_branch_check(['Missing'])
         self.assertEqual(attempt['branch_targets'], {'Missing': None})
         inspect = self.record('branch_inspect', attempt_id=attempt['attempt_id'], **context)
         self.assertEqual(inspect['repositories']['Missing']['status'], 'mapping_missing')
         result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed', retryable=False,
                              summary='Missing target mapping for Missing', evidence={'application': 'Missing'}, **context)
-        self.assertEqual(result['disposition'], 'blocked')
+        self.assertEqual((result['disposition'], result['next_stage']), ('next', 'coding'))
+        self.assertEqual(self.record('complete', **context)['status'], 'stale_execution')
+        self.pass_steps(context, ('coding', 'unit_test', 'code_review', 'e2e', 'integration'))
         blockers = self.fixture / 'blockers.md'
         blockers.write_text('Missing target mapping for Missing', encoding='utf-8')
         final = self.record('complete', blockers_path=str(blockers), **context)
-        self.assertEqual([step['outcome'] for step in final['steps']], ['success'] * 3 + ['failed'] + ['skipped'] * 5)
+        self.assertEqual([step['outcome'] for step in final['steps']], ['success'] * 3 + ['failed'] + ['success'] * 5)
         next_item = self.reserve(3)
         self.assertEqual(next_item['status'], 'reserved')
         self.record('bind', item_id=3, request_id=next_item['request_id'],
@@ -353,10 +355,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(attempt['retry_number'], retry)
             finish = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
                                  summary='Temporary remote failure', **context)
-            self.assertEqual(finish['disposition'], 'retry' if retry < 3 else 'blocked')
+            self.assertEqual(finish['disposition'], 'retry' if retry < 3 else 'next')
             if retry < 3:
                 attempt = self.record('attempt_start', stage='branch_check', **context)
                 self.assertEqual(attempt['branch_targets']['Example']['branch'], 'release')
+        self.pass_steps(context, ('coding', 'unit_test', 'code_review', 'e2e', 'integration'))
         final = self.record('complete', blockers_path='blockers.md', **context)
         self.assertEqual(final['steps'][3]['retries'], 3)
         self.assertEqual(self.reserve(3)['status'], 'reserved')
@@ -404,6 +407,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.record('attempt_finish', phase='verify', outcome='success',
                                      **events)['next_stage'], 'integration')
 
+    def test_each_blocked_stage_reaches_the_next_and_keeps_its_own_outcome(self):
+        self.config['workspaces'] = {'frontend': 'fixture'}
+        self.config['development']['frontend_bundle'] = {'name': 'example', 'applications': {}}
+        self.config['development']['step_timeout_minutes']['branch_check'] = 15
+        context = self.start()
+        stages = ('material_check', 'design', 'plan', 'branch_check', 'coding', 'unit_test',
+                  'code_review', 'e2e', 'integration')
+        for index, stage in enumerate(stages):
+            with self.subTest(stage=stage):
+                trial = self.record('attempt_start', stage=stage, **context)
+                if stage == 'branch_check':
+                    self.assertEqual(trial['branch_targets'], {})
+                    empty = self.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='success',
+                                        summary='Empty targets', evidence={'repositories': {}}, **context)
+                    self.assertEqual(empty['status'], 'branch_evidence_required')
+                result = self.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='failed',
+                                     retryable=False, summary=f'Blocked at {stage}', **context)
+                self.assertEqual(result['next_stage'], stages[index + 1] if index + 1 < len(stages) else None)
+        final = self.record('complete', blockers_path='blockers.md', **context)
+        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual([step['summary'] for step in final['steps']], [f'Blocked at {s}' for s in stages])
+
     def test_e2e_environment_failure_retries_without_code_repair(self):
         context = self.start()
         self.pass_steps(context, ('material_check', 'design', 'plan', 'coding', 'unit_test', 'code_review'))
@@ -412,12 +437,30 @@ class WorkflowTests(unittest.TestCase):
                     summary='Login service offline', **context)
         self.assertEqual(self.record('attempt_start', stage='e2e', **context)['phase'], 'verify')
 
+    def test_exhausted_review_and_unavailable_e2e_still_reach_integration(self):
+        context = self.start()
+        self.pass_steps(context, ('material_check', 'design', 'plan', 'coding', 'unit_test'))
+        for index in range(4):
+            trial = self.record('attempt_start', stage='code_review', **context)
+            finished = self.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='failed',
+                                   summary='Unresolved review findings', **context)
+            self.assertEqual(finished['next_stage'], 'code_review' if index < 3 else 'e2e')
+        e2e = self.record('attempt_start', stage='e2e', **context)
+        finished = self.record('attempt_finish', attempt_id=e2e['attempt_id'], outcome='failed',
+                               retryable=False, completion='待验证', summary='Login unavailable', **context)
+        self.assertEqual(finished['next_stage'], 'integration')
+        self.pass_steps(context, ('integration',))
+        final = self.record('complete', blockers_path='blockers.md', **context)
+        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual([step['outcome'] for step in final['steps'][-3:]], ['failed', 'failed', 'success'])
+
     def test_recovery_keeps_unresolved_repair_requirement_in_the_original_chat(self):
         context = self.start()
         self.pass_steps(context, ('material_check', 'design', 'plan', 'coding', 'unit_test'))
         attempt = self.record('attempt_start', stage='code_review', **context)
         self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed', retryable=False,
                     summary='Repair environment unavailable', repair_required=True, **context)
+        self.pass_steps(context, ('e2e', 'integration'))
         self.record('complete', **context, blockers_path='blockers.md')
         self.record('recover', recovery_id='env-restored', evidence={'healthcheck': 'passed'})
         renewed = self.reserve(2)
@@ -452,17 +495,47 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM writebacks').fetchone()[0], 9)
         self.assertEqual(self.reserve(3)['status'], 'reserved')
 
-    def test_blocked_closeout_releases_slot_before_attachment_or_shared_location(self):
+    def test_missing_requirement_file_closes_immediately_and_releases_slot(self):
         context = self.start()
         trial = self.record('attempt_start', stage='material_check', **context)
-        self.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='failed', retryable=False,
-                    summary='Missing intent.md', completion='待补材料', **context)
+        finish = self.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='failed',
+                             summary='Missing intent.md', evidence={'material_file_status': 'missing'}, **context)
+        self.assertEqual((finish['disposition'], finish['next_stage']), ('blocked', None))
         result = self.record('complete', **context, blockers_path='blockers.md')
         self.assertEqual(result['conclusion'], '待补材料')
+        self.assertEqual([step['outcome'] for step in result['steps']], ['failed'] + ['skipped'] * 7)
         self.assertIsNotNone(result['attachment_id'])
         self.assertEqual(self.reserve(3)['status'], 'reserved')
 
-    def test_timeout_requires_stop_proof_and_three_retries_then_skips_and_releases(self):
+    def test_unreadable_material_repository_does_not_close_the_item(self):
+        context = self.start()
+        trial = self.record('attempt_start', stage='material_check', **context)
+        event = dict(outcome='failed', summary='Repository unavailable', completion='待补材料',
+                     evidence={'material_file_status': 'unknown'}, **context)
+        first = self.record('attempt_finish', attempt_id=trial['attempt_id'], **event)
+        self.assertEqual(first['disposition'], 'retry')
+        retry = self.record('attempt_start', stage='material_check', **context)
+        final = self.record('attempt_finish', attempt_id=retry['attempt_id'], retryable=False, **event)
+        self.assertEqual(final['next_stage'], 'design')
+        design = self.record('attempt_start', stage='design', **context)
+        result = self.record('attempt_finish', attempt_id=design['attempt_id'], retryable=False, outcome='failed',
+                             summary='Missing file at design', evidence={'material_file_status': 'missing'}, **context)
+        self.assertEqual(result['next_stage'], 'plan')
+
+    def test_missing_file_on_bug_does_not_trigger_requirement_closeout(self):
+        self.scan('initial', [])
+        self.scan('new', [self.row(2, kind='bug')])
+        item = self.item(2, kind='bug')
+        lease = self.reserve(2, item=item)
+        context = {'item': item, 'request_id': lease['request_id'], 'chat_id': 'bug-chat'}
+        self.record('bind', desktop_project_id='desktop-1', **context)
+        self.record('start', **context)
+        trial = self.record('attempt_start', stage='material_check', **context)
+        result = self.record('attempt_finish', attempt_id=trial['attempt_id'], retryable=False, outcome='failed',
+                             summary='No attachment', evidence={'material_file_status': 'missing'}, **context)
+        self.assertEqual(result['next_stage'], 'design')
+
+    def test_timeout_requires_stop_proof_and_three_retries_then_advances(self):
         context = self.start()
         for index in range(4):
             trial = self.record('attempt_start', stage='material_check', **context)
@@ -473,10 +546,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(self.record('attempt_finish', **event)['status'], 'stop_unverified')
             stopped = self.record('attempt_finish', **event, stop_confirmed=True,
                                   stop_evidence={'process_exit': True})
-            self.assertEqual(stopped['disposition'], 'retry' if index < 3 else 'blocked')
+            self.assertEqual(stopped['disposition'], 'retry' if index < 3 else 'next')
+        self.pass_steps(context, ('design', 'plan', 'coding', 'unit_test', 'code_review', 'e2e', 'integration'))
         end = self.record('complete', **context, blockers_path='blockers.md', blockers_location='team/2')
         self.assertEqual(end['conclusion'], '阻断')
-        self.assertEqual([row['outcome'] for row in end['steps']], ['failed'] + ['skipped'] * 7)
+        self.assertEqual([row['outcome'] for row in end['steps']], ['failed'] + ['success'] * 7)
         self.assertEqual(self.reserve(3)['status'], 'reserved')
         self.assertEqual(self.record('recover', recovery_id='materials-rev2', evidence={'commit': 'changed'})['status'],
                          'recovered')

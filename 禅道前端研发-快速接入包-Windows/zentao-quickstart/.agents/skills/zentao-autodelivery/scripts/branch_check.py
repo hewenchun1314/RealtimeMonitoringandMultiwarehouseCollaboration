@@ -20,9 +20,11 @@ def branch_context(store, item):
     snapshot = json.loads(item['config_snapshot'])
     bundle = snapshot['development']['frontend_bundle']
     plan = store.conn.execute('''SELECT result FROM attempts WHERE item_seq=? AND stage='plan'
-                                 AND outcome='success' ORDER BY run_round DESC LIMIT 1''',
+                                 ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
                               (item['seq'],)).fetchone()
-    applications = planned_applications(json.loads(plan['result'])['evidence'])
+    applications = []
+    if plan and plan['result']:
+        applications = planned_applications(json.loads(plan['result']).get('evidence')) or []
     return {
         'bundle': bundle['name'],
         'frontend_workspace': snapshot['workspaces']['frontend'],
@@ -48,7 +50,7 @@ def valid_target(target):
 def valid_evidence(context, evidence):
     repositories = evidence.get('repositories') if isinstance(evidence, dict) else None
     targets = context['branch_targets']
-    if not isinstance(repositories, dict) or repositories.keys() != targets.keys():
+    if not targets or not isinstance(repositories, dict) or repositories.keys() != targets.keys():
         return False
     paths = set()
     for application, target in targets.items():
