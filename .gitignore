@@ -1,5 +1,6 @@
 /aggregation-platform-4/
 /req-demo/
+/customized-release/
 .local/
 .dotflow-exchange/
 node_modules/
