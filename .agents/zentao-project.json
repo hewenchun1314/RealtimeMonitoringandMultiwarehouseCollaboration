@@ -15,7 +15,7 @@
   },
   "monitor": {
     "enabled": true,
-    "interval_minutes": 3
+    "interval_minutes": 60
   },
   "runtime": {
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
