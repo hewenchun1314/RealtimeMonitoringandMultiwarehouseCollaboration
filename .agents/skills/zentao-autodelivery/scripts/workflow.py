@@ -18,7 +18,8 @@ from execution import (
 )
 from ledger import Ledger, encode, message, require_mapping, require_text, transaction, validate_config
 from status_board import publish_status
-from writeback import authorize_writeback, claim_writeback, confirm_writeback, reconcile_writeback
+from task_sync import reconcile_missing
+from writeback import authorize_writeback, claim_writeback, confirm_writeback, find_entry, reconcile_writeback
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -27,6 +28,7 @@ DATABASE_PATH = PROJECT_ROOT / '.local' / 'zentao-delivery' / 'workflow.sqlite3'
 
 CLAIM_ACTIONS = {'scan': save_scan, 'reserve': reserve}
 RECORD_ACTIONS = {
+    'task_reconcile_missing': reconcile_missing,
     'bind': bind,
     'start': start,
     'attempt_start': attempt_start,
@@ -135,6 +137,8 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
                 response['replayed'] = True
             return response
         item = store.find_item(data.get('item'))
+        if action.startswith('writeback_') and find_entry(store, item, data)['operation_type'].startswith('task_'):
+            return message('task_sync_required')
         if action == 'attempt_finish':
             response = attempt_finish(store, item, data, branches_verified=branches_verified,
                                       config_directory=config_directory)

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from delivery_scope import project_mode, route_stages
+from task_evidence import EVIDENCE_SCHEMA
 
 STAGES = ('material_check', 'design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'e2e', 'integration')
 STAGE_NAMES = dict(zip(STAGES, ('材料评审', '设计', '计划', '分支核验', '编码', '单元测试', 'Code Review', 'E2E', '合回')))
@@ -61,7 +62,16 @@ CREATE TABLE IF NOT EXISTS writebacks (
     reconcile_required INTEGER NOT NULL DEFAULT 0, receipt TEXT
 );
 CREATE INDEX IF NOT EXISTS pending_writebacks ON writebacks(state, expires_at);
-"""
+CREATE INDEX IF NOT EXISTS split_task_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
+    WHERE operation_type IN ('task_create','task_close','task_reopen');
+CREATE TABLE IF NOT EXISTS split_tasks (
+    item_seq INTEGER NOT NULL REFERENCES work_items(seq), task_key TEXT NOT NULL,
+    instance TEXT NOT NULL, side TEXT NOT NULL, definition TEXT NOT NULL,
+    desired TEXT NOT NULL DEFAULT 'open', generation INTEGER NOT NULL DEFAULT 0,
+    remote_id TEXT, remote_status TEXT, execution_id TEXT, assignee TEXT,
+    retry_at TEXT, last_error TEXT, PRIMARY KEY(item_seq,task_key), UNIQUE(instance,remote_id)
+);
+""" + EVIDENCE_SCHEMA
 
 
 def encode(value):
@@ -192,6 +202,8 @@ def validate_config(config):
         if type(timeouts.get(stage)) is not int or not 1 <= timeouts[stage] <= 1440:
             raise ValueError(f'development.step_timeout_minutes.{stage} must be an integer from one to 1440')
     runtime = require_mapping(config.get('runtime', {}), 'runtime')
+    if 'split_task_sync' in runtime and type(runtime['split_task_sync']) is not bool:
+        raise ValueError('runtime.split_task_sync must be a boolean')
     if 'desktop_project_id' in runtime:
         require_text(runtime['desktop_project_id'], 'runtime.desktop_project_id')
     if 'require_unattended_approval' in runtime and type(runtime['require_unattended_approval']) is not bool:

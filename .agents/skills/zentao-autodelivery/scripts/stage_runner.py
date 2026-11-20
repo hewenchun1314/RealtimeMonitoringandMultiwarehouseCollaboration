@@ -134,7 +134,7 @@ def bootstrap(prompt, command):
         return subprocess.call(command, stdin=input_stream)
 
 
-def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command):
+def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None):
     directory = evidence_dir / attempt_id / phase
     directory.mkdir(parents=True, exist_ok=False)
     receipt_path = directory / 'result.json'
@@ -169,12 +169,16 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command):
                 process.stdin.write(b'G')
                 process.stdin.flush()
             process.stdin.close()
-            timed_out = False
-            try:
-                process.wait(timeout=max(0, (deadline - utc_now()).total_seconds()))
-                timed_out = remaining <= 0 or utc_now() >= deadline
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            while process.poll() is None and utc_now() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                remaining = max(0, (deadline - utc_now()).total_seconds())
+                try:
+                    process.wait(timeout=remaining if stop_event is None else min(0.25, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+            timed_out = utc_now() >= deadline
+            stopped = stop_event is not None and stop_event.is_set() and process.poll() is None
 
             before = job.accounting()
             after = job.stop() if before.active else before
@@ -190,6 +194,8 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command):
             if hosted_agent:
                 evidence['codex_session'] = parse_session(stdout_path)
             outcome = 'timed_out' if timed_out else ('success' if process.returncode == 0 else 'failed')
+            if stopped:
+                outcome = 'stopped'
             result.update(outcome=outcome, stop_confirmed=after.active == 0, stop_evidence=evidence)
     finally:
         job.close()

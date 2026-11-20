@@ -15,15 +15,16 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 
 ## 账本
 
-从项目根目录执行 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py claim` 或 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`。两个命令通过标准输入接收一个 JSON 对象，通过标准输出返回结果。调用前查阅 [账本命令](references/workflow-cli.md)。查询阶段、绑定和待写回记录时，以 SQLite 只读方式打开 `.local/zentao-delivery/workflow.sqlite3`。账本变更统一通过两个命令提交。
+从项目根目录执行 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py claim` 或 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`。两个命令通过标准输入接收一个 JSON 对象，通过标准输出返回结果。调用前查阅 [账本命令](references/workflow-cli.md)。查询阶段、绑定和待写回记录时，以 SQLite 只读方式打开 `.local/zentao-delivery/workflow.sqlite3`。工单会话通过上述命令推进阶段；Task 同步器在自己的事务中登记租约、状态和实际回执。
 
 保留派发请求编号、聊天 ID、步骤和尝试编号。命令结果不明时先读回账本，并用同一事件标识核对或重试。以账本返回的稳定 `marker` 命名 `.local/zentao-delivery/items/<marker>/` 下的工单目录，保存设计、计划、验证证据和阻断记录，归档时区分每个恢复轮次。
 
-项目的只读进度页为 `.local/zentao-delivery/status.html`，由默认账本的 `claim`、`record` 更新，打开后自动重新读取页面。用它查看当前步骤、排队需求、已交付或阻断结论及待回写数。
+项目的只读进度页为 `.local/zentao-delivery/status.html`，默认账本的调度命令和拆分任务同步器会刷新此页。展开「拆分任务」可查看验收及合回情况、禅道 Task、迭代、初始指派账号和最近同步结果。
 
 ## 监测入口
 
 1. 对账已有工单、派发不明的请求、超时尝试及待写回事项。使用 `record runtime_check` 核对监测聊天的实际权限。只有返回 `runtime_unattended` 才执行需要外部访问的监测或写回。关闭 `monitor.enabled` 或指派白名单为空时，跳过新单扫描和领取。仅在当前请求授权范围内处理已有工单和回写。
+   在正式监测会话中执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py sync-tasks`，由受控同步进程按工单快照补办本项目 Task，覆盖已收尾工单。每轮核对回执，保留未完成项供续接。扫描和领取原 Story 备注及附件时，只处理 `comment`、`attachment` 两类操作。
 2. 根据 `zentao.accepted_statuses` 只扫描状态列表非空的工单类型。使用经验证的禅道只读接口分页查询，参考 `zentao-query` 和项目内 `zentao-cron-dashboard`。完整扫描须证明目标项目唯一匹配、工单归属明确、所有启用类型的分页结束且权限有效。只向账本传递指派账号和状态符合配置的工单，指派账号区分大小写。接口失败、权限缺失或分页不完整时，以 `complete:false` 登记部分扫描并保留已有队列。
 3. 调用 `claim` 登记完整扫描，首次记录历史基线，随后按优先级和发现顺序返回待复核队首。重新读取工单归属、状态和指派人，再调用 `claim` 领取。若返回队首变化，复核新的队首。以事务返回的领取结果确认名额。
 4. 首次派发和后续续接统一使用 [工单启动器](references/worker.md)。首次 `prepare` 用 `never` 创建只回复就绪的工单聊天，读回实际聊天 ID，核对或挂载桌面项目后登记 `record bind`。正式执行调用 `run`，它用 `never` 恢复同一聊天。禁止通过桌面建聊或发送消息工具启动业务轮次。启动器回执不明时，按原派发标记及其证据目录核对，确认停止后才能重试；执行权仍以账本为准。
@@ -43,6 +44,8 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 新领取工单先由评审 Agent 检查材料，再由拆分 Agent 按项目配置、材料标记、AI 研判的优先级确认范围，列出各端任务与验收条件。当前项目默认纯前端。主会话按账本返回的阶段只启动选中端的开发或测试 Agent，负责[分支核验与工作树](references/branches.md)、逐仓合回及最终收尾。跨端先完成后端，主会话核实[联调交接](references/backend.md)成功后启动前端设计和开发，最后用两个实际版本执行联合验收。已领取的旧工单沿原阶段名和计划继续。收尾后由当前调度轮次按队首领取下一单。
 
 Windows 上需要受控超时的 Agent 和本次自有进程使用 [阶段运行器](references/stage-runner.md) 启动。把 SQLite 返回的绝对截止时间传入运行器，按它的终态和清理证据登记原尝试。已启动的用户服务不进入本次受控进程组。
+
+启用 `runtime.split_task_sync` 的新 Story 由启动器为拆分 Agent 并行管理 Task。拆分登记后研发即可开始；同步器读取原 Story 的迭代、项目和建单时指派账号，每个稳定拆分编号对应一张 Task。研发和测试按[步骤指引](references/stages.md)提供逐项证据，账本在独立验收及相关仓库实际合回均满足时安排关闭。迭代待定时保留待建单，原任务返工后重开同一 Task。收尾备注和进度页分别报告研发与禅道现状。
 
 ## 禅道回写
 

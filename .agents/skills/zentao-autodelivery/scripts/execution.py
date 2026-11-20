@@ -11,6 +11,7 @@ from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
 from route_execution import (get_split, is_routed, read_history, snapshot, split_result, stage_role,
                              stages_for, v2_repair)
+import task_evidence
 
 
 REPAIR_PHASES = {
@@ -228,6 +229,8 @@ def repair_advance(store, item, data):
         return message('deadline_elapsed', deadline_at=trial['deadline_at'])
     summary = require_text(data.get('summary'), 'summary')
     evidence = data.get('evidence')
+    if isinstance(evidence, dict):
+        evidence = evidence.copy()
     if not evidence:
         raise ValueError('Repair phase completion requires evidence')
     completed = json.loads(trial['phase_history'])
@@ -244,6 +247,9 @@ def repair_advance(store, item, data):
             reason = validate_success(store, item, phase, evidence)
             if reason:
                 return message('evidence_required', reason=reason)
+            reason = task_evidence.prepare_receipt(store, item, phase, evidence, True)
+            if reason:
+                return message('evidence_required', reason=reason)
         phases = prior_repair_sequence(store, item)
     else:
         phases = REPAIR_PHASES[item['stage']]
@@ -253,6 +259,8 @@ def repair_advance(store, item, data):
     store.conn.execute('''UPDATE attempts SET phase=?,phase_started_at=?,phase_history=?,deadline_at=?
                           WHERE attempt_id=?''', (next_phase, store.time, encode(completed), deadline,
                                                   trial['attempt_id']))
+    if routed:
+        task_evidence.refresh(store, item)
     role = {'role': stage_role(item['stage'] if next_phase == 'verify' else next_phase)} if routed else {}
     return message('repair_advanced', attempt_id=trial['attempt_id'], phase=next_phase,
                    phase_started_at=store.time, deadline_at=deadline, retry_number=trial['retry_number'], **role)
@@ -274,6 +282,9 @@ def finish_revision(store, item, trial, receipt, completed):
     if revision_count(store, item) >= snapshot(item)['development']['max_retries_per_step']:
         return message('revision_limit_reached')
     route = receipt['route']
+    reason = task_evidence.prepare_receipt(store, item, 'split', receipt['evidence'], True, route)
+    if reason:
+        return message('evidence_required', reason=reason)
     completed.append(receipt)
     detail = {'summary': receipt['summary'], 'evidence': receipt['evidence'],
               'phase': 'split', 'route_revision': True, 'repair_required': False,
@@ -281,6 +292,7 @@ def finish_revision(store, item, trial, receipt, completed):
     store.conn.execute('''UPDATE attempts SET ended_at=?, outcome='success', result=?, phase_history=?
                           WHERE attempt_id=?''',
                        (store.time, encode(detail), encode(completed), trial['attempt_id']))
+    task_evidence.refresh(store, item)
     enqueue_note(store, item, 'split-revision-' + trial['attempt_id'],
                  f'拆分已修订，本轮旧版本归档，重新核验受影响仓库。{receipt["summary"]}')
     next_round = item['run_round'] + 1
@@ -349,6 +361,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     development = config['development']
     finished = outcome == 'success'
     evidence = data.get('evidence')
+    if isinstance(evidence, dict):
+        evidence = evidence.copy()
     route = None
     if routed and not finished:
         reason = validate_partial_merge(store, item, stage if phase == 'verify' else phase, evidence)
@@ -384,6 +398,11 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             return message('branch_evidence_required')
         if not branches_verified:
             return message('branch_worktree_unverified')
+    if routed:
+        reason = task_evidence.prepare_receipt(store, item, stage if phase == 'verify' else phase,
+                                               evidence, finished, route)
+        if reason:
+            return message('evidence_required', reason=reason)
     number = stages.index(stage)
     no_work = route and route['blockers'] and not any(route['tasks'].values())
     unresolved_contract = routed and not finished and (phase == 'split' or (repair_required and data.get('contract_changed')))
@@ -403,6 +422,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             raise ValueError('Invalid completion for a blocked step')
     store.conn.execute('UPDATE attempts SET ended_at=?,outcome=?,result=? WHERE attempt_id=?',
                        (store.time, outcome, encode(result), attempt_id))
+    if routed:
+        task_evidence.refresh(store, item)
 
     operation_id = None
     if retry:
@@ -426,6 +447,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             route = get_split(store, item) if routed else None
             conclusion = next((step['completion'] for step in steps if step['outcome'] == 'failed'),
                               '阻断' if route and route.get('blockers') else '已交付')
+            if conclusion == '已交付' and task_evidence.first_unverified_stage(store, item):
+                conclusion = '待验证'
             disposition = 'close' if conclusion == '已交付' else 'blocked'
             store.update_item(item, state='closing', conclusion=conclusion)
     return message('attempt_finished', attempt_id=attempt_id, step=stage, next_stage=next_stage, outcome=outcome,
@@ -503,6 +526,16 @@ def complete(store, item, data):
         if route:
             extra['delivery_summary'] = delivery_summary(route, stages)
             note += ' ' + extra['delivery_summary']
+        total, delivered, closed, unbound, closing, reopening = store.conn.execute('''
+            SELECT COUNT(*), SUM(desired='closed'), SUM(remote_status='closed'), SUM(remote_id IS NULL),
+                   SUM(remote_id IS NOT NULL AND desired='closed' AND remote_status IS NOT 'closed'),
+                   SUM(desired='open' AND remote_status='closed')
+            FROM split_tasks WHERE item_seq=?''', (item['seq'],)).fetchone()
+        if total:
+            extra['task_summary'] = (f'收尾时研发已验收并合回 {delivered}/{total} 项，'
+                                     f'禅道已关闭 {closed or 0}/{total} 张，待建单 {unbound} 张，'
+                                     f'待关闭 {closing or 0} 张，待重开 {reopening or 0} 张。')
+            note += ' ' + extra['task_summary']
     attachment_id = None
     if blockers_path:
         attachment_id = f'{item["marker"]}/{item["run_round"]}/blockers'
@@ -547,8 +580,9 @@ def recover(store, item, data):
     store.conn.execute('INSERT INTO recoveries(item_seq,recovery_id,evidence) VALUES(?,?,?)',
                        (item['seq'], recovery_id, evidence))
     state = 'queued' if item['eligible'] else 'ineligible'
-    stage = next((step['stage'] for step in terminal_steps(store, item)
-                  if step['outcome'] == 'failed'), item['stage'])
+    stage = next((step['stage'] for step in terminal_steps(store, item) if step['outcome'] == 'failed'), None)
+    if stage is None:
+        stage = task_evidence.first_unverified_stage(store, item) or item['stage']
     if is_routed(item):
         route = get_split(store, item)
         # A corrected requirement may change the split. Re-read its source first.

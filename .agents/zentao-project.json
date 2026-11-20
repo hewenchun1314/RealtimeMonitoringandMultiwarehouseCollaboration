@@ -19,6 +19,7 @@
     "interval_minutes": 60
   },
   "runtime": {
+    "split_task_sync": true,
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true
   },
@@ -170,7 +171,7 @@
     },
     "workspaces": "路径相对于本配置文件所在的 .agents 目录。requirement 指向需求材料仓库，frontend 指向前端工作区，backend 指向 srv-workspace 后端父仓。",
     "monitor": "enabled 控制新单扫描和领取。interval_minutes 以分钟表示期望的监测间隔；实际唤醒时间由 Codex 桌面定时任务决定。",
-    "runtime": "desktop_project_id 用于将工单会话绑定到对应的 Codex 桌面项目。require_unattended_approval 为 true 时，启动前核验会话能否无人值守执行。",
+    "runtime": "desktop_project_id 用于绑定工单会话。require_unattended_approval 启用无人值守权限核验。split_task_sync 控制新领取 Story 的拆分任务建单、关单及重开，已领工单沿用快照。",
     "development": {
       "max_concurrent_items": "同时占用执行名额的工单上限。",
       "max_retries_per_step": "每一步首次尝试失败后允许重试的次数。填 3 表示首次执行加最多 3 次重试。",

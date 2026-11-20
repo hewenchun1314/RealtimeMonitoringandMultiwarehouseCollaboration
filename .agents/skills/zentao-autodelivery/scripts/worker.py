@@ -1,6 +1,7 @@
 """Run the bound work-item chat through a non-interactive Codex CLI."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import timedelta
 import json
@@ -9,10 +10,12 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+from threading import Event
 from uuid import UUID, uuid4
 
 from desktop_runtime import runtime_check
 from stage_runner import run_stage, utc_now
+from task_sync import enabled as task_sync_enabled
 from workflow import DATABASE_PATH, PROJECT_ROOT
 
 
@@ -111,15 +114,47 @@ def run(operation, marker, cli):
         prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
         os.environ.pop('CODEX_THREAD_ID', None)
         deadline = utc_now() + (timedelta(hours=72) if operation == 'run' else timedelta(minutes=4))
-        receipt = run_stage(run_id, operation, deadline, PROJECT_ROOT, output, prompt_file,
-                            command(cli, operation, item['chat_id'] if item is not None else None))
+        launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file,
+                  command(cli, operation, item['chat_id'] if item is not None else None))
+        sync_receipt = None
+        if operation == 'run' and task_sync_enabled(item):
+            stop = Event()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_stage, run_id, 'task-sync', deadline, PROJECT_ROOT, output, None,
+                                         sync_command('--marker', marker, '--chat-id', item['chat_id']),
+                                         stop_event=stop)
+                try:
+                    receipt = run_stage(*launch)
+                finally:
+                    stop.set()
+                sync_receipt = future.result()
+        else:
+            receipt = run_stage(*launch)
         if operation == 'prepare':
             return prepared_result(receipt)
         if operation == 'probe':
             return {'status': 'probe_passed' if probe_passed(receipt) else 'probe_failed',
                     'receipt': receipt['receipt_path']}
-        return {'status': 'worker_stopped' if receipt['stop_confirmed'] else 'worker_stop_unverified',
-                'receipt': receipt['receipt_path'], 'outcome': receipt['outcome']}
+        stopped = receipt['stop_confirmed'] and (sync_receipt is None or sync_receipt['stop_confirmed'])
+        result = {'status': 'worker_stopped' if stopped else 'worker_stop_unverified',
+                  'receipt': receipt['receipt_path'], 'outcome': receipt['outcome']}
+        if sync_receipt:
+            result.update(task_sync_receipt=sync_receipt['receipt_path'], task_sync_outcome=sync_receipt['outcome'])
+        return result
+
+
+def sync_command(*args):
+    return [sys.executable, '-B', str(Path(__file__).with_name('task_sync_runner.py')), *args]
+
+
+def run_monitor_sync():
+    if runtime_check(os.environ.get('CODEX_THREAD_ID', ''))['status'] != 'runtime_unattended':
+        raise ValueError('Task synchronization requires an unattended monitor session')
+    receipt = run_stage(uuid4().hex, 'monitor', utc_now() + timedelta(minutes=3), PROJECT_ROOT,
+                        DATABASE_PATH.parent / 'task-sync', None, sync_command())
+    return {'status': 'tasks_checked' if receipt['outcome'] == 'success' else 'task_sync_incomplete',
+            'outcome': receipt['outcome'], 'stop_confirmed': receipt['stop_confirmed'],
+            'receipt': receipt['receipt_path']}
 
 
 def prepared_result(receipt):
@@ -134,17 +169,18 @@ def prepared_result(receipt):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('prepare', 'run', 'probe'))
+    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks'))
     parser.add_argument('--marker')
     args = parser.parse_args()
     host_config = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
     cli = host_config / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
     try:
-        result = run(args.operation, args.marker, cli.resolve(strict=True))
+        result = run_monitor_sync() if args.operation == 'sync-tasks' else run(
+            args.operation, args.marker, cli.resolve(strict=True))
     except (OSError, TypeError, ValueError, sqlite3.Error) as error:
         result = {'status': 'worker_error', 'reason': str(error)}
     print(json.dumps(result, ensure_ascii=True))
-    return int(result['status'] in ('worker_error', 'probe_failed'))
+    return int(result['status'] in ('worker_error', 'probe_failed', 'task_sync_incomplete'))
 
 
 if __name__ == '__main__':
