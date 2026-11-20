@@ -21,7 +21,7 @@ def project_mode(development):
     raise ValueError('Invalid development.allowed_requirement_types')
 
 
-def route_stages(scope):
+def route_stages(scope, *, e2e_enabled=True):
     if scope not in SCOPES.values():
         raise ValueError('Unknown delivery scope')
     stages = list(PREFIX)
@@ -30,7 +30,10 @@ def route_stages(scope):
     if scope == 'fullstack':
         stages.append('handoff')
     if scope in ('frontend_only', 'fullstack'):
-        stages.extend('frontend.' + step for step in (*SIDE_STEPS, 'e2e', 'integration'))
+        stages.extend('frontend.' + step for step in SIDE_STEPS)
+        if e2e_enabled:
+            stages.append('frontend.e2e')
+        stages.append('frontend.integration')
     return tuple(stages)
 
 

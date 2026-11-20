@@ -98,8 +98,10 @@ def split_result(store, item, evidence, *, revision=False):
         raise ValueError('Scope splitting requires the reviewed material snapshot')
     if not isinstance(evidence, dict):
         raise ValueError('Split evidence must be an object')
-    route = resolve_split(snapshot(item), {**evidence, 'material': reviewed['material']})
-    route['stages'] = list(route_stages(route['scope']))
+    config = snapshot(item)
+    route = resolve_split(config, {**evidence, 'material': reviewed['material']})
+    route['e2e_enabled'] = config.get('e2e', {}).get('enabled', True)
+    route['stages'] = list(route_stages(route['scope'], e2e_enabled=route['e2e_enabled']))
     if revision:
         previous = get_split(store, item)
         if not previous or previous['scope'] != route['scope']:
@@ -124,7 +126,9 @@ def v2_repair(stage, data, route):
     if name != 'code_review':
         phases.append(owner + '.code_review')
     if name == 'integration':
-        phases.append(owner + ('.e2e' if owner == 'frontend' else '.acceptance'))
+        acceptance = owner + ('.e2e' if owner == 'frontend' else '.acceptance')
+        if acceptance in route['stages']:
+            phases.append(acceptance)
     if joint and owner == 'backend':
         phases.extend(('backend.acceptance', 'backend.integration', 'handoff'))
         if data.get('frontend_changed') or data.get('contract_changed'):

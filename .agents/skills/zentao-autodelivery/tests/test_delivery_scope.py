@@ -85,6 +85,12 @@ class DeliveryScopeTests(unittest.TestCase):
         bug = read_material({}, self.directory, 'bug', {'detail': '研发范围：纯后端'})
         self.assertEqual(bug['markers'], ['纯后端'])
 
+    def test_e2e_switch_requires_a_boolean(self):
+        for invalid in ('false', 0, None):
+            self.config['e2e']['enabled'] = invalid
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, 'e2e.enabled'):
+                validate_config(self.config)
+
     def test_inactive_side_and_invalid_dependencies_rejected(self):
         invalid = {'id': 'T1', 'description': 'Do work', 'acceptance': ['tested']}
         for tasks in ({'backend': [invalid]}, {'frontend': [dict(invalid, depends_on=['unknown'])]},

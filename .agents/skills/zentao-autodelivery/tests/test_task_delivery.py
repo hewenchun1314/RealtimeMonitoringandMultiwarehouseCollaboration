@@ -10,6 +10,53 @@ from test_task_sync import Remote
 
 
 class TaskDeliveryTests(unittest.TestCase):
+    def test_disabled_page_acceptance_skips_e2e_and_closes_reviewed_merged_tasks(self):
+        for scope, mark in [('frontend_only', '纯前端'), ('fullstack', '前后端')]:
+            with self.subTest(scope=scope):
+                fixture = drills.RouteDrills()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.config['runtime']['split_task_sync'] = True
+                fixture.config['e2e']['enabled'] = False
+                fixture.begin_drill(scope, mark)
+                fixture.config['e2e']['enabled'] = True
+                remote = Remote()
+                completed = []
+                stage = 'material_check'
+                while stage:
+                    self.assertNotEqual(stage, 'frontend.e2e')
+                    attempt = fixture.record('attempt_start', stage=stage)
+                    self.assertEqual(attempt['status'], 'attempt_started', attempt)
+                    evidence = fixture.evidence(stage, attempt)
+                    side, _, step = stage.partition('.')
+                    if stage == 'split' and scope == 'fullstack':
+                        evidence['tasks']['backend'][0]['joint_acceptance'] = True
+                    elif step == 'plan':
+                        evidence['task_repositories'] = {side: [fixture.key]}
+                        if scope == 'fullstack' and side == 'frontend':
+                            evidence['task_repositories']['backend'] = [fixture.key]
+                    elif stage == 'backend.acceptance':
+                        evidence['task_results'] = {'backend': {'outcome': 'passed',
+                                                                'verification': evidence['verification']}}
+                    result = fixture.finish(stage, attempt, evidence)
+                    self.assertEqual(result['status'], 'attempt_finished', (stage, result))
+                    while sync_once(fixture.database, fixture.artifacts.parent.name, lambda _: remote):
+                        pass
+                    completed.append(stage)
+                    stage = result['next_stage']
+                self.assertEqual(completed[-2:], ['frontend.code_review', 'frontend.integration'])
+                self.assertEqual('backend.acceptance' in completed, scope == 'fullstack')
+                self.assertEqual('handoff' in completed, scope == 'fullstack')
+                final = fixture.record('complete')
+                self.assertEqual(final['conclusion'], '已交付', final)
+                self.assertIn('页面验收已跳过（项目配置关闭）', final['delivery_summary'])
+                self.assertEqual(len(remote.tasks), 2 if scope == 'fullstack' else 1)
+                self.assertTrue(all(t['status'] == 'closed' for t in remote.tasks.values()))
+                drills.publish_status(fixture.database, fixture.config)
+                board = (fixture.database.parent / 'status.html').read_text(encoding='utf-8')
+                self.assertIn('已合回，页面验收已跳过', board)
+                self.assertNotIn('已验收并合回', board)
+
     def test_single_side_routes_close_every_independently_accepted_task(self):
         for side, count, mark in [('frontend', 3, '纯前端'), ('backend', 4, '纯后端')]:
             with self.subTest(side=side):

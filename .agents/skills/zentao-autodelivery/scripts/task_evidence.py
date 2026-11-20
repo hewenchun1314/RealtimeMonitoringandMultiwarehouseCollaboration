@@ -141,7 +141,7 @@ def _receipt(stages, stage, *, partial=False):
     return {}
 
 
-def _side_result(stages, side, task, facts, previous):
+def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
     plan = _receipt(stages, side + '.plan').get('task_repositories', {})
     repositories = plan.get(task, [])
     if not repositories:
@@ -159,11 +159,13 @@ def _side_result(stages, side, task, facts, previous):
     component = {'repositories': repositories, 'versions': versions,
                  'tested': {}, 'merged': dict(prior.get('merged', {})),
                  'merge_tested': dict(prior.get('merge_tested', {}))}
-    if result:
-        component.update(acceptance=result, tested={k: test.get('versions', {}).get(k) for k in repositories},
-                         verified_at=stages.get(test_stage, {}).get('ended_at'), backend_versions=backend_versions)
-    elif same_joint:
-        component.update({k: prior[k] for k in ('acceptance', 'tested', 'verified_at', 'backend_versions') if k in prior})
+    if not skip_e2e:
+        if result:
+            component.update(acceptance=result, tested={k: test.get('versions', {}).get(k) for k in repositories},
+                             verified_at=stages.get(test_stage, {}).get('ended_at'), backend_versions=backend_versions)
+        elif same_joint:
+            component.update({k: prior[k] for k in ('acceptance', 'tested', 'verified_at', 'backend_versions')
+                              if k in prior})
     facts[side] = component
     merged = _receipt(stages, side + '.integration', partial=True)
     for key in repositories:
@@ -172,10 +174,16 @@ def _side_result(stages, side, task, facts, previous):
             component['merged'][key] = merged_sha
             component['merge_tested'][key] = (key not in merged.get('task_changed_merges', [])
                                                or bool(merged.get('merged_task_verification', {}).get(task)))
-    if component.get('acceptance', {}).get('outcome') != 'passed':
+    if skip_e2e:
+        unit = _receipt(stages, side + '.unit_test').get('versions', {})
+        review = _receipt(stages, side + '.code_review').get('versions', {})
+        if any(not versions[key] or unit.get(key) != versions[key] or review.get(key) != versions[key]
+               for key in repositories):
+            return '当前候选版本的单测或代码审查待通过'
+    elif component.get('acceptance', {}).get('outcome') != 'passed':
         return '独立验收未通过或待验证'
     for key in repositories:
-        if not versions[key] or component['tested'].get(key) != versions[key]:
+        if not skip_e2e and (not versions[key] or component['tested'].get(key) != versions[key]):
             return f'{key} 当前候选版本待验证'
         if not component['merged'].get(key):
             return f'{key} 待合回验收版本'
@@ -186,6 +194,7 @@ def _side_result(stages, side, task, facts, previous):
 
 def evaluate(route, stages, history=None):
     decisions = {}
+    e2e_enabled = route.get('e2e_enabled', True)
     handoff = _receipt(stages, 'handoff').get('backend_versions')
     joint_test = _receipt(stages, 'frontend.e2e', partial=True)
     backend_merge = _receipt(stages, 'backend.integration').get('merged_versions')
@@ -198,8 +207,9 @@ def evaluate(route, stages, history=None):
             previous = (history or {}).get(key, {})
             if any(previous.get(field) != value for field, value in facts.items()):
                 previous = {}
-            reason = _side_result(stages, side, key, facts, previous)
-            if route['scope'] == 'fullstack':
+            skip_e2e = side == 'frontend' and not e2e_enabled
+            reason = _side_result(stages, side, key, facts, previous, skip_e2e=skip_e2e)
+            if route['scope'] == 'fullstack' and e2e_enabled:
                 joint_result = joint_test.get('task_results', {}).get(key, {})
                 if current_joint and joint_result.get('outcome') == 'failed':
                     facts['joint_failure'] = joint_result
@@ -210,7 +220,15 @@ def evaluate(route, stages, history=None):
                         reason = '等待有效的前后端版本联合验收'
                     elif side == 'backend':
                         reason = _side_result(stages, 'frontend', key, facts, previous)
-            decisions[key] = ('open' if reason else 'closed', reason or '独立验收通过且相关仓库已合回', facts)
+            if skip_e2e:
+                facts['e2e_skipped'] = True
+                closed_reason = '单测和代码审查通过且相关仓库已合回，页面验收按项目配置跳过'
+            elif not e2e_enabled and route['scope'] == 'fullstack' and facts['joint']:
+                facts['e2e_skipped'] = True
+                closed_reason = '后端服务验收通过且相关仓库已合回，页面联合验收按项目配置跳过'
+            else:
+                closed_reason = '独立验收通过且相关仓库已合回'
+            decisions[key] = ('open' if reason else 'closed', reason or closed_reason, facts)
     return decisions
 
 
@@ -260,10 +278,16 @@ def refresh(store, item):
 
 def first_unverified_stage(store, item):
     import task_sync
+    from route_execution import get_split
 
     if not task_sync.enabled(item):
         return None
     task = store.conn.execute('''SELECT t.side FROM split_tasks t LEFT JOIN task_evidence e
         USING(item_seq,task_key) WHERE t.item_seq=? AND COALESCE(e.disposition,'open') <> 'closed'
         ORDER BY t.side,t.task_key LIMIT 1''', (item['seq'],)).fetchone()
-    return ('backend.acceptance' if task['side'] == 'backend' else 'frontend.e2e') if task else None
+    if not task:
+        return None
+    if task['side'] == 'backend':
+        return 'backend.acceptance'
+    route = get_split(store, item)
+    return 'frontend.integration' if route and not route.get('e2e_enabled', True) else 'frontend.e2e'

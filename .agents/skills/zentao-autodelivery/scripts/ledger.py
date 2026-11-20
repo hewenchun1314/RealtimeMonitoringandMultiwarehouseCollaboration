@@ -174,6 +174,9 @@ def validate_config(config):
     monitor = require_mapping(config.get('monitor'), 'monitor')
     if type(monitor.get('enabled')) is not bool:
         raise ValueError('monitor.enabled must be a boolean')
+    e2e = require_mapping(config.get('e2e', {}), 'e2e')
+    if type(e2e.get('enabled', True)) is not bool:
+        raise ValueError('e2e.enabled must be a boolean')
     development = require_mapping(config.get('development'), 'development')
     if type(development.get('max_concurrent_items')) is not int or development['max_concurrent_items'] < 1:
         raise ValueError('development.max_concurrent_items must be a positive integer')

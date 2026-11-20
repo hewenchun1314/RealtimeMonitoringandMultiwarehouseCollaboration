@@ -146,6 +146,7 @@
     }
   },
   "e2e": {
+    "enabled": false,
     "workspace": "frontend",
     "start_command": "npm run serve-shell-hub --gateway=http://10.10.4.140:31111/",
     "ready_url": null,
@@ -187,6 +188,7 @@
       "step_timeout_minutes": "每个阶段单次尝试的最长分钟数。默认拆分用 plan 时限，后端功能验收用 e2e 时限，跨端交接用 integration 时限。"
     },
     "e2e": {
+      "enabled": "true 执行前端页面验收，false 跳过页面验收并继续合回。缺省为 true。仅对新领取工单生效，已领取工单沿用原配置快照。",
       "workspace / start_command": "前端页面验收使用的工作区键，以及服务尚未运行时的启动命令。",
       "ready_url / platform_entry_path": "ready_url 可指定前端服务地址；为 null 时从启动输出或现有页面确认。platform_entry_path 是登录后进入平台的页面路径。",
       "login": "path 是登录页路径，username 是测试账号，credential_ref 指向该账号的本机凭据。",

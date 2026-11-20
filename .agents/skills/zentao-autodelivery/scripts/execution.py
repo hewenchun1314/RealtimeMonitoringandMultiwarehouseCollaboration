@@ -532,7 +532,9 @@ def complete(store, item, data):
                    SUM(desired='open' AND remote_status='closed')
             FROM split_tasks WHERE item_seq=?''', (item['seq'],)).fetchone()
         if total:
-            extra['task_summary'] = (f'收尾时研发已验收并合回 {delivered}/{total} 项，'
+            delivery_label = ('满足本单交付条件' if route and route['scope'] != 'backend_only'
+                              and not route.get('e2e_enabled', True) else '研发已验收并合回')
+            extra['task_summary'] = (f'收尾时{delivery_label} {delivered}/{total} 项，'
                                      f'禅道已关闭 {closed or 0}/{total} 张，待建单 {unbound} 张，'
                                      f'待关闭 {closing or 0} 张，待重开 {reopening or 0} 张。')
             note += ' ' + extra['task_summary']

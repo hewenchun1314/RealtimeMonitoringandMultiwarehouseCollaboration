@@ -45,6 +45,7 @@ class RouteDrills(unittest.TestCase):
         self.database = self.root / 'ledger' / 'workflow.sqlite3'
         self.now = datetime.now(timezone.utc)
         self.config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        self.config.get('e2e', {}).pop('enabled', None)
         self.assertEqual(self.config['development']['allowed_requirement_types'], ['frontend_only'])
         self.config['zentao'].update(base_url='http://127.0.0.1:1', assigned_to_accounts=['drill'])
         self.config['runtime'] = {'desktop_project_id': 'drill'}
@@ -320,6 +321,7 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
         self.drill('frontend_only', '前后端')
 
     def test_current_frontend_without_mark(self):
+        self.config['e2e']['enabled'] = True
         self.drill('frontend_only', '')
 
     def test_backend_without_frontend_settings(self):

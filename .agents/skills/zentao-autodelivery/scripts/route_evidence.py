@@ -163,6 +163,8 @@ def delivery_summary(route, stages):
         test = stages.get(f'{side}.{acceptance}')
         if test:
             facts.append(label + ('通过' if test['outcome'] == 'success' else '失败'))
+        elif side == 'frontend' and route['scope'] != 'backend_only' and not route.get('e2e_enabled', True):
+            facts.append('页面验收已跳过（项目配置关闭）')
         merge = stages.get(side + '.integration')
         if merge and isinstance(merge.get('evidence'), dict):
             merged = merge['evidence'].get('merged_versions')

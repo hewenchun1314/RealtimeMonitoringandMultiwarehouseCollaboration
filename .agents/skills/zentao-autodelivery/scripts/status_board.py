@@ -52,7 +52,9 @@ def task_progress(tasks, base_url):
             pending = ' · 待重开'
         description = json.loads(task['definition']).get('description', '')
         remote = {'closed': '已关闭', 'done': '已完成', 'wait': '未开始', 'doing': '进行中'}.get(status, status)
-        state = '已验收并合回' if task['desired'] == 'closed' else '待交付'
+        state = '待交付'
+        if task['desired'] == 'closed':
+            state = '已合回，页面验收已跳过' if task.get('e2e_skipped') else '已验收并合回'
         reason = task.get('evidence_reason') or ''
         error = task['last_error'] or ''
         side = '前端' if task['side'] == 'frontend' else '后端'
@@ -108,7 +110,9 @@ def publish_status(database, config):
             join = ('LEFT JOIN task_evidence e ON e.item_seq=t.item_seq AND e.task_key=t.task_key'
                     if 'task_evidence' in tables else '')
             reason = 'e.reason' if join else 'NULL'
-            for task in conn.execute(f'''SELECT t.*, {reason} AS evidence_reason FROM split_tasks t
+            skipped = "json_extract(e.evidence, '$.e2e_skipped')" if join else 'NULL'
+            for task in conn.execute(f'''SELECT t.*, {reason} AS evidence_reason, {skipped} AS e2e_skipped
+                    FROM split_tasks t
                     JOIN work_items w ON w.seq=t.item_seq {join}
                     WHERE w.instance=? AND w.project_id=? AND w.kind='story'
                     ORDER BY t.item_seq,t.task_key''', (scope[0], scan['project_id'])):
