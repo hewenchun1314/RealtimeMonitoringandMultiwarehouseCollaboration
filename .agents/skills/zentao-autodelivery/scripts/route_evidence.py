@@ -1,0 +1,174 @@
+"""Version-bound evidence for a scoped work item, including its backend handoff."""
+
+import re
+import subprocess
+from pathlib import Path
+
+from branch_check import git
+from route_execution import get_split, stage_evidence
+
+
+def nonblank(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def commit_map(value):
+    return isinstance(value, dict) and bool(value) and all(
+        nonblank(key) and isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha)
+        for key, sha in value.items())
+
+
+def check_candidate(proof, candidate):
+    tree = proof['worktree']
+    if git(tree, 'symbolic-ref', '--quiet', 'HEAD', allowed=(0, 1)) != 'refs/heads/' + proof['worktree_branch']:
+        return 'The worktree is no longer on the verified item branch'
+    if git(tree, 'rev-parse', 'HEAD') != candidate:
+        return 'Candidate must match the verified worktree HEAD'
+    if git(tree, '--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no', '--ignore-submodules=untracked'):
+        return 'Commit or reconcile tracked and staged item worktree changes before verifying this candidate'
+    if git(tree, 'merge-base', '--is-ancestor', proof['base_commit'], candidate, allowed=(0, 1)) is None:
+        return 'Candidate does not descend from the registered baseline'
+    source = proof['source_root']
+    if git(source, 'rev-parse', '--verify', 'refs/heads/' + proof['worktree_branch']) != candidate:
+        return 'Candidate does not match the item branch in the registered repository'
+
+
+def check_merged_commit(proof, candidate, merged):
+    source = proof['source_root']
+    actual = git(source, 'rev-parse', '--verify', 'refs/heads/' + proof['target_branch'])
+    if merged != actual or git(source, 'merge-base', '--is-ancestor', candidate, actual, allowed=(0, 1)) is None:
+        return 'Merged version must be the actual target tip and contain the candidate'
+
+
+def check_merge(proof, candidate, merged, reverified):
+    reason = check_merged_commit(proof, candidate, merged)
+    if reason:
+        return reason
+    source = proof['source_root']
+    if candidate != merged and not reverified:
+        if git(source, 'rev-parse', candidate + '^{tree}') != git(source, 'rev-parse', merged + '^{tree}'):
+            return 'Record merged_verification for a merge that changed the tested tree'
+
+
+def validate_partial_merge(store, item, stage, evidence):
+    """Verify successful repositories in a failed or interrupted normal/repair merge."""
+    if not stage.endswith('.integration') or not isinstance(evidence, dict) or 'merged_versions' not in evidence:
+        return None
+    merged = evidence['merged_versions']
+    if merged == {}:
+        return None
+    side = stage.split('.')[0]
+    targets = (stage_evidence(store, item, side + '.branch_check') or {}).get('repositories', {})
+    candidates = (stage_evidence(store, item, side + '.coding') or {}).get('versions', {})
+    versions = evidence.get('versions')
+    if (not commit_map(merged) or not commit_map(versions) or not merged.keys() <= versions.keys()
+            or not merged.keys() <= targets.keys() or any(candidates.get(k) != sha for k, sha in versions.items())):
+        return 'Partial merge receipts must identify registered repositories and their recorded candidates'
+    try:
+        for key, sha in merged.items():
+            reason = check_merged_commit(targets[key], versions[key], sha)
+            if reason:
+                return f'{key}: {reason}'
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
+        return f'Git evidence could not be verified: {error}'
+
+
+def repository_evidence(store, item, side, stage, evidence):
+    branches = stage_evidence(store, item, side + '.branch_check') or {}
+    targets = branches.get('repositories', {})
+    versions = evidence.get('versions')
+    if not commit_map(versions) or versions.keys() != targets.keys():
+        return 'Provide a candidate commit for every repository in the verified branch check'
+    merged = evidence.get('merged_versions')
+    if stage == 'integration':
+        candidate = stage_evidence(store, item, side + '.coding') or {}
+        if versions != candidate.get('versions') or not commit_map(merged) or merged.keys() != targets.keys():
+            return 'Merge evidence must cover the recorded candidates and every target repository'
+    try:
+        for key, proof in targets.items():
+            if stage == 'integration':
+                reason = check_merge(proof, versions[key], merged[key], nonblank(evidence.get('merged_verification')))
+            else:
+                reason = check_candidate(proof, versions[key])
+            if reason:
+                return f'{key}: {reason}'
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
+        return f'Git evidence could not be verified: {error}'
+
+
+def handoff_error(store, item, evidence):
+    route = get_split(store, item)
+    blockers = route.get('handoff_blockers', route['blockers'])
+    if blockers:
+        return 'Backend handoff is blocked: ' + ', '.join(blockers)
+    for name in ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'acceptance', 'integration'):
+        if not stage_evidence(store, item, 'backend.' + name):
+            return f'Backend {name} must succeed before frontend handoff'
+    integration = stage_evidence(store, item, 'backend.integration')
+    versions = evidence.get('backend_versions')
+    if not commit_map(versions) or versions != integration.get('merged_versions'):
+        return 'The callable backend version must match every merged service'
+    if not all(nonblank(evidence.get(key)) for key in ('environment', 'verification', 'document')):
+        return 'Supply the handoff document, callable environment and observed call evidence'
+    database = Path(store.conn.execute('PRAGMA database_list').fetchone()[2])
+    directory = database.parent.resolve() / 'items' / item['marker']
+    document = Path(evidence['document'])
+    expected = directory / f'round-{item["run_round"]}' / 'backend' / 'handoff.md'
+    try:
+        if (not document.is_absolute() or document.resolve() != expected or not document.is_file()
+                or not document.read_text(encoding='utf-8-sig').strip()):
+            return f'Provide the current handoff document at {expected}'
+    except (OSError, UnicodeError, RuntimeError, ValueError) as error:
+        return f'Handoff document unavailable: {error}'
+
+
+def validate_success(store, item, stage, evidence):
+    """Return a reason when a successful V2 stage cannot be substantiated."""
+    if not isinstance(evidence, dict) or not evidence:
+        return 'Stage evidence must be a non-empty object'
+    if stage == 'handoff':
+        return handoff_error(store, item, evidence)
+    side, _, name = stage.partition('.')
+    if name in ('coding', 'integration'):
+        return repository_evidence(store, item, side, name, evidence)
+    if name in ('unit_test', 'code_review', 'acceptance', 'e2e'):
+        candidate = stage_evidence(store, item, side + '.coding') or {}
+        if not commit_map(evidence.get('versions')) or evidence['versions'] != candidate.get('versions'):
+            return 'Verify the exact set of current candidate versions'
+        if not nonblank(evidence.get('verification')):
+            return 'Provide the command, observed result or verification evidence reference'
+        reason = repository_evidence(store, item, side, name, evidence)
+        if reason:
+            return reason
+        if name not in ('acceptance', 'e2e'):
+            return None
+        route = get_split(store, item)
+        expected = {task['id'] for task in route['tasks'].get(side, [])}
+        tested = evidence.get('verified_tasks')
+        if not isinstance(tested, list) or not all(nonblank(task) for task in tested) or set(tested) != expected:
+            return 'Acceptance must identify all verified task IDs for this side'
+        if name == 'e2e' and route['scope'] == 'fullstack':
+            handoff = stage_evidence(store, item, 'handoff') or {}
+            if not handoff or evidence.get('backend_versions') != handoff.get('backend_versions'):
+                return 'Joint acceptance must verify the backend versions from the latest handoff'
+
+
+def delivery_summary(route, stages):
+    if not route:
+        return '等待范围判定'
+    scopes = {'fullstack': '前后端', 'frontend_only': '纯前端', 'backend_only': '纯后端'}
+    sources = {'config': '项目配置', 'document': '需求标记', 'ai': 'AI 研判'}
+    facts = [f'{scopes[route["scope"]]}（{sources[route["source"]]}）']
+    for side, acceptance, label in (('backend', 'acceptance', '服务验收'), ('frontend', 'e2e', '页面验收')):
+        test = stages.get(f'{side}.{acceptance}')
+        if test:
+            facts.append(label + ('通过' if test['outcome'] == 'success' else '失败'))
+        merge = stages.get(side + '.integration')
+        if merge and isinstance(merge.get('evidence'), dict):
+            merged = merge['evidence'].get('merged_versions')
+            if commit_map(merged):
+                state = '合回' if merge['outcome'] == 'success' else '部分合回'
+                targets = '、'.join(f'{key}@{sha}' for key, sha in sorted(merged.items()))
+                facts.append(('后端' if side == 'backend' else '前端') + state + ' ' + targets)
+    facts.extend(route.get('blockers', []))
+    return '；'.join(facts)

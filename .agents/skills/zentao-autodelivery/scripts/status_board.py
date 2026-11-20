@@ -4,13 +4,15 @@ import json
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlencode
 
-from ledger import STAGE_NAMES
+from ledger import Ledger, STAGE_NAMES
+from route_evidence import delivery_summary
+from route_execution import read_history
 
 
 SECTIONS = (
@@ -30,7 +32,7 @@ def local_time(value):
     return datetime.fromisoformat(value).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
 
 
-def table_row(item, base_url):
+def table_row(item, base_url, delivery=''):
     url = f'{base_url}/index.php?' + urlencode({'m': 'story', 'f': 'view', 'storyID': item['item_id']})
     label = escape(item['title'] or '查看禅道需求')
     status = item['conclusion'] or STATES[item['state']]
@@ -39,10 +41,12 @@ def table_row(item, base_url):
     progress = STAGE_NAMES.get(item['stage'], '—')
     if item['retry_number'] is not None:
         progress += f'（第 {item["retry_number"] + 1} 次尝试）'
+        if item['phase'] and item['phase'] != 'verify':
+            progress += ' → ' + STAGE_NAMES.get(item['phase'], item['phase'])
     pending = str(item['pending']) if item['pending'] else '—'
     return (
         f'<tr><td><a href="{escape(url, quote=True)}">#{escape(item["item_id"])} {label}</a></td>'
-        f'<td>{escape(status)}</td><td>{escape(progress)}</td><td>{pending}</td></tr>'
+        f'<td>{escape(status)}</td><td>{escape(progress)}</td><td>{escape(delivery) or "—"}</td><td>{pending}</td></tr>'
     )
 
 
@@ -55,20 +59,23 @@ def publish_status(database, config):
         scan = conn.execute('SELECT project_id,observed_at FROM scans WHERE instance=? AND project_name=?',
                             scope).fetchone()
         rows = [] if scan is None else conn.execute('''
-            SELECT w.*, a.retry_number, d.state AS dispatch_state,
+            SELECT w.*, a.retry_number, a.phase, d.state AS dispatch_state,
                    (SELECT COUNT(*) FROM writebacks b WHERE b.item_seq=w.seq AND b.state<>'confirmed') AS pending
             FROM work_items w
             LEFT JOIN attempts a ON a.item_seq=w.seq AND a.outcome IS NULL
             LEFT JOIN dispatches d ON d.request_id=w.request_id
             WHERE w.instance=? AND w.project_id=? AND w.kind='story'
             ORDER BY w.priority IS NULL, w.priority, w.seq''', (scope[0], scan['project_id'])).fetchall()
+        store = Ledger(conn, config, datetime.now(timezone.utc))
+        summaries = {row['seq']: delivery_summary(*read_history(store, row)) for row in rows
+                     if row['config_snapshot'] and json.loads(row['config_snapshot']).get('workflow_version') == 2}
     sections = []
     for title, states in SECTIONS:
         selected = [item for item in rows if item['state'] in states]
-        content = ''.join(table_row(row, scope[0]) for row in selected)
+        content = ''.join(table_row(row, scope[0], summaries.get(row['seq'], '')) for row in selected)
         sections.append(
             f'<section><h2>{title} <span>{len(selected)}</span></h2>' + (
-                f'<table><thead><tr><th>禅道需求</th><th>状态</th><th>当前步骤</th><th>待回写</th></tr></thead>'
+                f'<table><thead><tr><th>禅道需求</th><th>状态</th><th>当前步骤</th><th>范围与交付</th><th>待回写</th></tr></thead>'
                 f'<tbody>{content}</tbody></table>' if content else '<p>暂无需求</p>'
             ) + '</section>'
         )

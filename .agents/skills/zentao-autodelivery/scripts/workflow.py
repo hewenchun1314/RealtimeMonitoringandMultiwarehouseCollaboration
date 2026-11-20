@@ -9,7 +9,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from branch_check import branch_context, inspect_branches, prepare_local_worktree, valid_evidence
+from branch_check import BRANCH_STAGES, branch_context, inspect_branches, prepare_local_worktree, valid_evidence
 from claim import reserve, save_scan
 from desktop_runtime import runtime_check
 from execution import (
@@ -60,7 +60,7 @@ def read_branch_attempt(database, config, data, now):
         conn.execute('BEGIN')
         store = Ledger(conn, config, now)
         item = store.find_item(data.get('item'))
-        if item['state'] != 'running' or item['stage'] != 'branch_check' or not execution_matches(store, item, data):
+        if item['state'] != 'running' or item['stage'] not in BRANCH_STAGES or not execution_matches(store, item, data):
             return None
         trial = active_attempt(store, item)
         if not trial or trial['attempt_id'] != data.get('attempt_id') or store.time >= trial['deadline_at']:
@@ -84,14 +84,15 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
             if (not isinstance(reconciliation, dict) or reconciliation.get('status') not in
                     ('no_receipt', 'failed', 'unavailable') or not reconciliation.get('evidence')):
                 return message('desktop_reconciliation_required')
-            app = require_text(data.get('application'), 'application')
+            field = 'service' if context.get('side') == 'backend' else 'application'
+            app = require_text(data.get(field), field)
             budget = (datetime.fromisoformat(context['deadline_at']) - check_time).total_seconds()
             try:
                 repo = prepare_local_worktree(context, config_directory, database, app, budget)
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
-                return message('branch_prepare_failed', application=app, reason=str(exc))
+                return message('branch_prepare_failed', **{field: app}, reason=str(exc))
             status = 'branch_prepared' if repo['status'] == 'verified' else 'branch_prepare_blocked'
-            return message(status, application=app, repository=repo, backend='git',
+            return message(status, **{field: app}, repository=repo, backend='git',
                            desktop_reconciliation=reconciliation)
         worktrees = require_mapping(data.get('worktrees', {}), 'worktrees')
         if worktrees.keys() - context['branch_targets'].keys():
@@ -135,7 +136,8 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
             return response
         item = store.find_item(data.get('item'))
         if action == 'attempt_finish':
-            response = attempt_finish(store, item, data, branches_verified=branches_verified)
+            response = attempt_finish(store, item, data, branches_verified=branches_verified,
+                                      config_directory=config_directory)
         else:
             response = actions[action](store, item, data)
         conn.execute('INSERT INTO events(event_id,request,response) VALUES(?,?,?)',

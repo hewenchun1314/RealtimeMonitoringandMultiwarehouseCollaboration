@@ -129,7 +129,7 @@ def reserve(store, data):
     store.conn.execute('''INSERT INTO dispatches(request_id,item_seq,desktop_project_id,state,expires_at)
                          VALUES(?,?,?,'reserved',?)''', (request_id, head['seq'], desktop_project, expires_at))
     # Keep configuration for the original admission across retries and recovery rounds.
-    snapshot = head['config_snapshot'] or encode(store.config)
+    snapshot = head['config_snapshot'] or encode({**store.config, 'workflow_version': 2})
     state = 'bound' if head['chat_id'] else 'reserved'
     store.update_item(head, request_id=request_id, state=state, assigned_to=assigned, source_status=status,
                       observed_at=check_time, desktop_project_id=desktop_project, config_snapshot=snapshot)

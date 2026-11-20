@@ -18,7 +18,7 @@ except ModuleNotFoundError:
     run = None
 
 
-class WorkflowTests(unittest.TestCase):
+class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(run, 'The workflow command handler is not implemented')
         temp = tempfile.TemporaryDirectory()
@@ -74,6 +74,17 @@ class WorkflowTests(unittest.TestCase):
         self.record('bind', request_id=request_id, chat_id='chat-2', desktop_project_id='desktop-1')
         self.record('start', request_id=request_id, chat_id='chat-2')
         return {'request_id': request_id, 'chat_id': 'chat-2'}
+
+
+class WorkflowTests(WorkflowFixture):
+    """Admitted legacy items continue to use their original configuration snapshot."""
+
+    def reserve(self, item_id, **overrides):
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.execute('UPDATE work_items SET config_snapshot=? WHERE item_id=? AND config_snapshot IS NULL',
+                         (json.dumps(self.config), str(item_id)))
+            conn.commit()
+        return super().reserve(item_id, **overrides)
 
     def test_baseline_stale_partial_and_case_sensitive_queue(self):
         self.assertEqual(self.scan('initial', [self.row(1)])['status'], 'baseline')

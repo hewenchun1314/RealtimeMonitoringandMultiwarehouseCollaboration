@@ -1,6 +1,8 @@
 # 分支核验与工作树
 
-使用工单配置快照中的 `development.frontend_bundle` 和 `workspaces.frontend`。应用键与构建清单一致，严格区分大小写。`repository` 是相对前端工作区的仓库路径，`branch` 是本单的基线及合回目标。计划只列需要提交代码的应用。仅在浏览器中加载的依赖按 E2E 指引核对。
+前端计划在 `frontend.plan` 的 `evidence.applications` 登记应用键，核对快照中的 `development.frontend_bundle.applications` 和 `workspaces.frontend`。后端计划在 `backend.plan` 的 `evidence.services` 登记服务键，核对 `development.backend_bundle.services` 和 `workspaces.backend`。键严格区分大小写。`repository` 相对于对应端工作区，`branch` 是基线及合回目标。两端分别准备工作树，同名服务和应用也使用各自的工单分支。已领取的旧单沿用原计划、阶段名与工作树。
+
+下列步骤在账本返回的 `frontend.branch_check` 或 `backend.branch_check` 运行，旧单仍使用 `branch_check`。`branch_prepare` 的前端请求传 `application`，后端请求传 `service`。`branch_inspect.worktrees` 和核验回执 `repositories` 的键始终使用本端计划中的配置键。纯后端工单核对服务工作区和独立验收入口。
 
 ## 计划完成后
 
@@ -17,5 +19,9 @@ Windows 工单启动器中的 CLI 若没有桌面建树工具，先核对现有 
 已证实应用映射缺失或无效、缺少实际 Git 仓库或本地及远端均无目标分支时，按不可重试失败记录应用、目标分支、路径和确认依据。仓库暂不可读、远端暂不可达或工具暂时异常时，按首次失败后最多三次重试处理。每次重试沿用账本中的工单和目标配置，先读回已有工作树再继续。
 
 建树回执超时时，核对原操作是否已停止，或是否已限定在本工单独立的 detached worktree 内且没有任何编码 Agent 启动。能证明隔离时保存证据，按超时处理。迟到的工作树回执只进入原尝试对账。复验得到新的结论时使用新的完成事件编号。
+
+## 多仓合回和恢复
+
+主工单会话按每个仓库登记候选 SHA，合回后从目标分支读回实际 SHA。某个仓库受阻时，阶段失败证据中的 `merged_versions` 只填已读回的仓库和提交，同时记录其余仓库的具体原因。恢复时逐仓核对上轮回执和 `git rev-parse refs/heads/<目标分支>`，用 `git merge-base --is-ancestor <候选SHA> <目标SHA>` 判断候选是否已包含。已包含的候选只需重新登记当前目标版本；继续处理其他仓库。有新增合并内容时检查其影响，树内容发生变化时补充 `merged_verification`。最终成功回执提交全部必需仓库的候选与合回版本。
 
 用完重试或确认不可重试时，在 `blockers.md` 列出受阻应用和步骤、尝试结果及依赖关系。按账本进入编码。编码阶段核对是否有可用且已核验的工单工作树，缺少时记录具体阻断并继续单测等后续阶段。待写回项可按现有规则补发。整个过程按账本和工具回执推进，无需人工答复。

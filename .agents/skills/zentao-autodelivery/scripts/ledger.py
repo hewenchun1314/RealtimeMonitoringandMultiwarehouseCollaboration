@@ -6,9 +6,16 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from delivery_scope import project_mode, route_stages
 
 STAGES = ('material_check', 'design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'e2e', 'integration')
 STAGE_NAMES = dict(zip(STAGES, ('材料评审', '设计', '计划', '分支核验', '编码', '单元测试', 'Code Review', 'E2E', '合回')))
+STAGE_NAMES.update(split='范围判定与任务拆分', handoff='后端联调交接')
+for scoped_stage in route_stages('fullstack'):
+    if '.' in scoped_stage:
+        side, step = scoped_stage.split('.')
+        STAGE_NAMES[scoped_stage] = ('前端' if side == 'frontend' else '后端') + (
+            '服务验收' if step == 'acceptance' else STAGE_NAMES[step])
 ITEM_FIELDS = ('instance', 'project_id', 'kind', 'id')
 
 SCHEMA = """
@@ -127,6 +134,24 @@ def workflow_stages(development):
     return STAGES if 'frontend_bundle' in development else tuple(stage for stage in STAGES if stage != 'branch_check')
 
 
+def validate_backend(config, development):
+    require_text(require_mapping(config.get('workspaces'), 'workspaces').get('backend'), 'workspaces.backend')
+    bundle = require_mapping(development.get('backend_bundle'), 'development.backend_bundle')
+    require_text(bundle.get('name'), 'backend_bundle.name')
+    services = require_mapping(bundle.get('services'), 'backend_bundle.services')
+    if not services:
+        raise ValueError('backend_bundle.services must contain a service')
+    for key, service in services.items():
+        require_text(key, 'service key')
+        service = require_mapping(service, key)
+        for field in ('repository', 'branch', 'build_command', 'test_command', 'acceptance_command'):
+            require_text(service.get(field), f'{key}.{field}')
+        path = Path(service['repository'])
+        if path.anchor or '..' in path.parts:
+            raise ValueError(f'{key}.repository must be relative to the backend workspace')
+        require_text(service.get('start_command') or service.get('service_url'), f'{key}.start_command or service_url')
+
+
 def validate_config(config):
     config = require_mapping(config, 'config')
     zentao = require_mapping(config.get('zentao'), 'zentao')
@@ -145,7 +170,10 @@ def validate_config(config):
     if type(development.get('max_retries_per_step')) is not int or not 0 <= development['max_retries_per_step'] <= 3:
         raise ValueError('development.max_retries_per_step must be an integer from zero to three')
     timeouts = require_mapping(development.get('step_timeout_minutes'), 'development.step_timeout_minutes')
-    if 'frontend_bundle' in development:
+    mode = project_mode(development)
+    if mode != 'frontend_only':
+        validate_backend(config, development)
+    if mode != 'backend_only' and 'frontend_bundle' in development:
         bundle = require_mapping(development['frontend_bundle'], 'development.frontend_bundle')
         require_text(bundle.get('name'), 'development.frontend_bundle.name')
         applications = require_mapping(bundle.get('applications'), 'development.frontend_bundle.applications')
@@ -153,9 +181,14 @@ def validate_config(config):
             require_text(application, 'application')
         workspaces = require_mapping(config.get('workspaces'), 'workspaces')
         require_text(workspaces.get('frontend'), 'workspaces.frontend')
-    for stage in workflow_stages(development):
-        if stage == 'integration' and stage not in timeouts:
-            continue
+    required = set(workflow_stages(development)) - {'integration'}
+    if mode == 'backend_only':
+        required.discard('branch_check')
+        if 'e2e' not in timeouts:
+            required.discard('e2e')
+            if 'backend.acceptance' not in timeouts:
+                required.add('acceptance')
+    for stage in required | set(timeouts):
         if type(timeouts.get(stage)) is not int or not 1 <= timeouts[stage] <= 1440:
             raise ValueError(f'development.step_timeout_minutes.{stage} must be an integer from one to 1440')
     runtime = require_mapping(config.get('runtime', {}), 'runtime')

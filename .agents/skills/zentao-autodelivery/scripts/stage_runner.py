@@ -220,7 +220,8 @@ def main(argv):
     try:
         if os.name != 'nt' or not command:
             raise ValueError('A Windows host and an explicit worker command are required')
-        if any(not re.fullmatch(r'[a-zA-Z0-9_-]{1,96}', part) for part in (args.attempt_id, args.phase)):
+        if (not re.fullmatch(r'[a-zA-Z0-9_-]{1,96}', args.attempt_id) or len(args.phase) > 96
+                or not re.fullmatch(r'(?:(?:backend|frontend)\.)?[a-zA-Z0-9_-]+', args.phase)):
             raise ValueError('Invalid attempt identifier or phase')
         deadline = datetime.fromisoformat(args.deadline_at)
         if deadline.utcoffset() is None:

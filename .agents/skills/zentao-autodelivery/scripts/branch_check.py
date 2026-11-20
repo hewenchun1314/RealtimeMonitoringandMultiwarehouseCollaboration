@@ -7,8 +7,12 @@ import subprocess
 from pathlib import Path
 
 
-def planned_applications(evidence):
-    applications = evidence.get('applications') if isinstance(evidence, dict) else None
+BRANCH_STAGES = ('branch_check', 'frontend.branch_check', 'backend.branch_check')
+
+
+def planned_applications(evidence, side='frontend'):
+    field = 'services' if side == 'backend' else 'applications'
+    applications = evidence.get(field) if isinstance(evidence, dict) else None
     if (not isinstance(applications, list) or not applications
             or any(not isinstance(app, str) or not app.strip() for app in applications)
             or len(set(applications)) != len(applications)):
@@ -18,19 +22,28 @@ def planned_applications(evidence):
 
 def branch_context(store, item):
     snapshot = json.loads(item['config_snapshot'])
-    bundle = snapshot['development']['frontend_bundle']
-    plan = store.conn.execute('''SELECT result FROM attempts WHERE item_seq=? AND stage='plan'
+    side, separator, _ = item['stage'].partition('.')
+    legacy = not separator
+    side = 'frontend' if legacy else side
+    bundle = snapshot['development'].get(f'{side}_bundle', {})
+    targets = bundle.get('services' if side == 'backend' else 'applications', {})
+    plan_stage = 'plan' if legacy else f'{side}.plan'
+    plan = store.conn.execute('''SELECT result,outcome FROM attempts WHERE item_seq=? AND stage=?
                                  ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
-                              (item['seq'],)).fetchone()
+                              (item['seq'], plan_stage)).fetchone()
     applications = []
-    if plan and plan['result']:
-        applications = planned_applications(json.loads(plan['result']).get('evidence')) or []
-    return {
-        'bundle': bundle['name'],
-        'frontend_workspace': snapshot['workspaces']['frontend'],
-        'branch_targets': {app: bundle['applications'].get(app) for app in applications},
-        'worktree_branch': f'zentao/{item["marker"].lower()}-{item["run_round"]}',
-    }
+    if plan and plan['result'] and (legacy or plan['outcome'] == 'success'):
+        applications = planned_applications(json.loads(plan['result']).get('evidence'), side) or []
+    workspace = snapshot.get('workspaces', {}).get(side)
+    suffix = '' if legacy else f'-{side}'
+    context = {'bundle': bundle.get('name', side), 'workspace': workspace,
+               'branch_targets': {app: targets.get(app) for app in applications},
+               'worktree_branch': f'zentao/{item["marker"].lower()}-{item["run_round"]}{suffix}'}
+    if legacy:
+        context['frontend_workspace'] = workspace
+    else:
+        context['side'] = side
+    return context
 
 
 def source_refs(branch):
@@ -90,15 +103,15 @@ def is_repo_root(path):
     return root is not None and Path(root).resolve() == path
 
 
-def inspect_repository(frontend, target, worktree_branch, worktree):
+def inspect_repository(workspace, target, worktree_branch, worktree):
     if target is None:
         return {'status': 'mapping_missing'}
     if not valid_target(target):
         return {'status': 'mapping_invalid'}
     branch = target['branch']
-    repository = (frontend / target['repository']).resolve()
+    repository = (workspace / target['repository']).resolve()
     app = {'source_root': str(repository), 'target_branch': branch}
-    if not repository.is_relative_to(frontend) or not repository.is_dir() or not is_repo_root(repository):
+    if not repository.is_relative_to(workspace) or not repository.is_dir() or not is_repo_root(repository):
         return {**app, 'status': 'repository_missing'}
     if git(repository, 'check-ref-format', f'refs/heads/{branch}', allowed=(0, 1)) is None:
         return {**app, 'status': 'invalid_target_branch'}
@@ -128,12 +141,14 @@ def inspect_repository(frontend, target, worktree_branch, worktree):
 
 
 def inspect_branches(context, config_directory, worktrees):
-    frontend = (config_directory / context['frontend_workspace']).resolve()
+    if not context['workspace']:
+        return {key: {'status': 'workspace_missing'} for key in context['branch_targets']}
+    workspace = (config_directory / context['workspace']).resolve()
     repositories = {}
     for application, target in context['branch_targets'].items():
         try:
             repositories[application] = inspect_repository(
-                frontend, target, context['worktree_branch'], worktrees.get(application),
+                workspace, target, context['worktree_branch'], worktrees.get(application),
             )
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
             repositories[application] = {'status': 'inspection_failed', 'reason': str(error)}
@@ -143,10 +158,12 @@ def inspect_branches(context, config_directory, worktrees):
 def prepare_local_worktree(context, config_directory, database, app, deadline_budget):
     branch = context['worktree_branch']
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', app) or app not in context['branch_targets']:
-        raise ValueError('Select a configured application from the current plan')
+        raise ValueError('Select a configured repository from the current plan')
     target = context['branch_targets'][app]
-    frontend = (config_directory / context['frontend_workspace']).resolve()
-    resolved = inspect_repository(frontend, target, branch, None)
+    if not context['workspace']:
+        return {'status': 'workspace_missing'}
+    source_workspace = (config_directory / context['workspace']).resolve()
+    resolved = inspect_repository(source_workspace, target, branch, None)
     if resolved['status'] != 'resolved':
         return resolved
     workspace = Path(database).resolve().parent
@@ -160,4 +177,4 @@ def prepare_local_worktree(context, config_directory, database, app, deadline_bu
         path.parent.mkdir(parents=True, exist_ok=True)
         git(repository, 'worktree', 'add', '-b', branch, '--', str(path), resolved['base_commit'],
             timeout=min(50, max(1, deadline_budget)))
-    return inspect_repository(frontend, target, branch, str(path))
+    return inspect_repository(source_workspace, target, branch, str(path))

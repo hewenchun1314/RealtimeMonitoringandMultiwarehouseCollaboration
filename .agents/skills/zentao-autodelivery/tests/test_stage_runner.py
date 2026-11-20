@@ -14,14 +14,22 @@ RUNNER = Path(__file__).resolve().parents[1] / 'scripts' / 'stage_runner.py'
 
 @unittest.skipUnless(os.name == 'nt', 'Windows stage workers require Windows Job Objects')
 class StageRunnerTests(unittest.TestCase):
-    def invoke(self, folder, attempt, seconds, command):
+    def invoke(self, folder, attempt, seconds, command, phase='verify'):
         deadline = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         worker = subprocess.run(
-            [sys.executable, '-B', str(RUNNER), '--attempt-id', attempt, '--phase', 'verify',
+            [sys.executable, '-B', str(RUNNER), '--attempt-id', attempt, '--phase', phase,
              '--deadline-at', deadline.isoformat(), '--cwd', str(folder), '--evidence-dir', str(folder),
              '--', *command], capture_output=True, encoding='utf-8', timeout=15, check=True,
         )
         return json.loads(worker.stdout)
+
+    def test_routed_repair_phase_has_its_own_worker_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            receipt = self.invoke(folder, 'joint', 10, [sys.executable, '-c', 'print("repaired")'],
+                                  phase='backend.coding')
+            self.assertEqual(receipt['outcome'], 'success')
+            self.assertEqual(Path(receipt['receipt_path']), folder / 'joint' / 'backend.coding' / 'result.json')
 
     def test_deadline_stops_worker_and_grandchild_without_touching_external_process(self):
         payload = (
