@@ -31,55 +31,60 @@
       "name": "micro-hnf-universal-subapp",
       "applications": {
         "aggregation-platform": {
-          "branch": "hnf-hangzhou-universal-subapp",
+          "branch": "AI-development",
           "repository": "."
         },
+        "simba": { "branch": "AI-development", "repository": "root/simba" },
         "micro-data-pool": {
-          "branch": "hnf-hangzhou-universal-subapp",
+          "branch": "AI-development",
           "repository": "root/micro-data-pool"
         },
-        "shell-hub": { "branch": "hnf", "repository": "root/shell-hub" },
+        "shell-hub": { "branch": "AI-development", "repository": "root/shell-hub" },
         "sso": {
-          "branch": "hnf-hangzhou-universal-subapp",
+          "branch": "AI-development",
           "repository": "root/sso"
         },
-        "cooperation": { "branch": "hnf", "repository": "root/cooperation" },
+        "cooperation": { "branch": "AI-development", "repository": "root/cooperation" },
         "fracturing-design": {
-          "branch": "hnf-hangzhou",
+          "branch": "AI-development",
           "repository": "children/fracturing-design"
         },
         "micro-dp-load-page": {
-          "branch": "hnf-hangzhou-universal-subapp",
+          "branch": "AI-development",
           "repository": "children/micro-dp-load-page"
         },
         "micro-double-sweet-spot": {
-          "branch": "micro-dev",
+          "branch": "AI-development",
           "repository": "children/micro-double-sweet-spot"
         },
         "tet-smart-log": {
-          "branch": "hnf-hangzhou",
+          "branch": "AI-development",
           "repository": "children/tet-smart-log"
         },
         "micro-pure-model-page": {
-          "branch": "hnf-hangzhou-universal-subapp",
+          "branch": "AI-development",
           "repository": "children/micro-pure-model-page"
         },
-        "llm-web": { "branch": "micro-dev", "repository": "children/llm-web" },
+        "llm-web": { "branch": "AI-development", "repository": "children/llm-web" },
         "SmartLogging-SPARK": {
-          "branch": "hnf-hangzhou-universal-subapp",
+          "branch": "AI-development",
           "repository": "children/smart-logging-spark"
         },
         "TetDMSWeb": {
-          "branch": "micro-dev-universal-subapp",
+          "branch": "AI-development",
           "repository": "children/dms-web"
         },
         "micro-drilling-track": {
-          "branch": "micro-dev",
+          "branch": "AI-development",
           "repository": "children/micro-drilling-track"
         },
         "digital-twin": {
-          "branch": "micro-dev",
+          "branch": "AI-development",
           "repository": "children/digital-twin"
+        },
+        "simulation-tracking": {
+          "branch": "AI-development",
+          "repository": "children/simulation-tracking"
         }
       }
     },
