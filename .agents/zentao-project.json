@@ -11,7 +11,8 @@
   },
   "workspaces": {
     "requirement": "../req-demo",
-    "frontend": "../aggregation-platform-4"
+    "frontend": "../aggregation-platform-4",
+    "backend": "../srv-workspace"
   },
   "monitor": {
     "enabled": true,
@@ -81,6 +82,51 @@
         }
       }
     },
+    "backend_bundle": {
+      "name": "srv-workspace",
+      "services": {
+        "smart-geo": {
+          "repository": "smart-geo",
+          "branch": "main",
+          "build_command": "mvn -B -pl smart-geo/smart-geo-server -am -DskipTests package",
+          "test_command": "mvn -B -pl smart-geo/smart-geo-server -am test",
+          "start_command": "java -jar (Get-Item 'smart-geo-server/target/smart-geo-server-*.jar').FullName --server.address=127.0.0.1 --server.port=18081",
+          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18081/tet/smart-geo/api/v3/api-docs'"
+        },
+        "model-manage-srv": {
+          "repository": "model-manage-srv",
+          "branch": "main",
+          "build_command": "mvn -B -pl model-manage-srv/app -am -DskipTests package",
+          "test_command": "mvn -B -pl model-manage-srv/app -am test",
+          "start_command": "java -jar (Get-Item 'app/target/app-*.jar').FullName --server.address=127.0.0.1 --server.port=18082",
+          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18082/tet/model-manage/api/v3/api-docs'"
+        },
+        "task-manage-grpc": {
+          "repository": "task-manage-grpc",
+          "branch": "main",
+          "build_command": "mvn -B -pl task-manage-server -am -DskipTests package",
+          "test_command": "mvn -B -pl task-manage-server -am test",
+          "start_command": "java -jar (Get-Item 'task-manage-server/target/task-manage-server-*.jar').FullName --server.address=127.0.0.1 --server.port=18083",
+          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18083/actuator/health'"
+        },
+        "tet-task-manager": {
+          "repository": "tet-task-manager",
+          "branch": "main",
+          "build_command": "dotnet build Tet.TaskManager.sln",
+          "test_command": "dotnet test Tet.TaskManager.Tests/Tet.TaskManager.Tests.csproj",
+          "start_command": "dotnet run --no-build --project Tet.TaskManager.WebApi/Tet.TaskManager.WebApi.csproj --launch-profile http",
+          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1/swagger/v1/swagger.json'"
+        },
+        "model-python": {
+          "repository": "model-python",
+          "branch": "zy-dev",
+          "build_command": "uv run --frozen python -m compileall -q app",
+          "test_command": "uv run --frozen pytest -q",
+          "start_command": "uv run --frozen uvicorn app.main:app --host 127.0.0.1 --port 5111",
+          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:5111/version'"
+        }
+      }
+    },
     "step_timeout_minutes": {
       "material_check": 10,
       "design": 45,
@@ -106,6 +152,39 @@
     "default_work_area": {
       "id": "fa02e06b9cfb4b7a9b959b0a33cbf36c",
       "name": "海能发陆上示范区工区"
+    }
+  },
+  "_comments": {
+    "development.allowed_requirement_types": {
+      "纯前端（当前配置）": ["frontend_only"],
+      "纯后端": ["backend_only"],
+      "前后端均可": ["frontend_only", "backend_only", "fullstack"],
+      "判定顺序": "单端项目始终只走配置的端。前后端均可时，先看需求 intent.md 中的“研发范围：纯前端 / 纯后端 / 前后端”（三选一）；未填写时由拆分 Agent 判断。",
+      "修改生效": "将所选数组填入 development.allowed_requirement_types。新领取的工单使用新配置，已领取的工单按原快照继续。"
+    },
+    "zentao": {
+      "base_url / project_name": "禅道实例地址和要监测的项目名称。",
+      "credential_ref": "访问禅道时使用的本机凭据引用。",
+      "assigned_to_accounts": "只接收指派给所列账号的工单，账号区分大小写。空数组暂停领取新单。",
+      "accepted_statuses": "story 填需求状态，bug 填缺陷状态。某类的状态数组为空时跳过该类扫描。"
+    },
+    "workspaces": "路径相对于本配置文件所在的 .agents 目录。requirement 指向需求材料仓库，frontend 指向前端工作区，backend 指向 srv-workspace 后端父仓。",
+    "monitor": "enabled 控制新单扫描和领取。interval_minutes 以分钟表示期望的监测间隔；实际唤醒时间由 Codex 桌面定时任务决定。",
+    "runtime": "desktop_project_id 用于将工单会话绑定到对应的 Codex 桌面项目。require_unattended_approval 为 true 时，启动前核验会话能否无人值守执行。",
+    "development": {
+      "max_concurrent_items": "同时占用执行名额的工单上限。",
+      "max_retries_per_step": "每一步首次尝试失败后允许重试的次数。填 3 表示首次执行加最多 3 次重试。",
+      "frontend_bundle": "name 是前端应用组名称。applications 的键供开发计划引用；每个应用的 repository 相对于 workspaces.frontend，点号表示工作区根仓库。branch 是分支核验和最终合回的目标分支。",
+      "backend_bundle": "services 登记可独立运行的服务。repository 相对于 workspaces.backend，branch 取自 srv-workspace/submodule-branch.txt。当前纯前端配置下跳过这些服务。",
+      "backend_bundle.build_command / test_command": "smart-geo 和 model-manage-srv 的 Maven 命令在本单的 reactor 根目录运行，以 srv-workspace/pom.xml 为聚合清单，并将相应模块指向已核验的候选工作树。其余服务在各自工单工作树根目录运行。tet-common-java 和 tet-dbprovider-java 的跟踪分支均为 main，作为公共库按需解析。",
+      "backend_bundle.start_command / acceptance_command": "启动命令使用 PowerShell，从相应服务的候选工作树根目录执行。Java 服务需先完成打包。验收命令是本地连通性检查；工单测试另按改动验证业务场景及实际运行版本。model-python 的默认入口为 HTTP API，涉及训练 Worker 的工单按该仓库 ReadMe.md 启动和验证 gRPC Worker。",
+      "step_timeout_minutes": "每个阶段单次尝试的最长分钟数。默认拆分用 plan 时限，后端功能验收用 e2e 时限，跨端交接用 integration 时限。"
+    },
+    "e2e": {
+      "workspace / start_command": "前端页面验收使用的工作区键，以及服务尚未运行时的启动命令。",
+      "ready_url / platform_entry_path": "ready_url 可指定前端服务地址；为 null 时从启动输出或现有页面确认。platform_entry_path 是登录后进入平台的页面路径。",
+      "login": "path 是登录页路径，username 是测试账号，credential_ref 指向该账号的本机凭据。",
+      "default_work_area": "页面验收默认进入的业务工区，id 用于定位，name 用于核对名称。"
     }
   }
 }

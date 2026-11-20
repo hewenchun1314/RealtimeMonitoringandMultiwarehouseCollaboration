@@ -62,6 +62,7 @@ class DeliveryScopeTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_config(self.config)
         dev['allowed_requirement_types'] = ['backend_only']
+        dev.pop('backend_bundle', None)
         with self.assertRaises(ValueError):
             validate_config(self.config)
         service = dict(repository='.', branch='main', build_command='make', test_command='make test',
