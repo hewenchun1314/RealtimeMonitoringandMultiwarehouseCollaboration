@@ -1,5 +1,7 @@
 # 分支核验与工作树
 
+设为 `writable` 的后端依赖也可以按依赖键列入后端计划。该目标的仓库位置来自 `source_path`，`branch` 来自其 `delivery`，仍须通过同一套工单工作树与合回核验。
+
 前端计划在 `frontend.plan` 的 `evidence.applications` 登记应用键，核对快照中的 `development.frontend_bundle.applications` 和 `workspaces.frontend`。后端计划在 `backend.plan` 的 `evidence.services` 登记服务键，核对 `development.backend_bundle.services` 和 `workspaces.backend`。键严格区分大小写。`repository` 相对于对应端工作区，`branch` 是基线及合回目标。两端分别准备工作树，同名服务和应用也使用各自的工单分支。已领取的旧单沿用原计划、阶段名与工作树。
 
 下列步骤在账本返回的 `frontend.branch_check` 或 `backend.branch_check` 运行，旧单仍使用 `branch_check`。`branch_prepare` 的前端请求传 `application`，后端请求传 `service`。`branch_inspect.worktrees` 和核验回执 `repositories` 的键始终使用本端计划中的配置键。纯后端工单核对服务工作区和独立验收入口。

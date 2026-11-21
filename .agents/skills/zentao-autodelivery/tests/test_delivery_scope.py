@@ -70,6 +70,7 @@ class DeliveryScopeTests(unittest.TestCase):
         self.config['workspaces'] = {'backend': '../services'}
         del dev['frontend_bundle']
         self.config.pop('e2e', None)
+        self.config.pop('backend_dependencies', None)
         dev['backend_bundle'] = {'name': 'service-group', 'services': {'api': service}}
         validate_config(self.config)
         for invalid in ({'repository': '../other'}, {'service_url': ''}, {'branch': ''}, {'test_command': None}):

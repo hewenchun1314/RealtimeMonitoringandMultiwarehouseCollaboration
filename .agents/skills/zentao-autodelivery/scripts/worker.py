@@ -13,16 +13,34 @@ import sys
 from threading import Event
 from uuid import UUID, uuid4
 
+from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
+from ledger import validate_config
 from stage_runner import run_stage, utc_now
 from task_sync import enabled as task_sync_enabled
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 
 
-def command(cli, operation, chat_id=None):
+def codex_directory():
+    return Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+
+
+def command(cli, operation, chat_id=None, *, protected_roots=(), writable_roots=()):
     argv = [str(cli), '--ask-for-approval', 'never', 'exec',
             '--json', '--color', 'never', '--skip-git-repo-check']
+    if protected_roots or writable_roots:
+        if any(root.is_relative_to(protected) for root in writable_roots for protected in protected_roots):
+            raise ValueError('A writable worker root is inside a read-only dependency')
+        filesystem = {':root': 'read', ':tmpdir': 'write'}
+        filesystem.update({path.as_posix(): 'write' for path in writable_roots})
+        filesystem.update({path.as_posix(): 'read' for path in protected_roots})
+        entries = ','.join(f'{json.dumps(path, ensure_ascii=False)}="{access}"'
+                           for path, access in filesystem.items())
+        argv.extend(['-c', 'default_permissions="zentao_delivery"',
+                     '-c', 'permissions.zentao_delivery.filesystem={' + entries + '}',
+                     '-c', 'permissions.zentao_delivery.network.enabled=true',
+                     '-c', 'windows.sandbox="mxc"'])
     if operation == 'probe':
         argv.append('--ephemeral')
     if operation == 'run':
@@ -55,6 +73,9 @@ def worker_prompt(operation, item):
         '禁止申请临时权限、弹审批、提问或等待人工确认，也不要开启新的桌面聊天。'
         '每次阶段尝试使用账本截止时间及阶段运行器。'
         '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
+        '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
+        '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
+        '按同名后端服务列入计划并使用核验过的工单工作树。前端使用已配置业务后端的契约。'
         '跨端工单在后端合回且联调交接通过后才启动前端。旧工单沿用原阶段。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )
@@ -111,12 +132,20 @@ def run(operation, marker, cli):
                     return existing
         else:
             run_id = uuid4().hex
+        config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        validate_config(config)
+        configs = [config]
+        if item is not None and item['config_snapshot']:
+            configs.append(json.loads(item['config_snapshot']))
+        # The current configuration can narrow permissions for an admitted item.
+        protected, writable = worker_roots(configs, CONFIG_PATH.parent, PROJECT_ROOT, codex_directory())
+        argv = command(cli, operation, item['chat_id'] if item is not None else None,
+                       protected_roots=protected, writable_roots=writable)
         prompt_file = output / f'{run_id}.txt'
         prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
         os.environ.pop('CODEX_THREAD_ID', None)
         deadline = utc_now() + (timedelta(hours=72) if operation == 'run' else timedelta(minutes=4))
-        launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file,
-                  command(cli, operation, item['chat_id'] if item is not None else None))
+        launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
         sync_receipt = None
         if operation == 'run' and task_sync_enabled(item):
             stop = Event()
@@ -180,8 +209,7 @@ def main():
     parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks'))
     parser.add_argument('--marker')
     args = parser.parse_args()
-    host_config = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
-    cli = host_config / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
+    cli = codex_directory() / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
     try:
         result = run_monitor_sync() if args.operation == 'sync-tasks' else run(
             args.operation, args.marker, cli.resolve(strict=True))

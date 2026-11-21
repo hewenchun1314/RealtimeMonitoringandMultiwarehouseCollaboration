@@ -4,12 +4,13 @@ import json
 from datetime import timedelta
 from uuid import uuid4
 
+from backend_dependencies import backend_services, dependency_context
 from branch_check import branch_context, planned_applications, valid_evidence
 from delivery_scope import read_material
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
-from route_execution import (get_split, is_routed, read_history, snapshot, split_result, stage_role,
+from route_execution import (get_split, is_routed, read_history, snapshot, split_result, stage_evidence, stage_role,
                              stages_for, v2_repair)
 import task_evidence
 
@@ -155,7 +156,25 @@ def phase_deadline(store, item, phase):
     return stamp(store.now + timedelta(minutes=minutes))
 
 
-def attempt_start(store, item, data):
+def phase_context(store, item, phase, config_directory):
+    stage = item['stage'] if phase == 'verify' else phase
+    context = {'role': stage_role(stage)}
+    if not stage.startswith('backend.'):
+        return context
+    config = snapshot(item)
+    if not config.get('backend_dependencies'):
+        return context
+    services = None
+    if stage not in ('backend.design', 'backend.plan'):
+        plan = stage_evidence(store, item, 'backend.plan')
+        services = set(planned_applications(plan, 'backend') or [])
+    dependencies = dependency_context(config, config_directory, services)
+    if dependencies:
+        context['backend_dependencies'] = dependencies
+    return context
+
+
+def attempt_start(store, item, data, *, config_directory):
     if not execution_matches(store, item, data) or item['state'] != 'running':
         return message('stale_execution')
     if data.get('stage') != item['stage']:
@@ -167,7 +186,7 @@ def attempt_start(store, item, data):
     active = active_attempt(store, item)
     if active:
         if routed:
-            preparation['role'] = stage_role(item['stage'] if active['phase'] == 'verify' else active['phase'])
+            preparation.update(phase_context(store, item, active['phase'], config_directory))
         return message('attempt_active', attempt_id=active['attempt_id'], deadline_at=active['deadline_at'],
                        phase=active['phase'], retry_number=active['retry_number'],
                        phase_started_at=active['phase_started_at'], **preparation)
@@ -203,7 +222,7 @@ def attempt_start(store, item, data):
                         phase, history = receipt['phase'], history[:index]
                         break
     if routed:
-        preparation['role'] = stage_role(item['stage'] if phase == 'verify' else phase)
+        preparation.update(phase_context(store, item, phase, config_directory))
     deadline = phase_deadline(store, item, phase)
     attempt_id = uuid4().hex
     store.conn.execute('''INSERT INTO attempts(attempt_id,item_seq,run_round,stage,retry_number,started_at,
@@ -215,7 +234,7 @@ def attempt_start(store, item, data):
                    **preparation)
 
 
-def repair_advance(store, item, data):
+def repair_advance(store, item, data, *, config_directory):
     if not execution_matches(store, item, data) or item['state'] != 'running':
         return message('stale_execution')
     trial = active_attempt(store, item)
@@ -261,9 +280,9 @@ def repair_advance(store, item, data):
                                                   trial['attempt_id']))
     if routed:
         task_evidence.refresh(store, item)
-    role = {'role': stage_role(item['stage'] if next_phase == 'verify' else next_phase)} if routed else {}
+    context = phase_context(store, item, next_phase, config_directory) if routed else {}
     return message('repair_advanced', attempt_id=trial['attempt_id'], phase=next_phase,
-                   phase_started_at=store.time, deadline_at=deadline, retry_number=trial['retry_number'], **role)
+                   phase_started_at=store.time, deadline_at=deadline, retry_number=trial['retry_number'], **context)
 
 
 def prior_repair_sequence(store, item):
@@ -391,8 +410,11 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         retry = False
     if finished and leaf == 'plan':
         side = stage.split('.')[0] if routed else 'frontend'
-        if stage.replace('plan', 'branch_check') in stages and not planned_applications(evidence, side):
+        targets = planned_applications(evidence, side)
+        if stage.replace('plan', 'branch_check') in stages and not targets:
             return message('services_required' if side == 'backend' else 'applications_required')
+        if side == 'backend' and set(targets or []) - backend_services(config).keys():
+            return message('evidence_required', reason='Backend plan services must be writable configured services')
     if finished and leaf == 'branch_check':
         if not valid_evidence(branch_context(store, item), evidence):
             return message('branch_evidence_required')

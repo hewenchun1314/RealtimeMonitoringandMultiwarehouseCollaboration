@@ -6,6 +6,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from backend_dependencies import backend_services, writable_dependencies
+
 
 BRANCH_STAGES = ('branch_check', 'frontend.branch_check', 'backend.branch_check')
 
@@ -26,7 +28,7 @@ def branch_context(store, item):
     legacy = not separator
     side = 'frontend' if legacy else side
     bundle = snapshot['development'].get(f'{side}_bundle', {})
-    targets = bundle.get('services' if side == 'backend' else 'applications', {})
+    targets = backend_services(snapshot) if side == 'backend' else bundle.get('applications', {})
     plan_stage = 'plan' if legacy else f'{side}.plan'
     plan = store.conn.execute('''SELECT result,outcome FROM attempts WHERE item_seq=? AND stage=?
                                  ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
@@ -43,6 +45,11 @@ def branch_context(store, item):
         context['frontend_workspace'] = workspace
     else:
         context['side'] = side
+    if side == 'backend':
+        dependency_workspaces = {key: entry['source_path'] for key, entry in writable_dependencies(snapshot).items()
+                                 if key in applications}
+        if dependency_workspaces:
+            context['dependency_workspaces'] = dependency_workspaces
     return context
 
 
@@ -63,7 +70,8 @@ def valid_target(target):
 def valid_evidence(context, evidence):
     repositories = evidence.get('repositories') if isinstance(evidence, dict) else None
     targets = context['branch_targets']
-    if not targets or not isinstance(repositories, dict) or repositories.keys() != targets.keys():
+    if (context.get('revoked_dependencies') or not targets
+            or not isinstance(repositories, dict) or repositories.keys() != targets.keys()):
         return False
     paths = set()
     for application, target in targets.items():
@@ -140,16 +148,22 @@ def inspect_repository(workspace, target, worktree_branch, worktree):
     return {**app, 'status': 'verified', 'worktree': str(worktree), 'worktree_branch': worktree_branch}
 
 
+def source_workspace(context, config_directory, key):
+    workspace = context.get('dependency_workspaces', {}).get(key, context['workspace'])
+    return (config_directory / workspace).resolve() if workspace else None
+
+
 def inspect_branches(context, config_directory, worktrees):
-    if not context['workspace']:
-        return {key: {'status': 'workspace_missing'} for key in context['branch_targets']}
-    workspace = (config_directory / context['workspace']).resolve()
     repositories = {}
     for application, target in context['branch_targets'].items():
+        if application in context.get('revoked_dependencies', ()):
+            repositories[application] = {'status': 'dependency_write_revoked'}
+            continue
         try:
-            repositories[application] = inspect_repository(
-                workspace, target, context['worktree_branch'], worktrees.get(application),
-            )
+            workspace = source_workspace(context, config_directory, application)
+            repositories[application] = (inspect_repository(
+                workspace, target, context['worktree_branch'], worktrees.get(application)
+            ) if workspace else {'status': 'workspace_missing'})
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
             repositories[application] = {'status': 'inspection_failed', 'reason': str(error)}
     return repositories
@@ -159,15 +173,17 @@ def prepare_local_worktree(context, config_directory, database, app, deadline_bu
     branch = context['worktree_branch']
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', app) or app not in context['branch_targets']:
         raise ValueError('Select a configured repository from the current plan')
+    if app in context.get('revoked_dependencies', ()):
+        return {'status': 'dependency_write_revoked'}
     target = context['branch_targets'][app]
-    if not context['workspace']:
+    workspace = source_workspace(context, config_directory, app)
+    if not workspace:
         return {'status': 'workspace_missing'}
-    source_workspace = (config_directory / context['workspace']).resolve()
-    resolved = inspect_repository(source_workspace, target, branch, None)
+    resolved = inspect_repository(workspace, target, branch, None)
     if resolved['status'] != 'resolved':
         return resolved
-    workspace = Path(database).resolve().parent
-    path = workspace / 'worktrees' / branch.split('/')[-1] / app
+    ledger_directory = Path(database).resolve().parent
+    path = ledger_directory / 'worktrees' / branch.split('/')[-1] / app
     if path.resolve() != path:
         raise ValueError('Worktree destination must be within the ledger workspace and cannot contain directory redirects')
     repository = Path(resolved['source_root'])
@@ -177,4 +193,4 @@ def prepare_local_worktree(context, config_directory, database, app, deadline_bu
         path.parent.mkdir(parents=True, exist_ok=True)
         git(repository, 'worktree', 'add', '-b', branch, '--', str(path), resolved['base_commit'],
             timeout=min(50, max(1, deadline_budget)))
-    return inspect_repository(source_workspace, target, branch, str(path))
+    return inspect_repository(workspace, target, branch, str(path))

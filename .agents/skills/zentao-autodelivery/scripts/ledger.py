@@ -159,12 +159,54 @@ def validate_backend(config, development):
     for key, service in services.items():
         require_text(key, 'service key')
         service = require_mapping(service, key)
-        for field in ('repository', 'branch', 'build_command', 'test_command', 'acceptance_command'):
-            require_text(service.get(field), f'{key}.{field}')
-        path = Path(service['repository'])
+        validate_service_delivery(service, key)
+        path = Path(require_text(service.get('repository'), f'{key}.repository'))
         if path.anchor or '..' in path.parts:
             raise ValueError(f'{key}.repository must be relative to the backend workspace')
-        require_text(service.get('start_command') or service.get('service_url'), f'{key}.start_command or service_url')
+
+
+def validate_service_delivery(service, key):
+    for field in ('branch', 'build_command', 'test_command', 'acceptance_command'):
+        require_text(service.get(field), f'{key}.{field}')
+    require_text(service.get('start_command') or service.get('service_url'), f'{key}.start_command or service_url')
+
+
+def validate_backend_dependencies(config, development):
+    dependencies = require_mapping(config.get('backend_dependencies', {}), 'backend_dependencies')
+    if not dependencies:
+        return
+    bundle = require_mapping(development.get('backend_bundle'), 'development.backend_bundle')
+    services = require_mapping(bundle.get('services'), 'backend_bundle.services')
+    writable = set()
+    for key, raw in dependencies.items():
+        require_text(key, 'backend dependency key')
+        field = f'backend_dependencies.{key}'
+        if key in services:
+            raise ValueError(f'{field} duplicates a backend service key')
+        dependency = require_mapping(raw, field)
+        access = dependency.get('access', 'read_only')
+        if access not in ('read_only', 'writable'):
+            raise ValueError(f'{field}.access must be read_only or writable')
+        if access == 'writable' or 'delivery' in dependency:
+            delivery = require_mapping(dependency.get('delivery'), f'{field}.delivery')
+            if 'repository' in delivery:
+                raise ValueError(f'{field}.delivery must use the repository at source_path')
+            validate_service_delivery(delivery, f'{field}.delivery')
+        if access == 'writable':
+            writable.add(key)
+        for name in ('source_path', 'api_source'):
+            path = Path(require_text(dependency.get(name), f'{field}.{name}'))
+            if path.anchor:
+                raise ValueError(f'{field}.{name} must be a relative path')
+            if name == 'api_source' and '..' in path.parts:
+                raise ValueError(f'{field}.api_source must stay inside source_path')
+        consumers = dependency.get('used_by')
+        require_strings(consumers, f'{field}.used_by')
+        if not consumers or len(set(consumers)) != len(consumers) or key in consumers:
+            raise ValueError(f'{field}.used_by must name unique configured backend services')
+    for key, dependency in dependencies.items():
+        if set(dependency['used_by']) - (services.keys() | writable):
+            raise ValueError(f'backend_dependencies.{key}.used_by references an unknown backend service')
 
 
 def validate_config(config):
@@ -189,8 +231,9 @@ def validate_config(config):
         raise ValueError('development.max_retries_per_step must be an integer from zero to three')
     timeouts = require_mapping(development.get('step_timeout_minutes'), 'development.step_timeout_minutes')
     mode = project_mode(development)
-    if mode != 'frontend_only':
+    if mode != 'frontend_only' or config.get('backend_dependencies'):
         validate_backend(config, development)
+    validate_backend_dependencies(config, development)
     if mode != 'backend_only' and 'frontend_bundle' in development:
         bundle = require_mapping(development['frontend_bundle'], 'development.frontend_bundle')
         require_text(bundle.get('name'), 'development.frontend_bundle.name')
@@ -210,6 +253,7 @@ def validate_config(config):
         if type(timeouts.get(stage)) is not int or not 1 <= timeouts[stage] <= 1440:
             raise ValueError(f'development.step_timeout_minutes.{stage} must be an integer from one to 1440')
     runtime = require_mapping(config.get('runtime', {}), 'runtime')
+    require_strings(runtime.get('worker_cache_paths', []), 'runtime.worker_cache_paths')
     if 'split_task_sync' in runtime and type(runtime['split_task_sync']) is not bool:
         raise ValueError('runtime.split_task_sync must be a boolean')
     if 'desktop_project_id' in runtime:

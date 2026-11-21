@@ -45,6 +45,7 @@ class RouteDrills(unittest.TestCase):
         self.database = self.root / 'ledger' / 'workflow.sqlite3'
         self.now = datetime.now(timezone.utc)
         self.config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        self.config.pop('backend_dependencies', None)
         self.config.get('e2e', {}).pop('enabled', None)
         self.assertEqual(self.config['development']['allowed_requirement_types'], ['frontend_only'])
         self.config['zentao'].update(base_url='http://127.0.0.1:1', assigned_to_accounts=['drill'])

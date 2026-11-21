@@ -1,6 +1,7 @@
 import sqlite3
 import json
 from contextlib import closing
+from pathlib import Path
 
 from test_workflow import WorkflowFixture
 
@@ -34,6 +35,145 @@ class RouteExecutionTests(WorkflowFixture):
             result = json.loads(conn.execute("SELECT result FROM attempts WHERE stage='split'").fetchone()[0])
         self.assertEqual(result['route']['source'], 'config')
         self.assertEqual(result['route']['material']['markers'], ['前后端'])
+
+    def configure_backend_dependencies(self):
+        self.config['workspaces']['backend'] = 'backend'
+        service = {'branch': 'main', 'build_command': 'build', 'test_command': 'test',
+                   'acceptance_command': 'check', 'service_url': 'http://127.0.0.1:1'}
+        self.config['development']['backend_bundle'] = {'name': 'Business API', 'services': {
+            name: {**service, 'repository': name} for name in ('business-api', 'local-api')
+        }}
+        self.config['backend_dependencies'] = {'upstream': {
+            'source_path': 'providers/upstream', 'api_source': 'contracts', 'used_by': ['business-api']
+        }}
+
+    def test_dependency_discovery_uses_admitted_snapshot_and_selected_services(self):
+        self.configure_backend_dependencies()
+        self.config['development']['allowed_requirement_types'] = ['backend_only']
+        self.material.write_text('研发范围：纯后端', encoding='utf-8')
+        context = self.start()
+        self.config['backend_dependencies']['upstream']['api_source'] = 'new-contracts'
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        task = {'id': 'B1', 'description': 'Serve local data', 'acceptance': ['Returns local records']}
+        self.finish_stage(context, 'split', evidence={'tasks': {'backend': [task]}})
+        design = self.record('attempt_start', **context, stage='backend.design')
+        api_source = self.fixture / 'providers' / 'upstream' / 'contracts'
+        self.assertEqual(design.get('backend_dependencies', {}).get('upstream'), {
+            'source_path': str(api_source.parent), 'api_source': str(api_source), 'used_by': ['business-api'],
+            'access': 'read_only',
+        })
+        active = self.record('attempt_start', **context, stage='backend.design')
+        self.assertEqual(active['backend_dependencies'], design['backend_dependencies'])
+        self.record('attempt_finish', **context, attempt_id=design['attempt_id'],
+                    outcome='success', summary='Design local implementation', evidence={'path': 'design.md'})
+        plan = self.record('attempt_start', **context, stage='backend.plan')
+        wrong = self.record('attempt_finish', **context, attempt_id=plan['attempt_id'],
+                            outcome='success', summary='Invalid write target', evidence={'services': ['upstream']})
+        self.assertEqual(wrong['status'], 'evidence_required')
+        self.record('attempt_finish', **context, attempt_id=plan['attempt_id'],
+                    outcome='success', summary='Plan local implementation', evidence={'services': ['local-api']})
+        branch = self.record('attempt_start', **context, stage='backend.branch_check')
+        self.assertEqual(set(branch['branch_targets']), {'local-api'})
+        self.assertNotIn('backend_dependencies', branch)
+
+    def test_frontend_attempt_has_no_backend_dependency_context(self):
+        self.configure_backend_dependencies()
+        context = self.start()
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        task = {'id': 'F1', 'description': 'Show data', 'acceptance': ['Uses the business API']}
+        self.finish_stage(context, 'split', evidence={'tasks': {'frontend': [task]}})
+        design = self.record('attempt_start', **context, stage='frontend.design')
+        self.assertEqual(design['status'], 'attempt_started')
+        self.assertNotIn('backend_dependencies', design)
+
+    def test_configuration_rejects_unknown_consumers_and_escaped_contract_sources(self):
+        self.configure_backend_dependencies()
+        upstream = self.config['backend_dependencies']['upstream']
+        upstream['used_by'] = ['missing']
+        with self.assertRaisesRegex(ValueError, 'used_by'):
+            self.scan('bad-consumer', [])
+        upstream['used_by'] = ['business-api']
+        upstream['api_source'] = '../other-repo'
+        with self.assertRaisesRegex(ValueError, 'api_source'):
+            self.scan('escaped-source', [])
+
+    def test_configuration_rejects_a_dependency_at_a_writable_repository_path(self):
+        self.configure_backend_dependencies()
+        self.config['backend_dependencies']['upstream']['source_path'] = 'backend/business-api'
+        with self.assertRaisesRegex(ValueError, 'source_path'):
+            self.record('runtime_check', chat_id='chat-2')
+
+    def test_writable_dependency_requires_delivery_settings(self):
+        self.configure_backend_dependencies()
+        upstream = self.config['backend_dependencies']['upstream']
+        upstream['access'] = 'writable'
+        with self.assertRaisesRegex(ValueError, 'delivery'):
+            self.record('runtime_check', chat_id='chat-2')
+        upstream['access'] = 'writeable'
+        with self.assertRaisesRegex(ValueError, 'access'):
+            self.record('runtime_check', chat_id='chat-2')
+
+    def test_writable_dependency_uses_its_own_target_branch_and_worktree(self):
+        from test_route_drills import git
+
+        self.configure_backend_dependencies()
+        self.config['development']['allowed_requirement_types'] = ['backend_only']
+        self.material.write_text('研发范围：纯后端', encoding='utf-8')
+        upstream = self.config['backend_dependencies']['upstream']
+        upstream.update(access='writable', delivery={
+            'branch': 'provider-dev', 'build_command': 'build', 'test_command': 'test',
+            'acceptance_command': 'check', 'service_url': 'http://127.0.0.1:1',
+        })
+        repo = (self.fixture / upstream['source_path']).resolve()
+        repo.mkdir(parents=True)
+        git(repo, 'init', '-b', 'provider-dev')
+        git(repo, '-c', 'user.name=Drill', '-c', 'user.email=drill@example.invalid',
+            'commit', '--allow-empty', '-m', 'Provider baseline')
+        context = self.start()
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        task = {'id': 'B1', 'description': 'Update provider API', 'acceptance': ['Returns the updated contract']}
+        self.finish_stage(context, 'split', evidence={'tasks': {'backend': [task]}})
+        self.finish_stage(context, 'backend.design', evidence={'path': 'design.md'})
+        plan = self.finish_stage(context, 'backend.plan', evidence={'services': ['upstream']})
+        self.assertEqual(plan.get('next_stage'), 'backend.branch_check', plan)
+        branch = self.record('attempt_start', **context, stage='backend.branch_check')
+        self.assertEqual(branch['backend_dependencies']['upstream']['access'], 'writable')
+        prepare = {**context, 'attempt_id': branch['attempt_id'], 'service': 'upstream',
+                   'desktop_reconciliation': {'status': 'unavailable', 'evidence': 'Local drill'}}
+        upstream['access'] = 'read_only'
+        blocked = self.record('branch_prepare', **prepare)
+        self.assertEqual(blocked.get('repository', {}).get('status'), 'dependency_write_revoked', blocked)
+        upstream['access'] = 'writable'
+        prepared = self.record('branch_prepare', **prepare)
+        self.assertEqual(prepared.get('status'), 'branch_prepared', prepared)
+        proof = prepared['repository']
+        self.assertEqual(proof['source_root'], str(repo))
+        self.assertEqual(proof['target_branch'], 'provider-dev')
+        self.assertNotEqual(proof['worktree'], str(repo))
+        finished = self.record('attempt_finish', **context, attempt_id=branch['attempt_id'], outcome='success',
+                               summary='Verified worktree', evidence={'repositories': {'upstream': proof}})
+        self.assertEqual(finished.get('next_stage'), 'backend.coding', finished)
+        worktree = Path(proof['worktree'])
+        (worktree / 'contract.txt').write_text('updated contract', encoding='utf-8')
+        git(worktree, 'add', 'contract.txt')
+        git(worktree, '-c', 'user.name=Drill', '-c', 'user.email=drill@example.invalid',
+            'commit', '-m', 'Update provider contract')
+        candidate = git(worktree, 'rev-parse', 'HEAD')
+        versions = {'upstream': candidate}
+        self.assertEqual(self.finish_stage(context, 'backend.coding', evidence={'versions': versions})['next_stage'],
+                         'backend.unit_test')
+        self.assertEqual(git(worktree, 'show', 'HEAD:contract.txt'), 'updated contract')
+        self.assertEqual(git(worktree, 'diff', '--check', 'HEAD^', 'HEAD'), '')
+        for stage in ('backend.unit_test', 'backend.code_review', 'backend.acceptance'):
+            evidence = {'versions': versions, 'verification': 'Verified the candidate contract file and commit diff'}
+            if stage == 'backend.acceptance':
+                evidence['verified_tasks'] = ['B1']
+            self.assertEqual(self.finish_stage(context, stage, evidence=evidence)['status'], 'attempt_finished')
+        git(repo, 'merge', '--ff-only', candidate)
+        merged = self.finish_stage(context, 'backend.integration',
+                                   evidence={'versions': versions, 'merged_versions': versions})
+        self.assertEqual(merged['status'], 'attempt_finished')
+        self.assertEqual(git(repo, 'rev-parse', 'refs/heads/provider-dev'), candidate)
 
     def test_failed_split_stops_before_development_and_recovery_reads_material_again(self):
         context = self.start()

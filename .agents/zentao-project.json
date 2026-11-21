@@ -21,7 +21,8 @@
   "runtime": {
     "split_task_sync": true,
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
-    "require_unattended_approval": true
+    "require_unattended_approval": true,
+    "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"]
   },
   "notifications": {
     "dingtalk": {"enabled": true}
@@ -148,6 +149,14 @@
       "integration": 45
     }
   },
+  "backend_dependencies": {
+    "datapool": {
+      "access": "read_only",
+      "source_path": "../tet-datapool",
+      "api_source": "DPWebApi/Controllers",
+      "used_by": ["smart-geo"]
+    }
+  },
   "e2e": {
     "enabled": false,
     "workspace": "frontend",
@@ -179,6 +188,7 @@
       "accepted_statuses": "story 填需求状态，bug 填缺陷状态。某类的状态数组为空时跳过该类扫描。"
     },
     "workspaces": "路径相对于本配置文件所在的 .agents 目录。requirement 指向需求材料仓库，frontend 指向前端工作区，backend 指向 srv-workspace 后端父仓。",
+    "backend_dependencies": "后端的按需依赖。access 省略时为 read_only。writable 需要 delivery 登记目标分支、构建、单测、验收及启动命令或服务地址，工单按依赖键选择修改目标。source_path 相对于本配置文件，api_source 相对于依赖目录，used_by 填消费方服务键。",
     "monitor": "enabled 控制新单扫描和领取。interval_minutes 以分钟表示期望的监测间隔；实际唤醒时间由 Codex 桌面定时任务决定。",
     "runtime": "desktop_project_id 用于绑定工单会话。require_unattended_approval 启用无人值守权限核验。split_task_sync 控制新领取 Story 的拆分任务建单、关单及重开，已领工单沿用快照。",
     "development": {

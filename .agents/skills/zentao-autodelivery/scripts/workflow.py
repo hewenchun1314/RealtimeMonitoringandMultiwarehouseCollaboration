@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+from backend_dependencies import dependency_locations, writable_dependencies
 from branch_check import BRANCH_STAGES, branch_context, inspect_branches, prepare_local_worktree, valid_evidence
 from claim import reserve, save_scan
 from desktop_runtime import runtime_check
@@ -54,7 +55,7 @@ REPLAYED_PERMISSIONS = {
 }
 
 
-def read_branch_attempt(database, config, data, now):
+def read_branch_attempt(database, config, data, now, config_directory):
     database = Path(database).resolve()
     if not database.is_file():
         return None
@@ -68,18 +69,26 @@ def read_branch_attempt(database, config, data, now):
         trial = active_attempt(store, item)
         if not trial or trial['attempt_id'] != data.get('attempt_id') or store.time >= trial['deadline_at']:
             return None
-        return {**branch_context(store, item), 'deadline_at': trial['deadline_at']}
+        context = branch_context(store, item)
+        live_dependencies = writable_dependencies(config)
+        revoked = [key for key, workspace in context.get('dependency_workspaces', {}).items()
+                   if key not in live_dependencies or (config_directory / workspace).resolve() !=
+                   (config_directory / live_dependencies[key]['source_path']).resolve()]
+        if revoked:
+            context['revoked_dependencies'] = revoked
+        return {**context, 'deadline_at': trial['deadline_at']}
 
 
 def run(command, data, config, database, *, now=None, config_directory=CONFIG_PATH.parent):
     validate_config(config)
+    dependency_locations(config, config_directory)
     data = require_mapping(data, 'request')
     action = require_text(data.get('action'), 'action')
     if command == 'record' and action == 'runtime_check':
         return runtime_check(require_text(data.get('chat_id'), 'chat_id'))
     check_time = now or datetime.now(timezone.utc)
     if command == 'record' and action in ('branch_inspect', 'branch_prepare'):
-        context = read_branch_attempt(database, config, data, check_time)
+        context = read_branch_attempt(database, config, data, check_time, config_directory)
         if context is None:
             return message('branch_attempt_inactive')
         if action == 'branch_prepare':
@@ -111,7 +120,7 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
     evidence = data.get('evidence')
     if (command == 'record' and action == 'attempt_finish' and data.get('outcome') == 'success'
             and isinstance(evidence, dict) and 'repositories' in evidence):
-        context = read_branch_attempt(database, config, data, check_time)
+        context = read_branch_attempt(database, config, data, check_time, config_directory)
         if context and valid_evidence(context, evidence):
             claimed = evidence['repositories']
             actual = inspect_branches(context, config_directory, {
@@ -143,6 +152,8 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
         if action == 'attempt_finish':
             response = attempt_finish(store, item, data, branches_verified=branches_verified,
                                       config_directory=config_directory)
+        elif action in ('attempt_start', 'repair_advance'):
+            response = actions[action](store, item, data, config_directory=config_directory)
         else:
             response = actions[action](store, item, data)
         if dingtalk_enabled(config) and response['status'] in ('started', 'completed'):

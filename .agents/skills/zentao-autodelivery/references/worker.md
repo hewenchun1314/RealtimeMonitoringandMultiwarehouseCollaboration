@@ -2,7 +2,9 @@
 
 领取后主会话读取该单快照与当前有效尝试。新单先检查材料、拆分任务，再执行账本选中的端；后端与前端各由开发、测试 Agent 交付证据，主会话负责两端分支核验和合回。跨端依赖与恢复细节见[步骤指引](stages.md)。沿原工单聊天续接时按账本阶段派工。
 
-从项目根目录运行。启动器使用本机已安装并登录的 Codex App Server 发行版 CLI。每次 CLI 开工或恢复都显式传入 `--ask-for-approval never`，沿用宿主已配置的沙箱权限。启动器持有工单锁，阶段运行器保留 stdout、stderr、终态和 Windows 进程清理证据。
+从项目根目录运行。启动器使用本机已安装并登录的 Codex App Server 发行版 CLI。每次 CLI 开工或恢复都显式传入 `--ask-for-approval never`。启动器持有工单锁，阶段运行器保留 stdout、stderr、终态和 Windows 进程清理证据。
+
+配置了 `backend_dependencies` 时，启动器为该工单 CLI 启用 Windows MXC 权限配置。只有当前项目配置和工单快照均将同一依赖路径设为 `writable` 时，启动器才会为其授予写权限。项目、已配置的前后端工作区、Codex 运行目录及临时目录提供正常的写入空间，`runtime.worker_cache_paths` 另外登记工作区外的构建缓存目录，支持 `~` 和系统环境变量。阶段 CLI 由本工单入口在同一受限进程树内启动。新增依赖后可以先跑 `probe` 确认配置可加载。MXC 无法启动时按现有权限阻断规则处理。
 
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py probe` 运行一次只读的实机探针。它要求 CLI 实际调用 shell 检查项目文件，根据工具输出和进程回执验证通过。不接单、不访问禅道。
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py prepare --marker <marker>` 仅用于已预占且未绑定的工单。以 `worker_ready` 返回的实际聊天 ID 为准。核对该聊天工作目录和实际桌面项目，尚未归组时用桌面项目工具挂载并读回，随后登记 `record bind`。遇到不明回执，先按账本待核对派发流程处理，再使用原有证据；只有确认没有创建聊天且该进程已停止，才允许新的派发请求重新准备。
