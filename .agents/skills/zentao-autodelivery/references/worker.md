@@ -7,6 +7,7 @@
 配置了 `backend_dependencies` 时，启动器为该工单 CLI 启用 Windows MXC 权限配置。只有当前项目配置和工单快照均将同一依赖路径设为 `writable` 时，启动器才会为其授予写权限。项目、已配置的前后端工作区、Codex 运行目录及临时目录提供正常的写入空间，`runtime.worker_cache_paths` 另外登记工作区外的构建缓存目录，支持 `~` 和系统环境变量。阶段 CLI 由本工单入口在同一受限进程树内启动。新增依赖后可以先跑 `probe` 确认配置可加载。MXC 无法启动时按现有权限阻断规则处理。
 
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py probe` 运行一次只读的实机探针。它要求 CLI 实际调用 shell 检查项目文件，根据工具输出和进程回执验证通过。不接单、不访问禅道。
+- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py e2e-preflight` 执行默认页面预检。已有本地前端时复用，端口空闲时按项目启动命令拉起服务，再用独立 Playwright 浏览器核验登录、工区及页面控件。退出码 `0` 且回执为 `e2e_preflight_passed` 表示通过。命令不领取工单。`--profile <JSON路径>` 可用于单独诊断指定业务页面。 [E2E 阶段指引](e2e.md#独立-playwright-浏览器)
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py prepare --marker <marker>` 仅用于已预占且未绑定的工单。以 `worker_ready` 返回的实际聊天 ID 为准。核对该聊天工作目录和实际桌面项目，尚未归组时用桌面项目工具挂载并读回，随后登记 `record bind`。遇到不明回执，先按账本待核对派发流程处理，再使用原有证据；只有确认没有创建聊天且该进程已停止，才允许新的派发请求重新准备。
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py run --marker <marker>` 在已绑定工单的原有会话里开始或续接。工单 Agent 用 `record runtime_check` 核对本轮实际策略，用 `record start` 领取执行权。已有活动尝试的情况下，先核对对应进程和账本，禁止重复启动。命令运行期间持续等待其回执；其他轮次遇到 `worker_busy` 时仅对账。回执缺失时根据受控进程和账本确认是否可恢复。
 

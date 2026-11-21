@@ -204,19 +204,60 @@ def prepared_result(receipt):
             'receipt': receipt['receipt_path']}
 
 
+def run_e2e_preflight(profile):
+    import msvcrt
+
+    attempt_id = uuid4().hex
+    phase = 'e2e-preflight'
+    output = DATABASE_PATH.parent / 'worker-probes'
+    startup_log = output / attempt_id / phase / 'frontend.log'
+    command = [sys.executable, '-B', str(Path(__file__).with_name('playwright_e2e.py')),
+               '--startup-log', str(startup_log)]
+    if profile:
+        command.extend(['--profile', str(profile.resolve(strict=True))])
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / 'e2e-preflight.lock').open('a+b') as lock:
+        if lock.tell() == 0:
+            lock.write(b'0')
+            lock.flush()
+        lock.seek(0)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return {'status': 'e2e_preflight_busy', 'check': {'stage': 'runner-lock'}}
+        receipt = run_stage(attempt_id, phase, utc_now() + timedelta(minutes=4), PROJECT_ROOT,
+                            output, None, command)
+    try:
+        check = json.loads(Path(receipt['stdout_path']).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        check = {'stage': 'runner'}
+    passed = receipt['outcome'] == 'success' and receipt['stop_confirmed'] and check.get('status') == 'passed'
+    return {'status': 'e2e_preflight_passed' if passed else 'e2e_preflight_blocked',
+            'check': check, 'outcome': receipt['outcome'], 'stop_confirmed': receipt['stop_confirmed'],
+            'receipt': receipt['receipt_path']}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks'))
+    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks', 'e2e-preflight'))
     parser.add_argument('--marker')
+    parser.add_argument('--profile', type=Path)
     args = parser.parse_args()
+    if args.profile and args.operation != 'e2e-preflight':
+        parser.error('--profile is only supported for e2e-preflight')
     cli = codex_directory() / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
     try:
-        result = run_monitor_sync() if args.operation == 'sync-tasks' else run(
-            args.operation, args.marker, cli.resolve(strict=True))
+        if args.operation == 'e2e-preflight':
+            result = run_e2e_preflight(args.profile)
+        elif args.operation == 'sync-tasks':
+            result = run_monitor_sync()
+        else:
+            result = run(args.operation, args.marker, cli.resolve(strict=True))
     except (OSError, TypeError, ValueError, sqlite3.Error) as error:
         result = {'status': 'worker_error', 'reason': str(error)}
     print(json.dumps(result, ensure_ascii=True))
-    return int(result['status'] in ('worker_error', 'probe_failed', 'task_sync_incomplete'))
+    return int(result['status'] in ('worker_error', 'probe_failed', 'task_sync_incomplete',
+                                    'e2e_preflight_blocked', 'e2e_preflight_busy'))
 
 
 if __name__ == '__main__':

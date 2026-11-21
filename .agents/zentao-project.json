@@ -158,11 +158,21 @@
     }
   },
   "e2e": {
-    "enabled": false,
+    "enabled": true,
     "workspace": "frontend",
     "start_command": "npm run serve-shell-hub --gateway=http://10.10.4.140:31111/",
     "ready_url": null,
     "platform_entry_path": "/aggregation-platform/sso/home-page/platform",
+    "playwright": {
+      "channel": "chrome",
+      "preflight_origin": "http://localhost:5000",
+      "preflight_entry_path": "/aggregation-platform/shell-hub/data-overview",
+      "preflight_startup_ports": [5010, 5150, 30042],
+      "preflight_checks": [
+        {"name": "data-overview-map-tab", "text": "地图"},
+        {"name": "data-overview-well-list-tab", "text": "井列表"}
+      ]
+    },
     "login": {
       "path": "/aggregation-platform/sso/login",
       "username": "hewenchun",
@@ -204,6 +214,7 @@
       "enabled": "true 执行前端页面验收，false 跳过页面验收并继续合回。缺省为 true。仅对新领取工单生效，已领取工单沿用原配置快照。",
       "workspace / start_command": "前端页面验收使用的工作区键，以及服务尚未运行时的启动命令。",
       "ready_url / platform_entry_path": "ready_url 可指定前端服务地址；为 null 时从启动输出或现有页面确认。platform_entry_path 是登录后进入平台的页面路径。",
+      "playwright": "channel 使用本机已安装的浏览器。派发前检查 preflight_origin 下的 preflight_entry_path，preflight_checks 指定页面控件。本次启动服务时等待额外的 preflight_startup_ports。正式验收传入工单候选服务的实际地址和用例档案。",
       "login": "path 是登录页路径，username 是测试账号，credential_ref 指向该账号的本机凭据。",
       "default_work_area": "页面验收默认进入的业务工区，id 用于定位，name 用于核对名称。"
     }
