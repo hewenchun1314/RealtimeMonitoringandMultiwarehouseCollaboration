@@ -14,9 +14,10 @@ from threading import Event
 from uuid import UUID, uuid4
 
 from desktop_runtime import runtime_check
+from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
 from stage_runner import run_stage, utc_now
 from task_sync import enabled as task_sync_enabled
-from workflow import DATABASE_PATH, PROJECT_ROOT
+from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 
 
 def command(cli, operation, chat_id=None):
@@ -152,9 +153,16 @@ def run_monitor_sync():
         raise ValueError('Task synchronization requires an unattended monitor session')
     receipt = run_stage(uuid4().hex, 'monitor', utc_now() + timedelta(minutes=3), PROJECT_ROOT,
                         DATABASE_PATH.parent / 'task-sync', None, sync_command())
-    return {'status': 'tasks_checked' if receipt['outcome'] == 'success' else 'task_sync_incomplete',
-            'outcome': receipt['outcome'], 'stop_confirmed': receipt['stop_confirmed'],
-            'receipt': receipt['receipt_path']}
+    result = {'status': 'tasks_checked' if receipt['outcome'] == 'success' else 'task_sync_incomplete',
+              'outcome': receipt['outcome'], 'stop_confirmed': receipt['stop_confirmed'],
+              'receipt': receipt['receipt_path']}
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        if dingtalk_enabled(config):
+            result['dingtalk'] = dispatch_dingtalk()
+    except (OSError, ValueError, TypeError, AttributeError):
+        result['dingtalk'] = {'status': 'configuration_error'}
+    return result
 
 
 def prepared_result(receipt):

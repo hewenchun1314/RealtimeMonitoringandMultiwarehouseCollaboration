@@ -12,6 +12,7 @@ from pathlib import Path
 from branch_check import BRANCH_STAGES, branch_context, inspect_branches, prepare_local_worktree, valid_evidence
 from claim import reserve, save_scan
 from desktop_runtime import runtime_check
+from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled, enqueue_notification
 from execution import (
     active_attempt, attempt_finish, attempt_start, bind, complete, defer_dispatch, execution_matches,
     expire_dispatch, recover, repair_advance, resolve_dispatch, start, stop,
@@ -144,6 +145,8 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
                                       config_directory=config_directory)
         else:
             response = actions[action](store, item, data)
+        if dingtalk_enabled(config) and response['status'] in ('started', 'completed'):
+            enqueue_notification(store, item, response)
         conn.execute('INSERT INTO events(event_id,request,response) VALUES(?,?,?)',
                      (event_id, request, encode(response)))
         return response
@@ -164,6 +167,9 @@ def main(argv=None):
                 publish_status(DATABASE_PATH, config)
             except (OSError, sqlite3.Error, ValueError) as error:
                 print(f'Status page refresh failed: {error}', file=sys.stderr)
+        if (dingtalk_enabled(config) and args.config.resolve() == CONFIG_PATH
+                and args.database.resolve() == DATABASE_PATH and response['status'] in ('started', 'completed')):
+            response['dingtalk'] = dispatch_dingtalk()
         exit_code = 0
     except (ValueError, OSError, sqlite3.Error) as error:
         response = {'ok': False, 'status': 'error', 'error_type': type(error).__name__, 'message': str(error)}

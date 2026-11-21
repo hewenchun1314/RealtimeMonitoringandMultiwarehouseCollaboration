@@ -23,6 +23,9 @@
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true
   },
+  "notifications": {
+    "dingtalk": {"enabled": true}
+  },
   "development": {
     "allowed_requirement_types": ["frontend_only"],
     "max_concurrent_items": 1,

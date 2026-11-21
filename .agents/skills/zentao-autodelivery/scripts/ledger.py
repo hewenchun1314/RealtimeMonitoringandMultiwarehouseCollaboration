@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS recoveries (
     item_seq INTEGER NOT NULL REFERENCES work_items(seq), recovery_id TEXT NOT NULL, evidence TEXT NOT NULL,
     PRIMARY KEY(item_seq, recovery_id)
 );
+CREATE TABLE IF NOT EXISTS dingtalk_notifications (
+    operation_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
+    event_type TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS writebacks (
     operation_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
     run_round INTEGER NOT NULL, operation_type TEXT NOT NULL, payload TEXT NOT NULL,
@@ -211,6 +216,10 @@ def validate_config(config):
         require_text(runtime['desktop_project_id'], 'runtime.desktop_project_id')
     if 'require_unattended_approval' in runtime and type(runtime['require_unattended_approval']) is not bool:
         raise ValueError('runtime.require_unattended_approval must be a boolean')
+    notifications = require_mapping(config.get('notifications', {}), 'notifications')
+    dingtalk = require_mapping(notifications.get('dingtalk', {}), 'notifications.dingtalk')
+    if type(dingtalk.get('enabled', False)) is not bool:
+        raise ValueError('notifications.dingtalk.enabled must be a boolean')
     for name, default in (('dispatch_lease_seconds', 300), ('writeback_lease_seconds', 120),
                           ('observation_max_age_seconds', 300)):
         runtime_int(config, name, default)
