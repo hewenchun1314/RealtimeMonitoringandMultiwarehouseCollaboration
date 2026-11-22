@@ -267,6 +267,11 @@ def validate_config(config):
             raise ValueError(f'development.step_timeout_minutes.{stage} must be an integer from one to 1440')
     runtime = require_mapping(config.get('runtime', {}), 'runtime')
     require_strings(runtime.get('worker_cache_paths', []), 'runtime.worker_cache_paths')
+    require_strings(runtime.get('worker_git_write_repositories', []), 'runtime.worker_git_write_repositories')
+    for target in runtime.get('worker_git_write_repositories', []):
+        side, _, name = target.partition(':')
+        if side not in ('backend', 'frontend') or not name:
+            raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
     if 'split_task_sync' in runtime and type(runtime['split_task_sync']) is not bool:
         raise ValueError('runtime.split_task_sync must be a boolean')
     if 'desktop_project_id' in runtime:

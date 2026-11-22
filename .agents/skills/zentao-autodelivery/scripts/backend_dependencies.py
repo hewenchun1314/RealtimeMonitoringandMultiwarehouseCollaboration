@@ -2,6 +2,7 @@
 
 from os.path import expandvars
 from pathlib import Path
+import subprocess
 
 
 def writable_dependencies(config):
@@ -55,6 +56,47 @@ def dependency_context(config, config_directory, services):
             if key in services or services.intersection(reference['used_by'])}
 
 
+def git_checkout(config, config_directory, key):
+    side, _, name = key.partition(':')
+    workspace = config.get('workspaces', {}).get(side)
+    bundle = config.get('development', {}).get(f'{side}_bundle', {})
+    targets = bundle.get('services' if side == 'backend' else 'applications', {})
+    repository = targets.get(name, {}).get('repository')
+    if not workspace or not repository or side not in ('backend', 'frontend'):
+        return None
+    workspace = (config_directory / workspace).resolve()
+    checkout = (workspace / repository).resolve()
+    if checkout.is_relative_to(workspace):
+        return workspace, checkout
+    return None
+
+
+def git_metadata_roots(configs, config_directory):
+    keys = configs[0].get('runtime', {}).get('worker_git_write_repositories', ())
+    for key in keys:
+        locations = {git_checkout(config, config_directory, key) for config in configs}
+        if len(locations) != 1 or None in locations:
+            continue
+        workspace, checkout = locations.pop()
+        if not checkout.is_dir():
+            continue
+        # Only recognize the registered checkout's own Git directory or its
+        # canonical submodule directory. A gitdir pointer cannot grant new paths.
+        expected = {checkout / '.git'}
+        if checkout != workspace:
+            expected.add(workspace / '.git' / 'modules' / checkout.relative_to(workspace))
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(checkout), 'rev-parse', '--path-format=absolute',
+                 '--show-toplevel', '--git-common-dir'],
+                check=True, capture_output=True, encoding='utf-8', timeout=5)
+            root, common = map(Path, result.stdout.splitlines())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if root.resolve() == checkout and common in expected and common.resolve() == common:
+            yield common
+
+
 def worker_roots(configs, config_directory, project_root, codex_directory):
     roots = set()
     dependency_writes = []
@@ -70,9 +112,11 @@ def worker_roots(configs, config_directory, project_root, codex_directory):
                 writable.add((config_directory / path).resolve())
         for path in config.get('runtime', {}).get('worker_cache_paths', []):
             writable.add((config_directory / Path(expandvars(path)).expanduser()).resolve())
-    if not roots:
+    git_roots = set(git_metadata_roots(configs, config_directory))
+    if not roots and not git_roots:
         return [], []
     granted = {root for _, root in set.intersection(*dependency_writes)}
     protected = roots - granted
-    writable.update(root for root in granted if not any(root.is_relative_to(path) for path in protected))
+    writable.update(root for root in granted | git_roots if not any(
+        root.is_relative_to(path) or path.is_relative_to(root) for path in protected))
     return sorted(protected), sorted(writable)

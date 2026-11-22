@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -130,6 +131,32 @@ class WorkerTests(unittest.TestCase):
                     protected, writable = worker_roots(configs, project, project, project / 'runtime')
                     self.assertEqual(upstream in writable, expected)
                     self.assertEqual(upstream in protected, not expected)
+
+    def test_git_metadata_grant_requires_a_matching_configured_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            checkout = project / 'backend' / 'service'
+            checkout.mkdir(parents=True)
+            metadata = project / 'backend' / '.git' / 'modules' / 'service'
+            metadata.parent.mkdir(parents=True)
+            subprocess.run(['git', 'init', f'--separate-git-dir={metadata}', checkout],
+                           check=True, capture_output=True)
+            settings = project / '.agents'
+            admitted = {
+                'workspaces': {'backend': '../backend'},
+                'development': {'backend_bundle': {'services': {'service': {'repository': 'service'}}}},
+                'backend_dependencies': {'upstream': {
+                    'source_path': '../upstream', 'api_source': '.', 'used_by': ['service'],
+                }},
+            }
+            current = {**admitted, 'runtime': {'worker_git_write_repositories': ['backend:service']}}
+            protected, writable = worker_roots([current, admitted], settings, project, project / 'runtime')
+            self.assertIn(metadata, writable)
+            self.assertNotIn(metadata.parents[1], writable)
+            self.assertIn(project / 'upstream', protected)
+            other = {**admitted, 'workspaces': {'backend': '../other'}}
+            _, writable = worker_roots([current, other], settings, project, project / 'runtime')
+            self.assertNotIn(metadata, writable)
 
 
 if __name__ == '__main__':

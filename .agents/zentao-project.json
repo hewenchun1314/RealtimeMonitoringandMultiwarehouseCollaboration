@@ -22,7 +22,8 @@
     "split_task_sync": true,
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true,
-    "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"]
+    "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"],
+    "worker_git_write_repositories": ["backend:smart-geo", "frontend:tet-smart-log"]
   },
   "notifications": {
     "dingtalk": {"enabled": true}
