@@ -6,7 +6,8 @@ from pathlib import Path
 
 from branch_check import git, planned_applications
 from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, TAG,
-                          configured_targets, deployed_receipt_matches, frontend_release_config)
+                          configured_targets, deployed_receipt_matches, frontend_release_config,
+                          mcp_rollout_matches, release_verification)
 from route_execution import get_split, snapshot, stage_evidence
 
 
@@ -182,17 +183,28 @@ def validate_success(store, item, stage, evidence):
         image = evidence.get('image')
         remote = evidence.get('remote_versions')
         digests = (evidence.get('digest'), evidence.get('config_digest'))
+        repository = settings.get('image_repository')
         if (not commit_map(merged) or evidence.get('versions') != merged
                 or not isinstance(remote, dict) or remote.keys() != merged.keys()
                 or not all(isinstance(sha, str) and COMMIT.fullmatch(sha) for sha in remote.values())
                 or not isinstance(image, str) or not TAG.fullmatch(image)
-                or image.rsplit(':', 1)[0] != settings.get('image_repository')
+                or image.rsplit(':', 1)[0] != repository
                 or not image.endswith('-' + FRONTEND_PROFILE)
                 or evidence.get('stopped_ports') != settings.get('local_ports')
-                or evidence.get('base_image') != settings.get('base_image')
                 or evidence.get('status') != 'published'
                 or not all(isinstance(digest, str) and DIGEST.fullmatch(digest) for digest in digests)):
             return '前端镜像发布需要逐仓版本、停服及 Harbor 摘要回执'
+        base = evidence.get('base_image')
+        target = settings.get('rancher')
+        if target:
+            rollout = evidence.get('rancher')
+            if (not isinstance(base, str) or not base.startswith(repository + '@')
+                    or not DIGEST.fullmatch(base.split('@', 1)[1])
+                    or not isinstance(rollout, dict) or rollout.get('target') != target
+                    or not mcp_rollout_matches(rollout.get('pod_verification'), repository + '@' + digests[0])):
+                return '前端镜像发布需要当前基线及 Rancher 新 Pod 核验'
+        elif base != settings.get('base_image'):
+            return '前端镜像发布需要匹配的底包摘要'
         return None
     side, _, name = stage.partition('.')
     if name in ('coding', 'integration'):
@@ -225,10 +237,7 @@ def validate_success(store, item, stage, evidence):
                         or not isinstance(probes, dict) or probes.keys() != deployed.keys()):
                     return 'Joint acceptance must identify the deployed gateway and every version probe'
                 for key, receipt in deployed.items():
-                    target = receipt['target']
-                    expected = {'sha': receipt['sha'],
-                                'url': target['gateway_url'].rstrip('/') + target['verification_path']}
-                    if probes[key] != expected:
+                    if probes[key] != release_verification(receipt):
                         return f'Joint acceptance verified a different release for {key}'
 
 
@@ -268,6 +277,10 @@ def delivery_summary(route, stages):
         evidence = frontend.get('evidence') or {}
         if frontend['outcome'] == 'success':
             facts.append(f'前端镜像已推送 Harbor {evidence["image"]}（{evidence["digest"]}）')
+            if rollout := evidence.get('rancher'):
+                target = rollout['target']
+                ready = rollout['pod_verification']['ready_replicas']
+                facts.append(f'前端已在 Rancher 更新 {target["namespace"]}/{target["deployment"]}，{ready} 个 Pod 已就绪')
         else:
             facts.append('前端镜像发布待验证')
     facts.extend(route.get('blockers', []))

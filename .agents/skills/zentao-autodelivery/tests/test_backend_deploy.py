@@ -99,6 +99,68 @@ class BackendDeployTests(unittest.TestCase):
         self.assertEqual(call.call_args_list[1].args[-2:], (f'{base}@{DIGEST}', '--raw'))
         self.assertEqual(call.call_args_list[2].args[-2:], (f'{base}@{PLATFORM_DIGEST}', '--raw'))
 
+    def test_remote_image_reads_reference_digest_and_rejects_a_different_digest(self):
+        config = {'os': 'linux', 'architecture': 'amd64', 'config': {'Labels': {deploy.REVISION: SHA}}}
+        outputs = [f'Digest: {DIGEST}\n', json.dumps({'config': {'digest': CONFIG}}), json.dumps(config)]
+        with patch.object(deploy, 'command', side_effect=[Mock(stdout=out, returncode=0) for out in outputs]) as call:
+            self.assertEqual(deploy.remote_image(REFERENCE, 'linux/amd64')['sha'], SHA)
+            self.assertEqual(call.call_args_list[1].args[-2:], (REFERENCE, '--raw'))
+        with patch.object(deploy, 'command', return_value=Mock(stdout=f'Digest: {PLATFORM_DIGEST}\n', returncode=0)):
+            with self.assertRaisesRegex(deploy.DeploymentError, 'digest'):
+                deploy.remote_image(REFERENCE, 'linux/amd64')
+
+    def test_mcp_release_deploys_harbor_digest_and_checks_health(self):
+        target = self.request['target'] = {
+            **self.request['target'], 'mcp_url': 'http://mcp.example/mcp',
+            'health_url': 'http://service.example/health',
+        }
+        pod_proof = {'image': REFERENCE, 'ready_replicas': 1, 'pods': ['next'], 'previous_pods': ['old']}
+
+        def rollout(approved, image, progress, record):
+            self.assertEqual(approved, target)
+            self.assertEqual(image, REFERENCE)
+            self.assertEqual(progress['digest'], DIGEST)
+            record(mcp_baseline={'image': IMAGE})
+            self.assertIn('mcp_baseline', json.loads(Path(self.request['receipt_path']).read_text()))
+            return pod_proof
+
+        with (
+            patch.object(deploy, 'image_tag', return_value=IMAGE),
+            patch.object(deploy, 'build_image', return_value=CONFIG),
+            patch.object(deploy, 'remote_image', return_value={'digest': DIGEST,
+                         'platform_digest': PLATFORM_DIGEST, 'config_digest': CONFIG, 'sha': SHA}),
+            patch.object(deploy, 'Kubernetes') as kube,
+            patch.object(deploy, 'deploy_mcp', side_effect=rollout) as update,
+            patch.object(deploy, 'verify_mcp_health') as health,
+        ):
+            report = deploy.publish(self.request)
+            kube.assert_not_called()
+            update.assert_called_once()
+            health.assert_called_once_with(target['health_url'])
+        self.assertEqual(report['pod_verification'], pod_proof)
+        self.assertEqual(report['verification'], {'sha': SHA, 'url': target['health_url'],
+                                                  'provider': 'rancher_mcp', 'image': REFERENCE})
+
+    def test_mcp_health_requires_up_json(self):
+        response = Mock(status=200)
+        endpoint = 'http://service.example:31191/actuator/health'
+        with patch.object(deploy, 'HTTPConnection') as connection:
+            connection.return_value.getresponse.return_value = response
+            response.read.return_value = b'{"status":"UP"}'
+            deploy.verify_mcp_health(endpoint)
+            connection.assert_called_once_with('service.example', 31191, timeout=10)
+            response.read.return_value = b'{"status":"DOWN"}'
+            with self.assertRaisesRegex(deploy.DeploymentError, 'not UP'):
+                deploy.verify_mcp_health(endpoint)
+
+    def test_live_mcp_acceptance_detects_image_change(self):
+        receipt = {'image': IMAGE, 'digest': DIGEST, 'sha': SHA,
+                   'target': {'mcp_url': 'http://mcp.example/mcp', 'health_url': 'http://service.example/health'}}
+        with patch.object(deploy, 'verify_mcp_image', side_effect=deploy.DeploymentError('image changed')) as check:
+            with self.assertRaisesRegex(deploy.DeploymentError, 'image changed'):
+                deploy.verify_published_release(receipt)
+        check.assert_called_once_with(receipt['target'], REFERENCE)
+
     def test_release_pushes_verified_image_and_deploys_digest(self):
         with (
             patch.object(deploy, 'image_tag', return_value=IMAGE),

@@ -124,8 +124,13 @@ def claim_frontend(store, item, directory):
         request = frontend_request(store, item, directory)
     except (ValueError, TypeError, KeyError) as error:
         blocked = str(error)
-    if request and not acquire_locks(store, item, 'frontend-image', [request['settings']['image_repository']]):
-        return message('deployment_busy', reason='同一前端镜像仓库已有工单在发布')
+    if request:
+        settings = request['settings']
+        resources = ['frontend-image/' + settings['image_repository']]
+        if target := settings.get('rancher'):
+            resources.append(target_key(target))
+        if not acquire_locks(store, item, 'target', resources):
+            return message('deployment_busy', reason='同一前端镜像仓库或工作负载已有工单在发布')
     trial = attempt_start(store, item, {**binding(item), 'stage': item['stage']},
                           config_directory=directory, deployment_worker=True)
     if trial['status'] not in ('attempt_started', 'attempt_active'):
@@ -196,12 +201,13 @@ def finish_deployment(store, item, trial, directory, fields):
             if not deployed_receipt_matches(receipt, service, versions.get(service), selected[service]):
                 return message('evidence_required', reason=f'Invalid deployment receipt for {service}')
             target = selected[service]
-            endpoint = target['gateway_url'].rstrip('/') + target['verification_path']
-            pods = receipt.get('pod_verification')
-            if (receipt['verification'].get('url') != endpoint or not isinstance(pods, dict)
-                    or not pods.get('deployment_uid') or type(pods.get('ready_replicas')) is not int
-                    or pods['ready_replicas'] < 1):
-                return message('evidence_required', reason=f'Missing pod or gateway readback for {service}')
+            if not target.get('mcp_url'):
+                endpoint = target['gateway_url'].rstrip('/') + target['verification_path']
+                pods = receipt.get('pod_verification')
+                if (receipt['verification'].get('url') != endpoint or not isinstance(pods, dict)
+                        or not pods.get('deployment_uid') or type(pods.get('ready_replicas')) is not int
+                        or pods['ready_replicas'] < 1):
+                    return message('evidence_required', reason=f'Missing pod or gateway readback for {service}')
             tag_locked = store.conn.execute('''SELECT 1 FROM deployment_locks
                 WHERE scope='tag' AND resource=? AND item_seq=?''', (receipt['image'], item['seq'])).fetchone()
             if not tag_locked:

@@ -10,9 +10,14 @@
 
 ## 后端自动部署
 
-按服务在 `development.backend_bundle.services.<服务键>.deployment` 配置 `enabled`、所选 `target` 和 `targets`。目标填写 `registry`、`image_repository`、`platform`、`cluster_id`、`kube_context`、`namespace`、`deployment`、`container`、`gateway_url` 和 `verification_path`。同一实际集群的 kubeconfig 别名共享一个 `cluster_id`。HTTP 版本端点返回 JSON，默认从 `git.commit.id` 读取完整 Git SHA，其他 JSON 字段可配 `version_field`。需要认证的版本探针使用 HTTPS 和可选 `http_credential_ref`、`http_username`。Smart-Geo 的 `deployment.build_dependencies` 要用经验证的 Git SHA 固定 `tet-common-java`。
+按服务在 `development.backend_bundle.services.<服务键>.deployment` 配置 `enabled`、所选 `target` 和 `targets`。目标登记 Harbor 仓库、平台、集群、命名空间、工作负载、容器和业务网关。Smart-Geo 的 `deployment.build_dependencies` 用经验证的 Git SHA 固定 `tet-common-java`。
 
-工单启动器从账本接手于 `backend.deploy` 的工单，独立执行镜像构建、推送、工作负载更新和 HTTP 检查。先核对当前授权和领取快照，再用合回 SHA 构建。按镜像标签和工作负载互斥，镜像标签冲突时保留证据。更新 Kubernetes 用包含前置条件的补丁，按摘要验证实际 Pod。启用前确认该环境、容器和版本探针，并使用运行工单的账号配置 Docker 登录及指定集群的 kubeconfig。部署失败登记「待验证」，部分成功保存在本轮发布回执中。
+工单启动器从账本接手于 `backend.deploy` 的工单，核对当前授权和领取快照，用合回 SHA 构建并推送 Harbor。按镜像标签和工作负载互斥，镜像标签冲突时保留证据。
+
+- 当前 Smart-Geo 目标用 `mcp_url` 更新 Rancher。发布脚本验证 Harbor 镜像的提交标签和摘要，调用 MCP 等待新 Pod 就绪并核对 Deployment 模板的镜像引用。直连 `health_url` 还须报告服务健康。
+- kubeconfig 路线填写 `kube_context` 和 `verification_path`，核对实际 Pod 镜像 ID 和 HTTP 版本字段，默认读取 `git.commit.id`。需要认证的版本探针使用 HTTPS 和可选 `http_credential_ref`、`http_username`。
+
+部署失败登记「待验证」。镜像已推送或 Deployment 已更新时，原尝试证据供重试对账。
 
 跨端启用部署时，`handoff` 在已有字段之外提交发布回执中的 `deployment` 服务映射及共同 `gateway_url`，前端联合验收从该网关重验完整后端版本。有关已安装的发布能力和实施上下文见[部署设计](../../../../docs/superpowers/plans/2026-11-22-禅道后端自动部署需求设计与实施计划.md)。
 

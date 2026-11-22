@@ -163,6 +163,54 @@ class FrontendPublisherTests(unittest.TestCase):
                    'TCP    127.0.0.1:5000    127.0.0.1:5002    ESTABLISHED    42\n')):
             verify_ports_stopped([5000])
 
+    def test_partial_bundle_uses_live_base_and_reuses_harbor_after_rollout_failure(self):
+        settings = {**self.request['settings'], 'rancher': {
+            'mcp_url': 'http://127.0.0.1:40140/mcp', 'namespace': 'internalrd',
+            'deployment': 'web', 'container': 'web', 'cluster_id': 'cluster',
+        }}
+        request = {**self.request, 'settings': settings}
+        repo = settings['image_repository']
+        live_base = 'sha256:' + 'e' * 64
+        old_ref = repo + '@' + live_base
+        new_ref = repo + '@' + self.digest
+        observed = {'digest': self.digest, 'config_digest': self.config_digest}
+        proof = {'image': new_ref, 'ready_replicas': 1, 'previous_pods': ['old'], 'pods': ['new']}
+
+        def build(release, _):
+            self.assertEqual(release['settings']['base_image'], old_ref)
+            return Path('fixture.tar')
+
+        def deploy(target, image, receipt, record):
+            self.assertEqual(target, settings['rancher'])
+            self.assertEqual(image, new_ref)
+            self.assertEqual(receipt['expected_previous_image'], old_ref)
+            if 'mcp_baseline' not in receipt:
+                record(mcp_baseline={'previous_image': old_ref, 'previous_pods': ['old'], 'desired_replicas': 1})
+                raise DeploymentError('rollout interrupted')
+            return proof
+
+        with (patch('frontend_release.verify_toolchain'),
+              patch('frontend_release.synchronize_branch', side_effect=lambda _, __, sha: sha),
+              patch('frontend_release.verify_ports_stopped'),
+              patch('frontend_release.current_image', return_value=old_ref) as current,
+              patch('frontend_release.build_archive', side_effect=build) as archive,
+              patch('frontend_release.archive_config', return_value=self.config_digest),
+              patch('frontend_release.command', return_value=SimpleNamespace(
+                  stdout=self.config_digest + ' linux/amd64')),
+              patch('frontend_release.remote_image', side_effect=[
+                  {'digest': live_base}, None, observed, observed, {**observed, 'digest': 'sha256:' + 'f' * 64}]),
+              patch('frontend_release.update_and_verify', side_effect=deploy)):
+            with self.assertRaisesRegex(DeploymentError, 'interrupted'):
+                publish(request, self.journal)
+            publish(request, self.journal)
+            with self.assertRaisesRegex(DeploymentError, 'digest changed'):
+                publish(request, self.journal)
+        current.assert_called_once()
+        archive.assert_called_once()
+        receipt = json.loads(self.journal.read_text(encoding='utf-8'))
+        self.assertEqual(receipt['base_image'], old_ref)
+        self.assertEqual(receipt['rancher'], {'target': settings['rancher'], 'pod_verification': proof})
+
 
 class FrontendLedgerTests(unittest.TestCase):
     def setUp(self):

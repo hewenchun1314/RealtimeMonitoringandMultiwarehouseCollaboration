@@ -186,9 +186,9 @@ def deployed_acceptance(config, options, args):
 
 
 def verify_deployment(deployment):
-    from backend_deploy import verify_http
+    from backend_deploy import verify_published_release
 
-    return {service: verify_http(receipt['target'], receipt['sha']) for service, receipt in deployment.items()}
+    return {service: verify_published_release(receipt) for service, receipt in deployment.items()}
 
 
 def port_open(host, port):

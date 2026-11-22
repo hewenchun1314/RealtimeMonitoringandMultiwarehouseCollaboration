@@ -11,7 +11,8 @@ import tarfile
 import tempfile
 
 from backend_deploy import DeploymentError, command, remote_image, required_digest
-from deploy_state import COMMIT, FRONTEND_PROFILE
+from deploy_state import COMMIT, FRONTEND_PROFILE, TAG
+from rancher_mcp import RancherMcpError, current_image, update_and_verify
 from stage_runner import write_json
 
 
@@ -161,18 +162,44 @@ def tag_for(request):
     return f'{settings["image_repository"]}:{fingerprint}-{FRONTEND_PROFILE}'
 
 
+def release_base(settings, saved):
+    target = settings.get('rancher')
+    if not target:
+        return settings['base_image'], None
+    if saved:
+        return saved['base_image'], saved['expected_previous_image']
+    before = current_image(target, settings['base_image'])
+    repo = settings['image_repository']
+    if before.startswith(repo + '@'):
+        required_digest(before.partition('@')[2])
+    elif not TAG.fullmatch(before) or before.rsplit(':', 1)[0] != repo:
+        raise DeploymentError('Rancher 当前前端镜像不属于配置的 Harbor 仓库')
+    current = remote_image(before, settings['platform'])
+    if not current:
+        raise DeploymentError('Harbor 中找不到 Rancher 当前前端镜像')
+    return repo + '@' + current['digest'], before
+
+
 def publish(request, journal):
-    image = tag_for(request)
     settings = request['settings']
     versions = {key: app['sha'] for key, app in request['applications'].items()}
     try:
         saved = json.loads(journal.read_text(encoding='utf-8'))
     except FileNotFoundError:
         saved = {}
+    base_image, previous_image = release_base(settings, saved)
+    settings = {**settings, 'base_image': base_image}
+    request = {**request, 'settings': settings}
+    image = tag_for(request)
     if saved and (saved.get('image') != image or saved.get('versions') != versions):
         raise DeploymentError('Existing release receipt does not match the requested image or versions')
     expected = saved.get('config_digest')
-    result = {'image': image, 'versions': versions, 'remote_versions': {}, 'base_image': settings['base_image']}
+    result = {'image': image, 'versions': versions, 'remote_versions': {}, 'base_image': base_image}
+    if previous_image:
+        result['expected_previous_image'] = previous_image
+    for key in ('digest', 'mcp_baseline', 'rancher'):
+        if key in saved:
+            result[key] = saved[key]
     if expected:
         result['config_digest'] = required_digest(expected)
     verify_toolchain(request)
@@ -206,8 +233,19 @@ def publish(request, journal):
             observed = remote_image(image, settings['platform'])
     if not observed or observed['config_digest'] != expected:
         raise DeploymentError('Harbor did not confirm the frontend image contents')
+    if saved.get('digest', observed['digest']) != observed['digest']:
+        raise DeploymentError('Harbor image digest changed since the prior publication attempt')
     result.update(status='published', digest=observed['digest'])
     write_json(journal, result)
+    if target := settings.get('rancher'):
+        ref = settings['image_repository'] + '@' + observed['digest']
+
+        def record(**fields):
+            result.update(fields)
+            write_json(journal, result)
+
+        proof = update_and_verify(target, ref, result, record)
+        record(rancher={'target': target, 'pod_verification': proof})
 
 
 def main():
@@ -218,7 +256,7 @@ def main():
     os.environ.update(GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='never')
     try:
         publish(json.loads(args.request.read_text(encoding='utf-8')), args.journal)
-    except (DeploymentError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
+    except (DeploymentError, RancherMcpError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
         print(f'前端镜像发布失败：{error}', flush=True)
         return 1
     return 0

@@ -27,6 +27,41 @@ def frontend_release_config(config):
     return config['development'].get('frontend_bundle', {}).get('deployment', {})
 
 
+def validate_mcp_target(target, field):
+    if not isinstance(target, dict):
+        raise ValueError(f'{field} must be an object')
+    for key in ('cluster_id', 'namespace', 'deployment', 'container'):
+        value = target.get(key)
+        if not isinstance(value, str) or not re.fullmatch(TARGET_FIELDS[key], value):
+            raise ValueError(f'{field}.{key} is invalid')
+    address = target.get('mcp_url')
+    url = urlsplit(address) if isinstance(address, str) else None
+    if (not url or url.scheme not in ('http', 'https') or not url.hostname
+            or url.username is not None or url.path != '/mcp' or url.query or url.fragment):
+        raise ValueError(f'{field}.mcp_url must be an HTTP(S) /mcp endpoint')
+    env = target.get('mcp_bearer_token_env')
+    if env is not None and (url.scheme != 'https' or not isinstance(env, str)
+                            or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', env)):
+        raise ValueError(f'{field}.mcp_bearer_token_env requires HTTPS and a valid variable name')
+
+
+def mcp_rollout_matches(proof, image):
+    if not isinstance(proof, dict) or proof.get('image') != image:
+        return False
+    ready, pods, previous = (proof.get(key) for key in ('ready_replicas', 'pods', 'previous_pods'))
+    return (type(ready) is int and ready > 0 and isinstance(pods, list) and len(pods) == ready
+            and isinstance(previous, list) and all(isinstance(pod, str) and pod for pod in (*pods, *previous))
+            and len(set(pods)) == ready and set(pods).isdisjoint(previous))
+
+
+def release_verification(receipt):
+    target = receipt['target']
+    if target.get('mcp_url'):
+        return {'sha': receipt['sha'], 'url': target['health_url'], 'provider': 'rancher_mcp',
+                'image': receipt['image'].rsplit(':', 1)[0] + '@' + receipt['digest']}
+    return {'sha': receipt['sha'], 'url': target['gateway_url'].rstrip('/') + target['verification_path']}
+
+
 def validate_frontend_release(config):
     release = frontend_release_config(config)
     if not isinstance(release, dict) or type(release.get('enabled', False)) is not bool:
@@ -49,6 +84,8 @@ def validate_frontend_release(config):
             or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
             or len(set(ports)) != len(ports)):
         raise ValueError('frontend_bundle.deployment.local_ports must contain unique TCP ports')
+    if 'rancher' in release:
+        validate_mcp_target(release['rancher'], 'frontend_bundle.deployment.rancher')
 
 
 def project_services(config):
@@ -88,7 +125,10 @@ def validate_configured_targets(config):
             prefix = f'{field}.targets.{name}'
             if not isinstance(target, dict):
                 raise ValueError(f'{prefix} must be an object')
+            use_mcp = 'mcp_url' in target
             for key, pattern in TARGET_FIELDS.items():
+                if use_mcp and key == 'kube_context':
+                    continue
                 value = target.get(key)
                 if not isinstance(value, str) or not re.fullmatch(pattern, value):
                     raise ValueError(f'{prefix}.{key} is invalid')
@@ -99,6 +139,15 @@ def validate_configured_targets(config):
             if (url.scheme not in ('http', 'https') or not url.hostname or url.username is not None
                     or url.path not in ('', '/') or url.query or url.fragment):
                 raise ValueError(f'{prefix}.gateway_url must be an HTTP origin')
+            if use_mcp:
+                validate_mcp_target(target, prefix)
+                health = target.get('health_url')
+                probe = urlsplit(health) if isinstance(health, str) else None
+                if (not probe or probe.scheme not in ('http', 'https') or not probe.hostname
+                        or probe.username is not None or not probe.path or probe.path == '/'
+                        or probe.query or probe.fragment):
+                    raise ValueError(f'{prefix}.health_url must be an HTTP(S) health endpoint')
+                continue
             path = target.get('verification_path')
             if not isinstance(path, str) or not re.fullmatch(r'/[A-Za-z0-9._~/-]+', path) or '//' in path:
                 raise ValueError(f'{prefix}.verification_path must be a local absolute URL path')
@@ -119,12 +168,16 @@ def deployed_receipt_matches(receipt, service, sha, target):
     digest = receipt.get('digest')
     image = receipt.get('image')
     probe = receipt.get('verification')
-    return (receipt.get('status') == 'deployed' and receipt.get('service') == service
+    common = (receipt.get('status') == 'deployed' and receipt.get('service') == service
             and receipt.get('sha') == sha and receipt.get('target') == target
             and isinstance(digest, str) and DIGEST.fullmatch(digest) is not None
             and isinstance(image, str) and TAG.fullmatch(image) is not None
             and image.rsplit(':', 1)[0] == f'{target["registry"]}/{target["image_repository"]}'
             and isinstance(probe, dict) and probe.get('sha') == sha)
+    if not common or not target.get('mcp_url'):
+        return common
+    expected = release_verification(receipt)
+    return probe == expected and mcp_rollout_matches(receipt.get('pod_verification'), expected['image'])
 
 
 def release_locks(store, item, *, tags_only=False):

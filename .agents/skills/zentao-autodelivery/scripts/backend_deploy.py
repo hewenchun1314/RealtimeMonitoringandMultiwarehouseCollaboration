@@ -160,7 +160,7 @@ def build_image(request, tag):
 
 
 def remote_image(tag, platform):
-    """Read the tag once, then inspect platform and config through immutable references."""
+    """Resolve a tag or digest, then inspect platform and immutable config."""
     args = ('docker', 'buildx', 'imagetools', 'inspect')
     result = command(*args, tag, allow_failure=True, timeout=90)
     if result.returncode:
@@ -172,7 +172,12 @@ def remote_image(tag, platform):
     if not match:
         raise DeploymentError('The registry did not report a manifest digest')
     digest = match.group(1)
-    reference = tag.rsplit(':', 1)[0]
+    reference, separator, pinned = tag.partition('@')
+    if separator:
+        if required_digest(pinned) != digest:
+            raise DeploymentError('Harbor returned a different manifest digest')
+    else:
+        reference = tag.rsplit(':', 1)[0]
     manifest = json.loads(command(*args, f'{reference}@{digest}', '--raw', timeout=90).stdout)
     platform_digest = digest
     if 'manifests' in manifest:
@@ -329,6 +334,62 @@ def verify_http(target, sha):
     return {'sha': sha, 'url': gateway.rstrip('/') + path}
 
 
+def verify_mcp_health(url):
+    """Check process health independently of the rollout's image evidence."""
+    origin = urlsplit(url)
+    if (origin.scheme not in ('http', 'https') or not origin.hostname or origin.username is not None
+            or origin.password is not None or not origin.path.startswith('/') or origin.path.startswith('//')
+            or origin.query or origin.fragment or any(ch == '\\' or ord(ch) < 32 for ch in url)):
+        raise DeploymentError('Invalid service health endpoint')
+    connect = HTTPSConnection if origin.scheme == 'https' else HTTPConnection
+    connection = connect(origin.hostname, origin.port, timeout=10)
+    try:
+        connection.request('GET', origin.path, headers={'Accept': 'application/json'})
+        response = connection.getresponse()
+        if response.status != 200:
+            raise DeploymentError(f'Service health returned HTTP {response.status}')
+        body = response.read(1024 * 1024 + 1)
+        if len(body) > 1024 * 1024:
+            raise DeploymentError('Service health response exceeded the size limit')
+        observed = json.loads(body)
+    except (OSError, HTTPException, json.JSONDecodeError, UnicodeError):
+        raise DeploymentError('Service health endpoint did not return usable JSON') from None
+    finally:
+        connection.close()
+    if not isinstance(observed, dict) or observed.get('status') != 'UP':
+        raise DeploymentError('Service health is not UP')
+
+
+def deploy_mcp(target, reference, receipt, record):
+    from rancher_mcp import RancherMcpError, update_and_verify
+
+    try:
+        return update_and_verify(target, reference, receipt, record)
+    except RancherMcpError as error:
+        raise DeploymentError(str(error)) from None
+
+
+def verify_mcp_image(target, reference):
+    from rancher_mcp import RancherMcpError, verify_current
+
+    try:
+        verify_current(target, reference)
+    except RancherMcpError as error:
+        raise DeploymentError(str(error)) from None
+
+
+def verify_published_release(receipt):
+    from deploy_state import release_verification
+
+    target = receipt['target']
+    if not target.get('mcp_url'):
+        return verify_http(target, receipt['sha'])
+    verification = release_verification(receipt)
+    verify_mcp_image(target, verification['image'])
+    verify_mcp_health(target['health_url'])
+    return verification
+
+
 def save_receipt(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + '.tmp')
@@ -359,11 +420,15 @@ def publish(request):
 
     try:
         record('preflight')
-        kube = Kubernetes(target)
-        kube.uid = receipt.get('deployment_uid')
-        observed_image = kube.preflight()
+        use_mcp = bool(target.get('mcp_url'))
+        if use_mcp:
+            record('packaging')
+        else:
+            kube = Kubernetes(target)
+            kube.uid = receipt.get('deployment_uid')
+            observed_image = kube.preflight()
+            record('packaging', deployment_uid=kube.uid, previous_image=receipt.get('previous_image', observed_image))
         platform = target['platform']
-        record('packaging', deployment_uid=kube.uid, previous_image=receipt.get('previous_image', observed_image))
         remote = remote_image(tag, platform)
         config = receipt.get('config_digest')
         if config is None:
@@ -391,15 +456,23 @@ def publish(request):
             raise DeploymentError('Published tag digest changed since the prior attempt')
         record('deployment_update', digest=digest, platform_digest=platform_digest)
         reference = tag.rsplit(':', 1)[0] + '@' + digest
-        current = kube.current_image()
-        if current != reference:
-            if current != receipt['previous_image']:
-                raise DeploymentError('Deployment image was changed by another release')
-            kube.update(current, reference)
-        record('deployment_verification')
-        pod = kube.verify_rollout(reference, {digest, platform_digest, config})
-        record('gateway_verification', pod_verification=pod)
-        verification = verify_http(target, sha)
+        if use_mcp:
+            from deploy_state import release_verification
+
+            pod = deploy_mcp(target, reference, receipt, lambda **facts: record('deployment_update', **facts))
+            record('health_verification', pod_verification=pod)
+            verify_mcp_health(target['health_url'])
+            verification = release_verification(receipt)
+        else:
+            current = kube.current_image()
+            if current != reference:
+                if current != receipt['previous_image']:
+                    raise DeploymentError('Deployment image was changed by another release')
+                kube.update(current, reference)
+            record('deployment_verification')
+            pod = kube.verify_rollout(reference, {digest, platform_digest, config})
+            record('gateway_verification', pod_verification=pod)
+            verification = verify_http(target, sha)
         receipt.update(status='deployed', verification=verification, stage='complete')
         save_receipt(path, receipt)
         return receipt

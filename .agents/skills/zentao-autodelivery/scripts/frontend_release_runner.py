@@ -69,8 +69,12 @@ def run_frontend_release(marker, database, config_path, project_root, *, recover
     outcome = proof['outcome']
     if outcome == 'success' and evidence.get('status') != 'published':
         outcome = 'failed'
-    summary = (f'前端镜像已推送 Harbor {evidence["image"]}（{evidence["digest"]}）'
-               if outcome == 'success' else '前端镜像发布未通过，详见本单发布日志')
+    if outcome == 'success':
+        summary = f'前端镜像已推送 Harbor {evidence["image"]}（{evidence["digest"]}）'
+        if evidence.get('rancher'):
+            summary += '，Rancher 已核对模板摘要和就绪 Pod'
+    else:
+        summary = '前端镜像发布未通过，详见本单发布日志'
     return finish({
         'attempt_id': attempt_id, 'outcome': outcome, 'summary': summary, 'evidence': evidence,
         'stop_confirmed': True, 'stop_evidence': proof['stop_evidence'],

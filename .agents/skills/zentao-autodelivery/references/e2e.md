@@ -20,7 +20,7 @@ E2E 在合回前执行。从工单配置快照读取 `e2e` 设置及当前前端
 
 正式验收从本单已核对的候选工作树启动服务。把实际本地地址、工单标识、测试档案和场景脚本交给 `playwright_e2e.py --marker <marker> --base-url <origin> --profile <JSON路径> --scenario <CJS路径>`，由当前 E2E 阶段运行器执行。场景文件导出 `async ({ page }) => { ... }`，在已经登录且通过数据检查的独立页面上确认前后端实际运行版本、执行本单用例并保存证据。断言失败时抛出错误，并在工单证据中记录脱敏的具体断言和页面状态。只在场景及现有逐项证据校验完成后登记 E2E 通过。
 
-跨端工单若有自动部署结果，再传入 `--startup-log <本轮日志路径>`，由 runner 使用交接网关并启动候选前端。基座本身有工单 worktree 时默认使用该目录。仅子应用有工单 worktree 时，先准备可启动的基座目录并接入所有待验子应用，再通过 `--candidate-workspace <路径>` 传入。候选依赖须事先安装。基座与子应用启动端口须空闲。runner 会核实各前端仓库实际 SHA，并在 Playwright 执行前后核对网关上的后端版本。验收证据从实测回执填入 `gateway_url`（取 `frontend.gateway`）及 `backend_deployment`。
+跨端工单若有自动部署结果，再传入 `--startup-log <本轮日志路径>`，由 runner 使用交接网关并启动候选前端。基座本身有工单 worktree 时默认使用该目录。仅子应用有工单 worktree 时，先准备可启动的基座目录并接入所有待验子应用，再通过 `--candidate-workspace <路径>` 传入。候选依赖须事先安装。基座与子应用启动端口须空闲。runner 会核实各前端仓库实际 SHA，并在 Playwright 执行前后核对后端发布证据。MCP 路线读回 Deployment 模板摘要、Ready Pod 和服务健康，kubeconfig 路线读回网关 HTTP 版本。业务场景使用交接网关。验收证据从实测回执填入 `gateway_url`（取 `frontend.gateway`）及 `backend_deployment`。
 
 ## 基座应用
 
