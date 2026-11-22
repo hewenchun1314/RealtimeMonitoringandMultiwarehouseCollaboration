@@ -189,10 +189,17 @@
   },
   "backend_dependencies": {
     "datapool": {
-      "access": "read_only",
+      "access": "writable",
       "source_path": "../tet-datapool",
       "api_source": "DPWebApi/Controllers",
-      "used_by": ["smart-geo"]
+      "used_by": ["smart-geo"],
+      "delivery": {
+        "branch": "AI-development",
+        "build_command": "dotnet build DPWebApi/DPWebApi.csproj --configuration Release",
+        "test_command": "dotnet test Tet.UnitTests/Tet.UnitTests.csproj --configuration Release",
+        "start_command": "$env:DOTNET_ENVIRONMENT='localzzg'; $env:ASPNETCORE_ENVIRONMENT='localzzg'; $env:useSwagger='true'; dotnet run --no-build --no-launch-profile --configuration Release --project DPWebApi/DPWebApi.csproj -- --urls http://127.0.0.1:19085",
+        "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:19085/swagger/v1/swagger.json'"
+      }
     }
   },
   "e2e": {

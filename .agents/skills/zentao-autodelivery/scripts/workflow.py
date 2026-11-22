@@ -152,7 +152,7 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
         if action == 'attempt_finish':
             response = attempt_finish(store, item, data, branches_verified=branches_verified,
                                       config_directory=config_directory)
-        elif action in ('attempt_start', 'repair_advance'):
+        elif action in ('attempt_start', 'repair_advance', 'recover'):
             response = actions[action](store, item, data, config_directory=config_directory)
         else:
             response = actions[action](store, item, data)

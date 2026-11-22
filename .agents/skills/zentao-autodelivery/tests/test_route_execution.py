@@ -219,6 +219,23 @@ class RouteExecutionTests(WorkflowFixture):
         self.assertEqual(self.record('recover', recovery_id='fixed', evidence='updated material')['stage'],
                          'material_check')
 
+    def test_recovery_restarts_material_and_split_when_reviewed_intent_changes(self):
+        context = self.start()
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        evidence = {'tasks': {'frontend': [{'id': 'F1', 'description': 'Show data', 'acceptance': ['Visible']}]}}
+        self.finish_stage(context, 'split', evidence=evidence)
+        self.finish_stage(context, 'frontend.design', 'failed', retryable=False,
+                          evidence={'task_blockers': {'F1': 'Product rule is unclear'}})
+        self.record('complete', blockers_path='blockers.md', **context)
+        self.material.write_text('研发范围：前后端\n历史曲线应追溯原始输入。', encoding='utf-8')
+        restored = self.record('recover', recovery_id='new-material', evidence='Confirmed historic curve policy')
+        self.assertEqual(restored['stage'], 'material_check')
+        context['request_id'] = self.reserve(2)['request_id']
+        self.record('start', **context)
+        self.assertEqual(self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})[
+            'next_stage'], 'split')
+        self.assertEqual(self.finish_stage(context, 'split', evidence=evidence)['next_stage'], 'frontend.design')
+
     def test_blocked_split_has_no_developer_attempt_and_can_reread_corrected_material(self):
         context = self.start()
         self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})

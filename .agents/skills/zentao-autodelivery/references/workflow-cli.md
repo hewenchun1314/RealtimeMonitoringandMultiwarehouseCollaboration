@@ -57,7 +57,7 @@
 | `attempt_finish` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`outcome`、`summary`、`evidence`。`outcome` 为 `success`、`failed` 或 `timed_out`。Code Review 或 E2E 有确需修复的代码缺陷时，失败结果提供 `repair_required:true`。环境问题按普通失败处理。分段失败也由本操作记录，超时须提供 `stop_confirmed:true` 和 `stop_evidence`。确定无法重试时提供 `retryable:false`，可用 `completion` 指定「待补材料」「待验证」或「阻断」。`disposition:next` 时即使本步失败也立即执行 `next_stage`。`retry` 续跑本步，收到 `close` 或 `blocked` 后执行收尾。需求的 `material_check` 确认缺少需求文件时，提交 `outcome:"failed"` 和 `evidence.material_file_status:"missing"` 并附核对依据。账本跳过重试，返回 `blocked`，后续步骤记为跳过，结论为「待补材料」。 |
 | `complete` | `request_id`、`chat_id`。有阻断时提供本地 `blockers_path`，有协作者可访问的位置时再提供 `blockers_location`。以账本返回的结论和步骤结果为准。 |
 | `stop` | 用户明确要求停跑时使用。传 `request_id`、`chat_id`、`stop_evidence`，证据须包含实际聊天状态 `chat_status:"idle"` 和 `owned_processes_active_after_stop:0`。有活动尝试时先登记原尝试终态。停跑保留绑定和已有步骤，成绩记为「主动停跑」，释放名额并入队写回，不进入自动恢复。 |
-| `recover` | `recovery_id`、与阻断直接相关的 `evidence`。同一恢复证据用同一标识。从流程顺序中首个仍失败的步骤恢复，沿原聊天继续。 |
+| `recover` | `recovery_id`、与阻断直接相关的 `evidence`。同一恢复证据用同一标识。从流程顺序中首个仍失败的步骤恢复，沿原聊天继续。需求已评审的 `intent.md` 变化或不可读时，从材料评审重新开始，再按新材料拆分。 |
 | `writeback_claim` | `operation_id`、`owner`。保存 `lease_id`、`expires_at`、`reconcile_required` 及 `entry`。到期失去发起请求的权利。 |
 | `writeback_reconcile` | `operation_id`、`lease_id`、`prior_ended:true`、`missing:true`。接管后确认旧请求已终止并读回确认缺失时提交。获得 `ready_to_send` 后，才能申请补发。 |
 | `writeback_send` | `operation_id`、`lease_id`。获得新的 `send_authorized` 后允许执行一次对应的禅道写入请求。同一事件重放或已有进行中的发送授权时返回 `already_authorized`，进入回读对账。领取到期后的新执行者按 `writeback_reconcile` 完成核对后再申请授权。 |

@@ -666,7 +666,7 @@ def stop(store, item, data):
     return complete(store, store.find_item(item_identity(item)), data)
 
 
-def recover(store, item, data):
+def recover(store, item, data, *, config_directory):
     recovery_id = require_text(data.get('recovery_id'), 'recovery_id')
     evidence = data.get('evidence')
     if not evidence:
@@ -686,8 +686,16 @@ def recover(store, item, data):
         stage = task_evidence.first_unverified_stage(store, item) or item['stage']
     if is_routed(item):
         route = get_split(store, item)
-        # A corrected requirement may change the split. Re-read its source first.
-        if stage == 'split' or (route and route.get('blockers')):
+        reviewed = (stage_evidence(store, item, 'material_check') or {}).get('material')
+        changed = False
+        if item['kind'] == 'story' and reviewed:
+            try:
+                current = read_material(snapshot(item), config_directory, 'story', {'path': reviewed['path']})
+                changed = current['sha256'] != reviewed['sha256']
+            except (ValueError, KeyError):
+                # Route an unavailable reviewed source through normal material review.
+                changed = True
+        if changed or stage == 'split' or (route and route.get('blockers')):
             stage = 'material_check'
     store.update_item(item, state=state, stage=stage, conclusion=None, run_round=item['run_round'] + 1)
     return message('recovered', item_state=state, stage=stage, chat_id=item['chat_id'],
