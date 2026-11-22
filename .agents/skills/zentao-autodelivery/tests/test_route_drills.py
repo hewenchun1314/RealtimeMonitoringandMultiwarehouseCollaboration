@@ -47,6 +47,8 @@ class RouteDrills(unittest.TestCase):
         self.config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
         self.config.pop('backend_dependencies', None)
         self.config.get('e2e', {}).pop('enabled', None)
+        # These drills end at integration. The frontend publisher has its own worker tests.
+        self.config['development']['frontend_bundle'].pop('deployment', None)
         self.assertEqual(self.config['development']['allowed_requirement_types'], ['frontend_only'])
         self.config['zentao'].update(base_url='http://127.0.0.1:1', assigned_to_accounts=['drill'])
         self.config['runtime'] = {'desktop_project_id': 'drill'}

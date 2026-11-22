@@ -4,17 +4,18 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from deploy_state import DEPLOY_STAGE, TAG, deployed_receipt_matches, project_services, release_locks, target_key
+from deploy_state import (COMMIT, DEPLOY_STAGE, DEPLOY_STAGES, FRONTEND_DEPLOY_STAGE, TAG,
+                          deployed_receipt_matches, frontend_release_config, project_services, release_locks, target_key)
 from execution import active_attempt, attempt_finish, attempt_start, execution_matches, repair_advance
 from ledger import Ledger, item_identity, message, transaction, validate_config
 from route_evidence import deployment_requirements
-from route_execution import get_split, is_routed, snapshot
+from route_execution import get_split, is_routed, read_history, snapshot
 
 
 def deployment_pending(store, item):
     if item['state'] != 'running' or not is_routed(item):
         return False
-    if item['stage'] == DEPLOY_STAGE:
+    if item['stage'] in DEPLOY_STAGES:
         return True
     trial = active_attempt(store, item)
     if trial:
@@ -79,6 +80,60 @@ def trial_fields(item, trial):
             'deadline_at': trial['deadline_at'], 'run_round': item['run_round']}
 
 
+def frontend_request(store, item, directory):
+    config = snapshot(item)
+    settings = frontend_release_config(config)
+    live = frontend_release_config(store.config)
+    approved = {**settings}
+    if live.get('image_mode') == 'reuse':
+        approved['image_mode'] = 'reuse'
+    source = (directory / config['workspaces']['frontend']).resolve()
+    if (not settings.get('enabled') or approved != live
+            or source != (directory / store.config.get('workspaces', {}).get('frontend', '.')).resolve()):
+        raise ValueError('前端镜像发布或前端工作区授权已变更')
+    route, steps = read_history(store, item)
+    required = [name for name in route['stages'] if name.startswith('frontend.') and name != FRONTEND_DEPLOY_STAGE]
+    if any(steps.get(name, {}).get('outcome') != 'success' for name in required):
+        raise ValueError('前端发布需要本单前端验证及合回成功')
+    planned = steps['frontend.plan']['evidence']['applications']
+    versions = steps['frontend.integration']['evidence']['merged_versions']
+    if not planned or set(planned) != versions.keys():
+        raise ValueError('前端应用与合回 SHA 清单不一致')
+    application_settings = config['development']['frontend_bundle']['applications']
+    live_apps = store.config['development']['frontend_bundle']['applications']
+    applications = {}
+    for key in planned:
+        app = application_settings.get(key)
+        if app is None or app != live_apps.get(key) or not COMMIT.fullmatch(versions[key]):
+            raise ValueError(f'{key} 的发布版本或仓库授权无效')
+        relative = app['repository']
+        repository = (source / relative).resolve()
+        if not repository.is_relative_to(source):
+            raise ValueError(f'{key} 的仓库超出前端工作区')
+        applications[key] = {'repository': str(repository), 'path': relative, 'branch': app['branch'],
+                             'sha': versions[key]}
+    if len({app['repository'] for app in applications.values()}) != len(applications):
+        raise ValueError('前端发布应用必须映射到不同仓库')
+    return {'marker': item['marker'], 'settings': approved, 'applications': applications,
+            'release_dir': str(directory.parent / 'customized-release')}
+
+
+def claim_frontend(store, item, directory):
+    request, blocked = None, None
+    try:
+        request = frontend_request(store, item, directory)
+    except (ValueError, TypeError, KeyError) as error:
+        blocked = str(error)
+    if request and not acquire_locks(store, item, 'frontend-image', [request['settings']['image_repository']]):
+        return message('deployment_busy', reason='同一前端镜像仓库已有工单在发布')
+    trial = attempt_start(store, item, {**binding(item), 'stage': item['stage']},
+                          config_directory=directory, deployment_worker=True)
+    if trial['status'] not in ('attempt_started', 'attempt_active'):
+        return trial
+    store.conn.execute('INSERT INTO deployment_claims VALUES(?,?)', (trial['attempt_id'], item['seq']))
+    return message('deployment_claimed', **trial_fields(item, trial), frontend_request=request, blocked=blocked)
+
+
 def claim_deployment(store, item, directory):
     if not execution_matches(store, item, binding(item)):
         return message('stale_execution')
@@ -86,6 +141,8 @@ def claim_deployment(store, item, directory):
     if active and store.conn.execute('SELECT 1 FROM deployment_claims WHERE attempt_id=?',
                                      (active['attempt_id'],)).fetchone():
         return message('deployment_busy', **trial_fields(item, active))
+    if item['stage'] == FRONTEND_DEPLOY_STAGE:
+        return claim_frontend(store, item, directory)
     requests, skipped, gateway, blocked = release_requests(store, item, directory)
     targets = sorted({target_key(request['target']) for request in requests.values()})
     if not acquire_locks(store, item, 'target', targets):
@@ -118,6 +175,17 @@ def lock_image_tags(store, item, directory, fields):
 def finish_deployment(store, item, trial, directory, fields):
     data = {**fields, **binding(item), 'phase': trial['phase']}
     evidence = data.get('evidence')
+    if item['stage'] == FRONTEND_DEPLOY_STAGE:
+        if data.get('outcome') == 'success':
+            try:
+                frontend_request(store, item, directory)
+            except (ValueError, TypeError, KeyError) as error:
+                data.update(outcome='failed', summary=str(error), retryable=False)
+        data['completion'] = '待验证'
+        result = attempt_finish(store, item, data, config_directory=directory, deployment_worker=True)
+        if result['status'] == 'attempt_finished':
+            store.conn.execute('DELETE FROM deployment_claims WHERE attempt_id=?', (trial['attempt_id'],))
+        return result
     if not isinstance(evidence, dict) or not isinstance(evidence.get('services'), dict):
         raise ValueError('Deployment completion requires per-service receipts')
     selected, _, versions, _ = deployment_requirements(store, item)
@@ -161,7 +229,7 @@ def deployment_action(action, marker, database, config_path, **fields):
         if not item or not deployment_pending(store, item):
             return message('deployment_not_pending')
         if action == 'peek':
-            return message('deployment_pending')
+            return message('deployment_pending', stage=item['stage'])
         if action == 'claim':
             return claim_deployment(store, item, directory)
         trial = active_attempt(store, item)

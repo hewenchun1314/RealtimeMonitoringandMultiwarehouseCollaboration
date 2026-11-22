@@ -7,13 +7,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from delivery_scope import project_mode, route_stages
-from deploy_state import DEPLOY_STAGE, validate_configured_targets
+from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, validate_configured_targets, validate_frontend_release
 from task_evidence import EVIDENCE_SCHEMA
 
 STAGES = ('material_check', 'design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'e2e', 'integration')
 STAGE_NAMES = dict(zip(STAGES, ('材料评审', '设计', '计划', '分支核验', '编码', '单元测试', 'Code Review', 'E2E', '合回')))
 STAGE_NAMES.update(split='范围判定与任务拆分', handoff='后端联调交接')
 STAGE_NAMES[DEPLOY_STAGE] = '后端部署'
+STAGE_NAMES[FRONTEND_DEPLOY_STAGE] = '前端镜像发布'
 for scoped_stage in route_stages('fullstack'):
     if '.' in scoped_stage:
         side, step = scoped_stage.split('.')
@@ -253,6 +254,7 @@ def validate_config(config):
             require_text(application, 'application')
         workspaces = require_mapping(config.get('workspaces'), 'workspaces')
         require_text(workspaces.get('frontend'), 'workspaces.frontend')
+        validate_frontend_release(config)
     required = set(workflow_stages(development)) - {'integration'}
     if mode == 'backend_only':
         required.discard('branch_check')

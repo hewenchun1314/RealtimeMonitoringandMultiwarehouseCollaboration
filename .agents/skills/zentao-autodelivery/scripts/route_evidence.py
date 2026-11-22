@@ -5,7 +5,8 @@ import subprocess
 from pathlib import Path
 
 from branch_check import git, planned_applications
-from deploy_state import DEPLOY_STAGE, configured_targets, deployed_receipt_matches
+from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, TAG,
+                          configured_targets, deployed_receipt_matches, frontend_release_config)
 from route_execution import get_split, snapshot, stage_evidence
 
 
@@ -175,6 +176,24 @@ def validate_success(store, item, stage, evidence):
         return handoff_error(store, item, evidence)
     if stage == DEPLOY_STAGE:
         return deployment_evidence_error(store, item, evidence)
+    if stage == FRONTEND_DEPLOY_STAGE:
+        settings = frontend_release_config(snapshot(item))
+        merged = (stage_evidence(store, item, 'frontend.integration') or {}).get('merged_versions')
+        image = evidence.get('image')
+        remote = evidence.get('remote_versions')
+        digests = (evidence.get('digest'), evidence.get('config_digest'))
+        if (not commit_map(merged) or evidence.get('versions') != merged
+                or not isinstance(remote, dict) or remote.keys() != merged.keys()
+                or not all(isinstance(sha, str) and COMMIT.fullmatch(sha) for sha in remote.values())
+                or not isinstance(image, str) or not TAG.fullmatch(image)
+                or image.rsplit(':', 1)[0] != settings.get('image_repository')
+                or not image.endswith('-' + FRONTEND_PROFILE)
+                or evidence.get('stopped_ports') != settings.get('local_ports')
+                or evidence.get('base_image') != settings.get('base_image')
+                or evidence.get('status') != 'published'
+                or not all(isinstance(digest, str) and DIGEST.fullmatch(digest) for digest in digests)):
+            return '前端镜像发布需要逐仓版本、停服及 Harbor 摘要回执'
+        return None
     side, _, name = stage.partition('.')
     if name in ('coding', 'integration'):
         return repository_evidence(store, item, side, name, evidence)
@@ -244,5 +263,12 @@ def delivery_summary(route, stages):
                 target = receipt['target']
                 facts.append(f'{key} 已部署到 {target["namespace"]}/{target["deployment"]} '
                              f'{receipt["image"].rsplit(":", 1)[0]}@{receipt["digest"]}')
+    frontend = stages.get(FRONTEND_DEPLOY_STAGE)
+    if frontend:
+        evidence = frontend.get('evidence') or {}
+        if frontend['outcome'] == 'success':
+            facts.append(f'前端镜像已推送 Harbor {evidence["image"]}（{evidence["digest"]}）')
+        else:
+            facts.append('前端镜像发布待验证')
     facts.extend(route.get('blockers', []))
     return '；'.join(facts)

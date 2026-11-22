@@ -5,7 +5,7 @@ import re
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 
-from deploy_state import DEPLOY_STAGE
+from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE
 
 
 SCOPES = {'纯前端': 'frontend_only', '纯后端': 'backend_only', '前后端': 'fullstack'}
@@ -23,7 +23,7 @@ def project_mode(development):
     raise ValueError('Invalid development.allowed_requirement_types')
 
 
-def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False):
+def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_deploy_enabled=False):
     if scope not in SCOPES.values():
         raise ValueError('Unknown delivery scope')
     stages = list(PREFIX)
@@ -38,6 +38,8 @@ def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False):
         if e2e_enabled:
             stages.append('frontend.e2e')
         stages.append('frontend.integration')
+        if frontend_deploy_enabled:
+            stages.append(FRONTEND_DEPLOY_STAGE)
     return tuple(stages)
 
 

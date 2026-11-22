@@ -43,14 +43,14 @@ def attempt_location(database, marker, claim):
     return root, root / 'attempts' / claim['attempt_id'] / 'finish.json'
 
 
-def record_finish(action, checkpoint, deadline, result):
+def record_finish(action, checkpoint, deadline, result, *, timeout_summary='后端部署已到执行截止时间'):
     timed_out = (utc_now() >= deadline and result['outcome'] != 'timed_out')
     if timed_out:
-        result = {**result, 'outcome': 'timed_out', 'summary': '后端部署已到执行截止时间'}
+        result = {**result, 'outcome': 'timed_out', 'summary': timeout_summary}
     write_json(checkpoint, result)
     response = action('finish', **result)
     if response['status'] == 'deadline_elapsed' and result['outcome'] != 'timed_out':
-        result = {**result, 'outcome': 'timed_out', 'summary': '后端部署已到执行截止时间'}
+        result = {**result, 'outcome': 'timed_out', 'summary': timeout_summary}
         write_json(checkpoint, result)
         response = action('finish', **result)
     return response

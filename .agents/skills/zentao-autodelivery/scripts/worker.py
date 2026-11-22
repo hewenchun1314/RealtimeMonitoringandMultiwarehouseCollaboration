@@ -17,8 +17,10 @@ from uuid import UUID, uuid4
 from backend_deploy_runner import deployment_action, run_deployment
 from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
+from deploy_state import FRONTEND_DEPLOY_STAGE
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
 from ledger import validate_config
+from frontend_release_runner import run_frontend_release
 from stage_runner import run_stage, utc_now
 from task_sync import enabled as task_sync_enabled
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
@@ -78,7 +80,7 @@ def worker_prompt(operation, item):
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
         '按同名后端服务列入计划并使用核验过的工单工作树。前端使用已配置业务后端的契约。'
-        '若账本的当前阶段或返工分段为 backend.deploy，结束当前轮次，发布执行器会自动接手并续接原会话。'
+        '若账本进入 backend.deploy（含返工分段）或 frontend.deploy，结束当前轮次，发布执行器会接手并续接原会话。'
         '跨端工单在后端合回且联调交接通过后才启动前端。旧工单沿用原阶段。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )
@@ -135,21 +137,26 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     deadline = deadline or utc_now() + timedelta(hours=72)
 
     def peek():
-        return deployment_action('peek', marker, DATABASE_PATH, CONFIG_PATH)['status']
+        return deployment_action('peek', marker, DATABASE_PATH, CONFIG_PATH)
 
-    state = peek()
+    pending = peek()
     last_turn = {}
     last_deployment = None
+    release_key = 'backend_deployment'
     while utc_now() < deadline:
+        state = pending['status']
         item = read_item(marker)
         if not item or item['state'] not in ('bound', 'running', 'closing'):
             return last_turn or {'status': 'worker_released'}
         if state == 'deployment_pending':
+            frontend = pending.get('stage') == FRONTEND_DEPLOY_STAGE
+            release_key = 'frontend_deployment' if frontend else 'backend_deployment'
             if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
                 deployment = {'status': 'deployment_runtime_blocked'}
             else:
-                deployment = run_deployment(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT,
-                                            recover=recover_deployment)
+                runner = run_frontend_release if frontend else run_deployment
+                deployment = runner(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT,
+                                    recover=recover_deployment)
             status = deployment['status']
             if status == 'deployment_busy' and 'attempt_id' not in deployment:
                 # Another work item owns the target. Its release can be observed
@@ -158,24 +165,24 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
                 if remaining > 0:
                     time.sleep(min(2, remaining))
             elif status not in ('attempt_finished', 'repair_advanced', 'deployment_not_pending'):
-                return {**last_turn, 'status': 'worker_deployment_blocked', 'backend_deployment': deployment}
+                return {**last_turn, 'status': 'worker_deployment_blocked', release_key: deployment}
             else:
                 last_deployment = deployment
-            state = peek()
+            pending = peek()
             continue
         if state != 'deployment_not_pending':
             return {**last_turn, 'status': 'worker_deployment_blocked',
-                    'backend_deployment': {'status': state}}
+                    release_key: {'status': state}}
         last_turn = worker_result(*launch_chat(item))
         if last_deployment is not None:
-            last_turn['backend_deployment'] = last_deployment
+            last_turn[release_key] = last_deployment
         if last_turn['status'] != 'worker_stopped':
             return last_turn
-        state = peek()
-        if state == 'deployment_not_pending':
+        pending = peek()
+        if pending['status'] == 'deployment_not_pending':
             return last_turn
     return {**last_turn, 'status': 'worker_deployment_blocked',
-            'backend_deployment': {'status': 'deployment_worker_deadline'}}
+            release_key: {'status': 'deployment_worker_deadline'}}
 
 
 def run(operation, marker, cli):

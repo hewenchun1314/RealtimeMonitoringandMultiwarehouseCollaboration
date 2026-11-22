@@ -5,6 +5,9 @@ from urllib.parse import urlsplit
 
 
 DEPLOY_STAGE = 'backend.deploy'
+FRONTEND_DEPLOY_STAGE = 'frontend.deploy'
+DEPLOY_STAGES = (DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE)
+FRONTEND_PROFILE = 'zentao-ai-development'
 TARGET_FIELDS = {
     'registry': r'[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?',
     'image_repository': r'[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)+',
@@ -18,6 +21,34 @@ TARGET_FIELDS = {
 DIGEST = re.compile(r'sha256:[0-9a-f]{64}')
 COMMIT = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})')
 TAG = re.compile(r'[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?/[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9][a-zA-Z0-9_.-]*')
+
+
+def frontend_release_config(config):
+    return config['development'].get('frontend_bundle', {}).get('deployment', {})
+
+
+def validate_frontend_release(config):
+    release = frontend_release_config(config)
+    if not isinstance(release, dict) or type(release.get('enabled', False)) is not bool:
+        raise ValueError('frontend_bundle.deployment.enabled must be a boolean')
+    if not release.get('enabled'):
+        return
+    if release.get('image_mode', 'build') not in ('build', 'reuse'):
+        raise ValueError('frontend_bundle.deployment.image_mode must be build or reuse')
+    repository = release.get('image_repository')
+    if not isinstance(repository, str) or not TAG.fullmatch(repository + ':check'):
+        raise ValueError('frontend_bundle.deployment.image_repository is invalid')
+    base = release.get('base_image')
+    if (not isinstance(base, str) or not base.startswith(repository + '@')
+            or not DIGEST.fullmatch(base.partition('@')[2])):
+        raise ValueError('frontend_bundle.deployment.base_image must pin the repository digest')
+    if release.get('platform') not in ('linux/amd64', 'linux/arm64'):
+        raise ValueError('frontend_bundle.deployment.platform is invalid')
+    ports = release.get('local_ports')
+    if (not isinstance(ports, list) or not ports
+            or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
+            or len(set(ports)) != len(ports)):
+        raise ValueError('frontend_bundle.deployment.local_ports must contain unique TCP ports')
 
 
 def project_services(config):

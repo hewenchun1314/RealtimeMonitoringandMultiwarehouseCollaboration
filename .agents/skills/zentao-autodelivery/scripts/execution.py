@@ -7,7 +7,7 @@ from uuid import uuid4
 from backend_dependencies import backend_services, dependency_context
 from branch_check import branch_context, planned_applications, valid_evidence
 from delivery_scope import read_material
-from deploy_state import DEPLOY_STAGE, release_locks
+from deploy_state import DEPLOY_STAGE, DEPLOY_STAGES, release_locks
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
@@ -183,7 +183,7 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
         return message('stale_execution')
     if data.get('stage') != item['stage']:
         return message('stage_mismatch', stage=item['stage'])
-    if item['stage'] == DEPLOY_STAGE and not deployment_worker:
+    if item['stage'] in DEPLOY_STAGES and not deployment_worker:
         return message('deployment_worker_required')
     preparation = branch_context(store, item) if item['stage'].rsplit('.', 1)[-1] == 'branch_check' else {}
     routed = is_routed(item)
@@ -361,7 +361,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     if outcome not in ('success', 'failed', 'timed_out'):
         raise ValueError('outcome must be success, failed or timed_out')
     phase = trial['phase']
-    if (item['stage'] == DEPLOY_STAGE or phase == DEPLOY_STAGE) and not deployment_worker:
+    if (item['stage'] in DEPLOY_STAGES or phase == DEPLOY_STAGE) and not deployment_worker:
         return message('deployment_worker_required')
     completed_phases = json.loads(trial['phase_history'])
     if data.get('phase', None if completed_phases else 'verify') != phase:

@@ -3,7 +3,7 @@
 import json
 
 from delivery_scope import resolve_split, route_stages
-from deploy_state import DEPLOY_STAGE, configured_targets
+from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, configured_targets, frontend_release_config
 from ledger import workflow_stages
 
 
@@ -22,7 +22,8 @@ def invalidate_repaired_outputs(stages, phase, route):
     side = phase.partition('.')[0]
     for stage in order[order.index(phase) + 1:]:
         if (stage.partition('.')[0] == side or
-                (side in ('backend', 'handoff') and stage in ('handoff', 'frontend.e2e', 'frontend.integration'))):
+                (side in ('backend', 'handoff') and stage in (
+                    'handoff', 'frontend.e2e', 'frontend.integration', FRONTEND_DEPLOY_STAGE))):
             stages.pop(stage, None)
 
 
@@ -103,7 +104,8 @@ def split_result(store, item, evidence, *, revision=False):
     route = resolve_split(config, {**evidence, 'material': reviewed['material']})
     route['e2e_enabled'] = config.get('e2e', {}).get('enabled', True)
     route['stages'] = list(route_stages(route['scope'], e2e_enabled=route['e2e_enabled'],
-                                       deploy_enabled=bool(configured_targets(config))))
+                                       deploy_enabled=bool(configured_targets(config)),
+                                       frontend_deploy_enabled=frontend_release_config(config).get('enabled', False)))
     if revision:
         previous = get_split(store, item)
         if not previous or previous['scope'] != route['scope']:
@@ -142,6 +144,8 @@ def v2_repair(stage, data, route):
 
 
 def stage_role(stage):
+    if stage == FRONTEND_DEPLOY_STAGE:
+        return '前端部署 Agent'
     if stage == DEPLOY_STAGE:
         return '发布执行器'
     if stage == 'material_check':

@@ -33,6 +33,14 @@
     "max_retries_per_step": 3,
     "frontend_bundle": {
       "name": "micro-hnf-universal-subapp",
+      "deployment": {
+        "enabled": true,
+        "image_mode": "build",
+        "image_repository": "hzhub.tracyenergy.cn:6443/internalrd/tet-micro-data-pool-web-new",
+        "base_image": "hzhub.tracyenergy.cn:6443/internalrd/tet-micro-data-pool-web-new@sha256:f7016bb60da56ef4e188f62d63d7e9bec72746122a8595c039acf6a468c0d09b",
+        "platform": "linux/amd64",
+        "local_ports": [5000, 5001, 5002, 5004, 5005, 5006, 5010, 5013, 5150, 5151, 30001, 30042, 30043, 30044, 30046, 30047, 30049, 30102, 30103, 30112]
+      },
       "applications": {
         "aggregation-platform": {
           "branch": "AI-development",
