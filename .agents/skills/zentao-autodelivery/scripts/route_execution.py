@@ -66,6 +66,8 @@ def read_history(store, item):
         entry = {'stage': stage, 'outcome': 'success' if record['outcome'] == 'success' else 'failed',
                  'summary': result['summary'], 'evidence': result['evidence'], 'started_at': record['started_at'],
                  'ended_at': record['ended_at'], 'retries': record['retry_number']}
+        if result.get('task_blockers'):
+            entry['task_blockers'] = result['task_blockers']
         if entry['outcome'] == 'failed':
             entry['completion'] = result.get('completion', '阻断')
             phase = result['phase']
@@ -92,6 +94,51 @@ def stages_for(store, item, route=None):
         return workflow_stages(snapshot(item)['development'])
     route = route or get_split(store, item)
     return route['stages'] if route else ('material_check', 'split')
+
+
+def handoff_tasks(route):
+    """Tasks whose remaining work needs a callable backend handoff."""
+    backend = route['tasks'].get('backend', [])
+    upstream = {task['id'] for task in backend}
+    joint = {task['id'] for task in backend if task.get('joint_acceptance')}
+    frontend = route['tasks'].get('frontend', [])
+    while True:
+        dependent = {task['id'] for task in frontend
+                     if set(task.get('depends_on', [])) & (upstream | joint)}
+        if dependent <= joint:
+            return joint
+        joint.update(dependent)
+
+
+def blocked_tasks(route, stages):
+    blocked = {key: {'stage': stage, 'reason': reason}
+               for stage, receipt in stages.items()
+               for key, reason in receipt.get('task_blockers', {}).items()}
+    tasks = [task for tasks in route['tasks'].values() for task in tasks]
+    while True:
+        added = {}
+        for task in tasks:
+            key = task['id']
+            dependencies = sorted(set(task.get('depends_on', [])) & blocked.keys())
+            if dependencies and key not in blocked:
+                added[key] = {'depends_on': dependencies, 'reason': '依赖受阻：' + '、'.join(dependencies)}
+        if not added:
+            return blocked
+        blocked.update(added)
+
+
+def stage_task_ids(route, stage):
+    if stage == 'handoff':
+        return handoff_tasks(route)
+    return {task['id'] for task in route['tasks'].get(stage.partition('.')[0], [])}
+
+
+def task_scope(store, item, stage):
+    route, stages = read_history(store, item)
+    if not route:
+        return None
+    blocked = blocked_tasks(route, stages)
+    return {'active': sorted(stage_task_ids(route, stage) - blocked.keys()), 'blocked': blocked}
 
 
 def split_result(store, item, evidence, *, revision=False):

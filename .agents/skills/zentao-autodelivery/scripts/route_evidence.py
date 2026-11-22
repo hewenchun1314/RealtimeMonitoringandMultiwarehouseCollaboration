@@ -8,7 +8,7 @@ from branch_check import git, planned_applications
 from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, TAG,
                           configured_targets, deployed_receipt_matches, frontend_release_config,
                           mcp_rollout_matches, release_verification)
-from route_execution import get_split, snapshot, stage_evidence
+from route_execution import blocked_tasks, get_split, handoff_tasks, read_history, snapshot, stage_evidence
 
 
 def nonblank(value):
@@ -140,15 +140,31 @@ def handoff_error(store, item, evidence):
             return f'Backend {name} must succeed before frontend handoff'
     integration = stage_evidence(store, item, 'backend.integration')
     versions = evidence.get('backend_versions')
-    if not commit_map(versions) or versions != integration.get('merged_versions'):
+    merged = integration.get('merged_versions')
+    partial_deployment = None
+    if DEPLOY_STAGE in route.get('stages', ()) and not stage_evidence(store, item, DEPLOY_STAGE):
+        _, stages = read_history(store, item)
+        receipt = stages.get(DEPLOY_STAGE, {})
+        if receipt.get('task_blockers'):
+            targets, _, deployed_versions, error = deployment_requirements(store, item)
+            if error:
+                return error
+            entries = (receipt.get('evidence') or {}).get('services', {})
+            partial_deployment = {key: entries[key] for key, target in targets.items()
+                                  if deployed_receipt_matches(entries.get(key), key, deployed_versions[key], target)}
+            merged = {key: sha for key, sha in merged.items() if key not in targets or key in partial_deployment}
+    if not commit_map(versions) or versions != merged:
         return 'The callable backend version must match every merged service'
     if DEPLOY_STAGE in route.get('stages', ()):
         deployment = stage_evidence(store, item, DEPLOY_STAGE)
-        if not deployment:
+        if not deployment and partial_deployment is None:
             return 'The deployment stage must succeed before frontend handoff'
-        if reason := deployment_evidence_error(store, item, deployment):
-            return reason
-        receipts = deployment['services']
+        if deployment:
+            if reason := deployment_evidence_error(store, item, deployment):
+                return reason
+            receipts = deployment['services']
+        else:
+            receipts = partial_deployment
         if receipts:
             gateways = {receipt['target']['gateway_url'].rstrip('/') for receipt in receipts.values()}
             gateway = evidence.get('gateway_url')
@@ -169,7 +185,7 @@ def handoff_error(store, item, evidence):
         return f'Handoff document unavailable: {error}'
 
 
-def validate_success(store, item, stage, evidence):
+def validate_success(store, item, stage, evidence, *, task_blockers=None):
     """Return a reason when a successful V2 stage cannot be substantiated."""
     if not isinstance(evidence, dict) or not evidence:
         return 'Stage evidence must be a non-empty object'
@@ -220,13 +236,19 @@ def validate_success(store, item, stage, evidence):
             return reason
         if name not in ('acceptance', 'e2e'):
             return None
-        route = get_split(store, item)
-        expected = {task['id'] for task in route['tasks'].get(side, [])}
+        route, stages = read_history(store, item)
+        if task_blockers:
+            stages[stage] = {'task_blockers': task_blockers}
+        blocked = blocked_tasks(route, stages)
+        expected = {task['id'] for task in route['tasks'].get(side, [])} - blocked.keys()
         tested = evidence.get('verified_tasks')
         if not isinstance(tested, list) or not all(nonblank(task) for task in tested) or set(tested) != expected:
             return 'Acceptance must identify all verified task IDs for this side'
         if name == 'e2e' and route['scope'] == 'fullstack':
             handoff = stage_evidence(store, item, 'handoff') or {}
+            if (not handoff and (blocked or 'handoff' in stages)
+                    and not (handoff_tasks(route) - blocked.keys())):
+                return None
             if not handoff or evidence.get('backend_versions') != handoff.get('backend_versions'):
                 return 'Joint acceptance must verify the backend versions from the latest handoff'
             deployed = handoff.get('deployment')

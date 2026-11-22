@@ -47,6 +47,39 @@ class RouteExecutionTests(WorkflowFixture):
             'source_path': 'providers/upstream', 'api_source': 'contracts', 'used_by': ['business-api']
         }}
 
+    def test_scoped_design_blocker_advances_and_propagates_to_dependent_tasks(self):
+        self.configure_backend_dependencies()
+        self.config['development']['allowed_requirement_types'] = ['frontend_only', 'backend_only', 'fullstack']
+        context = self.start()
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        def task(key, deps=()):
+            return {'id': key, 'description': key, 'acceptance': ['Verified'], 'depends_on': list(deps)}
+        self.finish_stage(context, 'split', evidence={
+            'tasks': {'backend': [task('B1'), task('B2')],
+                      'frontend': [task('F1', ['B1']), task('F2')]},
+            'interface_contract': 'B1 serves F1',
+        })
+        result = self.finish_stage(context, 'backend.design', outcome='failed', retryable=False,
+                                   evidence={'task_blockers': {'B1': 'Upstream contract is unavailable'}})
+        self.assertEqual(result['next_stage'], 'backend.plan', result)
+        plan = self.record('attempt_start', **context, stage='backend.plan')
+        self.assertEqual(plan['task_scope']['active'], ['B2'])
+        self.assertEqual(set(plan['task_scope']['blocked']), {'B1', 'F1'})
+
+    def test_all_backend_tasks_blocked_can_still_run_independent_frontend(self):
+        self.configure_backend_dependencies()
+        self.config['development']['allowed_requirement_types'] = ['frontend_only', 'backend_only', 'fullstack']
+        context = self.start()
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        task = lambda key: {'id': key, 'description': key, 'acceptance': ['Verified']}
+        self.finish_stage(context, 'split', evidence={
+            'tasks': {'backend': [task('B1')], 'frontend': [task('F1')]},
+            'interface_contract': 'No dependency for F1',
+        })
+        result = self.finish_stage(context, 'backend.design', outcome='failed', retryable=False,
+                                   evidence={'task_blockers': {'B1': 'Unavailable source'}})
+        self.assertEqual(result['next_stage'], 'frontend.design', result)
+
     def test_dependency_discovery_uses_admitted_snapshot_and_selected_services(self):
         self.configure_backend_dependencies()
         self.config['development']['allowed_requirement_types'] = ['backend_only']

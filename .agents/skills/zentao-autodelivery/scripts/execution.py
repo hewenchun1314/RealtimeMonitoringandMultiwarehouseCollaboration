@@ -7,12 +7,12 @@ from uuid import uuid4
 from backend_dependencies import backend_services, dependency_context
 from branch_check import branch_context, planned_applications, valid_evidence
 from delivery_scope import read_material
-from deploy_state import DEPLOY_STAGE, DEPLOY_STAGES, release_locks
+from deploy_state import DEPLOY_STAGE, DEPLOY_STAGES, configured_targets, deployed_receipt_matches, release_locks
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
-from route_execution import (get_split, is_routed, read_history, snapshot, split_result, stage_evidence, stage_role,
-                             stages_for, v2_repair)
+from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
+                             stage_evidence, stage_role, stage_task_ids, stages_for, task_scope, v2_repair)
 import task_evidence
 
 
@@ -163,6 +163,9 @@ def phase_deadline(store, item, phase):
 def phase_context(store, item, phase, config_directory):
     stage = item['stage'] if phase == 'verify' else phase
     context = {'role': stage_role(stage)}
+    scope = task_scope(store, item, stage)
+    if scope is not None and stage_task_ids(get_split(store, item), stage):
+        context['task_scope'] = scope
     if not stage.startswith('backend.'):
         return context
     config = snapshot(item)
@@ -231,14 +234,14 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
                         break
     if phase == DEPLOY_STAGE and not deployment_worker:
         return message('deployment_worker_required')
-    if routed:
-        preparation.update(phase_context(store, item, phase, config_directory))
     deadline = phase_deadline(store, item, phase)
     attempt_id = uuid4().hex
     store.conn.execute('''INSERT INTO attempts(attempt_id,item_seq,run_round,stage,retry_number,started_at,
                                               deadline_at,phase,phase_started_at,phase_history)
                           VALUES(?,?,?,?,?,?,?,?,?,?)''', (attempt_id, item['seq'], item['run_round'], item['stage'],
                                                           retries, store.time, deadline, phase, store.time, encode(history)))
+    if routed:
+        preparation.update(phase_context(store, item, phase, config_directory))
     return message('attempt_started', attempt_id=attempt_id, stage=item['stage'], retry_number=retries,
                    started_at=store.time, phase_started_at=store.time, phase=phase, deadline_at=deadline,
                    **preparation)
@@ -397,6 +400,17 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     if isinstance(evidence, dict):
         evidence = evidence.copy()
     route = None
+    current_route, history = read_history(store, item) if routed else (None, {})
+    reported = evidence.get('task_blockers') if isinstance(evidence, dict) else None
+    stage_tasks = stage_task_ids(current_route, stage) if current_route else set()
+    if reported is not None:
+        if (phase != 'verify' or repair_required or not isinstance(reported, dict) or not reported
+                or not reported.keys() <= stage_tasks
+                or any(not isinstance(reason, str) or not reason.strip() for reason in reported.values())):
+            return message('evidence_required', reason='task_blockers must map current stage task IDs to reasons')
+        prospective = blocked_tasks(current_route, {**history, stage: {'task_blockers': reported}})
+        if finished and not (stage_tasks - prospective.keys()):
+            return message('evidence_required', reason='A stage with no remaining tasks cannot report success')
     if routed and not finished:
         reason = validate_partial_merge(store, item, stage if phase == 'verify' else phase, evidence)
         if reason:
@@ -412,7 +426,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             except (ValueError, OSError) as exc:
                 return message('evidence_required', reason=str(exc))
         else:
-            reason = validate_success(store, item, stage, evidence)
+            reason = validate_success(store, item, stage, evidence, task_blockers=reported)
             if reason:
                 return message('evidence_required', reason=reason)
     stages = stages_for(store, item, route)
@@ -436,7 +450,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             return message('branch_worktree_unverified')
     if routed:
         reason = task_evidence.prepare_receipt(store, item, stage if phase == 'verify' else phase,
-                                               evidence, finished, route)
+                                               evidence, finished, route, task_blockers=reported)
         if reason:
             return message('evidence_required', reason=reason)
     number = stages.index(stage)
@@ -445,9 +459,37 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     stop_route = (missing_file or no_work or unresolved_contract or
                   (routed and (stage in ('split', 'handoff', DEPLOY_STAGE) or phase == DEPLOY_STAGE) and not finished))
     next_stage = stages[number + 1] if not stop_route and number + 1 < len(stages) else None
+    recorded_blockers = dict(reported or {}) if not retry else {}
+    if current_route and not retry and phase == 'verify':
+        existing = blocked_tasks(current_route, history)
+        if not finished and stage == 'handoff':
+            recorded_blockers.update({key: summary for key in stage_tasks - existing.keys() - recorded_blockers.keys()})
+        if not finished and stage == DEPLOY_STAGE and not recorded_blockers:
+            plan = stage_evidence(store, item, 'backend.plan') or {}
+            merged = (stage_evidence(store, item, 'backend.integration') or {}).get('merged_versions', {})
+            receipts = (evidence or {}).get('services', {})
+            targets = configured_targets(config)
+            failed_services = {key for key in planned_applications(plan, 'backend') or ()
+                               if key in targets and not deployed_receipt_matches(
+                                   receipts.get(key), key, merged.get(key), targets[key])}
+            recorded_blockers.update({
+                key: '待核验部署：' + '、'.join(sorted(set(services) & failed_services))
+                for key, services in plan.get('task_repositories', {}).items()
+                if key in stage_tasks - existing.keys() and set(services) & failed_services
+            })
+            # The handoff validates deployed versions. Independent frontend tasks
+            # can continue after that gate records any unavailable dependencies.
+            next_stage = stages[number + 1] if number + 1 < len(stages) else None
+        if existing or recorded_blockers or (not finished and stage == 'handoff'):
+            blocked = blocked_tasks(current_route, {**history, stage: {'task_blockers': recorded_blockers}})
+            if not unresolved_contract:
+                next_stage = next((candidate for candidate in stages[number + 1:]
+                                   if stage_task_ids(current_route, candidate) - blocked.keys()), None)
     result = {'summary': summary, 'evidence': evidence, 'stop_evidence': data.get('stop_evidence'),
               'terminal_step': not retry, 'phase': phase, 'repair_phases': completed_phases,
               'repair_required': repair_required or phase != 'verify'}
+    if recorded_blockers:
+        result['task_blockers'] = recorded_blockers
     if route:
         result['route'] = route
     if routed and result['repair_required']:
@@ -477,6 +519,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                 f'{result_label}（重试 {trial["retry_number"]} 次）。{summary}')
         if route:
             note += f' 范围 {route["scope"]}，判定来源 {route["source"]}。'
+        if recorded_blockers:
+            note += ' 受阻任务：' + '；'.join(f'{key} {reason}' for key, reason in recorded_blockers.items()) + '。'
         operation_id = enqueue_note(store, item, stage, note)
         if next_stage:
             disposition = 'next'
@@ -485,7 +529,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             steps = terminal_steps(store, item)
             route = get_split(store, item) if routed else None
             conclusion = next((step['completion'] for step in steps if step['outcome'] == 'failed'),
-                              '阻断' if route and route.get('blockers') else '已交付')
+                              '阻断' if route and (route.get('blockers') or any(
+                                  step.get('task_blockers') for step in steps)) else '已交付')
             if conclusion == '已交付' and task_evidence.first_unverified_stage(store, item):
                 conclusion = '待验证'
             disposition = 'close' if conclusion == '已交付' else 'blocked'
@@ -497,7 +542,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
 def terminal_steps(store, item):
     if is_routed(item):
         route, results = read_history(store, item)
-        return ordered_steps(store, item, stages_for(store, item, route), results)
+        return ordered_steps(store, item, stages_for(store, item, route), results, route)
     rows = store.conn.execute('''SELECT * FROM attempts WHERE item_seq=? AND outcome IS NOT NULL
                                   ORDER BY run_round DESC, retry_number DESC''', (item['seq'],))
     results = {}
@@ -519,8 +564,9 @@ def terminal_steps(store, item):
     return ordered_steps(store, item, stages_for(store, item), results)
 
 
-def ordered_steps(store, item, order, results):
+def ordered_steps(store, item, order, results, route=None):
     steps = []
+    blocked = blocked_tasks(route, results) if route else {}
     skip_reason = ('因用户要求主动停跑而跳过' if item['conclusion'] == '主动停跑'
                    else f'因 {item["stage"]} 阻断跳过')
     if item['stage'] == 'material_check' and item['conclusion'] == '待补材料':
@@ -528,7 +574,14 @@ def ordered_steps(store, item, order, results):
     for stage in order:
         step = results.get(stage)
         if step is None:
-            step = {'stage': stage, 'outcome': 'skipped', 'summary': skip_reason,
+            reason = skip_reason
+            if route and blocked and item['conclusion'] != '主动停跑':
+                tasks = stage_task_ids(route, stage)
+                if tasks and tasks <= blocked.keys():
+                    reason = '本阶段任务均受阻：' + '、'.join(sorted(tasks))
+                elif stage == 'handoff' and not tasks:
+                    reason = '剩余任务无后端交接依赖'
+            step = {'stage': stage, 'outcome': 'skipped', 'summary': reason,
                     'ended_at': store.time}
         steps.append(step)
     return steps
@@ -565,6 +618,11 @@ def complete(store, item, data):
         if route:
             extra['delivery_summary'] = delivery_summary(route, stages)
             note += ' ' + extra['delivery_summary']
+            blocked = blocked_tasks(route, stages)
+            if blocked:
+                extra['blocked_tasks'] = blocked
+                note += ' 待续接任务：' + '；'.join(f'{key} {entry["reason"]}'
+                                                  for key, entry in sorted(blocked.items())) + '。'
         total, delivered, closed, unbound, closing, reopening = store.conn.execute('''
             SELECT COUNT(*), SUM(desired='closed'), SUM(remote_status='closed'), SUM(remote_id IS NULL),
                    SUM(remote_id IS NOT NULL AND desired='closed' AND remote_status IS NOT 'closed'),
@@ -622,7 +680,8 @@ def recover(store, item, data):
     store.conn.execute('INSERT INTO recoveries(item_seq,recovery_id,evidence) VALUES(?,?,?)',
                        (item['seq'], recovery_id, evidence))
     state = 'queued' if item['eligible'] else 'ineligible'
-    stage = next((step['stage'] for step in terminal_steps(store, item) if step['outcome'] == 'failed'), None)
+    stage = next((step['stage'] for step in terminal_steps(store, item)
+                  if step['outcome'] == 'failed' or step.get('task_blockers')), None)
     if stage is None:
         stage = task_evidence.first_unverified_stage(store, item) or item['stage']
     if is_routed(item):

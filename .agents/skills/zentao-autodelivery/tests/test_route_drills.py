@@ -333,6 +333,45 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
     def test_fullstack_backend_then_frontend(self):
         self.drill('fullstack', '前后端')
 
+    def test_independent_frontend_is_verified_and_merged_after_backend_blocker(self):
+        self.begin_drill('fullstack', '前后端')
+        stage = 'material_check'
+        completed = []
+        while stage:
+            attempt = self.record('attempt_start', stage=stage)
+            self.assertEqual(attempt['status'], 'attempt_started', attempt)
+            if stage == 'backend.design':
+                result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
+                                     retryable=False, summary='Missing upstream contract',
+                                     evidence={'task_blockers': {'backend': 'Missing upstream contract'}})
+            else:
+                evidence = self.evidence(stage, attempt)
+                if stage == 'split':
+                    evidence['tasks']['frontend'][0]['id'] = 'dependent'
+                    evidence['tasks']['frontend'].append({
+                        'id': 'frontend', 'description': 'Show locally computed status',
+                        'acceptance': ['Independent page renders'],
+                    })
+                    evidence['tasks']['frontend'].append({
+                        'id': 'fixture', 'description': 'Validate a separate fixture',
+                        'acceptance': ['Fixture can be exercised'],
+                    })
+                if stage == 'frontend.unit_test':
+                    evidence['task_blockers'] = {'fixture': 'Required fixture is unavailable'}
+                if stage == 'frontend.e2e':
+                    self.assertEqual(attempt['task_scope']['active'], ['frontend'])
+                    self.assertEqual(set(attempt['task_scope']['blocked']), {'backend', 'dependent', 'fixture'})
+                result = self.finish(stage, attempt, evidence)
+            self.assertEqual(result['status'], 'attempt_finished', result)
+            completed.append(stage)
+            stage = result['next_stage']
+        self.assertEqual(completed[3], 'frontend.design')
+        self.assertEqual(completed[-1], 'frontend.integration')
+        closeout = self.record('complete', blockers_path=str(self.artifacts / 'blockers.md'))
+        self.assertEqual(closeout['conclusion'], '阻断', closeout)
+        self.assertEqual(set(closeout['blocked_tasks']), {'backend', 'dependent', 'fixture'})
+        self.assertEqual(git(self.repositories['frontend'], 'rev-parse', 'HEAD'), self.merged['frontend'][self.key])
+
     def test_failed_backend_acceptance_allows_safe_merge_but_blocks_frontend(self):
         self.begin_drill('fullstack', '前后端')
         stage = 'material_check'

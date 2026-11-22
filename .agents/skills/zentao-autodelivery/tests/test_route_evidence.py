@@ -33,13 +33,32 @@ class RouteEvidenceTests(unittest.TestCase):
         self.route = {'scope': 'fullstack', 'blockers': [], 'tasks': {
             'frontend': [{'id': 'F1'}, {'id': 'F2'}], 'backend': [{'id': 'B1'}]}}
         for name, lookup in [('stage_evidence', lambda store, item, key: self.history.get(key)),
-                             ('get_split', lambda *args: self.route)]:
+                             ('get_split', lambda *args: self.route),
+                             ('read_history', lambda *args: (self.route, {}))]:
             mock = patch('route_evidence.' + name, side_effect=lookup)
             mock.start()
             self.addCleanup(mock.stop)
 
     def check(self, stage, evidence):
         return validate_success(self.store, self.item, stage, evidence)
+
+    def test_handoff_uses_only_callable_versions_after_partial_deployment(self):
+        self.route['stages'] = ['backend.deploy']
+        self.history['backend.integration']['merged_versions'] = {**self.merged, 'archive': 'c' * 40}
+        target = {'registry': 'registry.local', 'image_repository': 'reports', 'gateway_url': 'http://localhost:8080'}
+        deployed = {'status': 'deployed', 'service': 'reports', 'sha': 'b' * 40, 'target': target,
+                    'image': 'registry.local/reports:current', 'digest': 'sha256:' + 'd' * 64,
+                    'verification': {'sha': 'b' * 40}}
+        stages = {'backend.deploy': {'task_blockers': {'B2': 'Archive release failed'},
+                                     'evidence': {'services': {'reports': deployed}}}}
+        proof = {**self.handoff, 'deployment': {'reports': deployed}, 'gateway_url': target['gateway_url']}
+        with patch('route_evidence.read_history', return_value=(self.route, stages)), patch(
+                'route_evidence.deployment_requirements',
+                return_value=({'reports': target, 'archive': target}, [],
+                              self.history['backend.integration']['merged_versions'], None)):
+            self.assertIsNone(self.check('handoff', proof))
+            wrong = {**proof, 'backend_versions': self.history['backend.integration']['merged_versions']}
+            self.assertIsNotNone(self.check('handoff', wrong))
 
     def local_candidate(self):
         source, tree = self.root / 'source', self.root / 'item'

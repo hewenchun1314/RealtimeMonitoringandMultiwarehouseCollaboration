@@ -25,14 +25,15 @@ def _nonblank(value):
     return isinstance(value, str) and bool(value.strip())
 
 
-def validate_task_fields(route, stage, evidence, success):
+def validate_task_fields(route, stage, evidence, success, blocked=()):
     side, _, leaf = stage.partition('.')
     if leaf not in ('plan', 'e2e', 'acceptance'):
         return None
-    own = set(_tasks(route, side))
+    own = set(_tasks(route, side)) - set(blocked)
     backend = _tasks(route, 'backend')
     combined = side == 'frontend' and route['scope'] == 'fullstack'
-    joint = {key for key, task in backend.items() if task.get('joint_acceptance')} if combined else set()
+    joint = ({key for key, task in backend.items() if task.get('joint_acceptance')} - set(blocked)
+             if combined else set())
     if leaf == 'plan' and success:
         mapping = evidence.get('task_repositories')
         if not isinstance(mapping, dict) or set(mapping) != own | joint:
@@ -50,7 +51,7 @@ def validate_task_fields(route, stage, evidence, success):
         results = evidence.get('task_results')
         if results is None and not success:
             return None
-        allowed = own | (set(backend) if combined else set())
+        allowed = own | (set(backend) - set(blocked) if combined else set())
         required = own | joint
         if not isinstance(results, dict) or set(results) - allowed or (success and required - set(results)):
             return 'task_results must identify current tasks and cover all required tasks on success'
@@ -71,12 +72,12 @@ def validate_merge_tests(mapping, changed, reviews, success):
     return None
 
 
-def prepare_receipt(store, item, stage, evidence, success, route=None):
+def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_blockers=None):
     """Validate and enrich a receipt before the existing transaction records the stage."""
     import task_sync
     from branch_check import git
     from route_evidence import repository_evidence
-    from route_execution import get_split, stage_evidence
+    from route_execution import blocked_tasks, handoff_tasks, read_history, stage_evidence
 
     if not task_sync.enabled(item):
         return None
@@ -99,8 +100,11 @@ def prepare_receipt(store, item, stage, evidence, success, route=None):
     side, _, leaf = stage.partition('.')
     if leaf not in ('plan', 'e2e', 'acceptance', 'integration') or not isinstance(evidence, dict):
         return None
-    route = get_split(store, item)
-    reason = validate_task_fields(route, stage, evidence, success)
+    route, stages = read_history(store, item)
+    if task_blockers:
+        stages[stage] = {'task_blockers': task_blockers}
+    blocked = blocked_tasks(route, stages)
+    reason = validate_task_fields(route, stage, evidence, success, blocked)
     if reason:
         return reason
     # The existing successful acceptance path checks these versions. Failed stages can
@@ -109,7 +113,8 @@ def prepare_receipt(store, item, stage, evidence, success, route=None):
         coding = stage_evidence(store, item, side + '.coding') or {}
         if not coding or coding.get('versions') != evidence.get('versions'):
             return 'Partial acceptance must use the current candidate versions'
-        if leaf == 'e2e' and route['scope'] == 'fullstack':
+        if (leaf == 'e2e' and route['scope'] == 'fullstack'
+                and (handoff_tasks(route) - blocked.keys() or stage_evidence(store, item, 'handoff'))):
             handoff = stage_evidence(store, item, 'handoff') or {}
             if not handoff or evidence.get('backend_versions') != handoff.get('backend_versions'):
                 return 'Partial joint acceptance needs the latest callable backend versions'
@@ -195,6 +200,8 @@ def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
 
 
 def evaluate(route, stages, history=None, *, deployment_targets=None):
+    from route_execution import blocked_tasks, handoff_tasks
+
     decisions = {}
     targets = deployment_targets or {}
     deployment = _receipt(stages, DEPLOY_STAGE, partial=True).get('services')
@@ -203,13 +210,22 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
     e2e_enabled = route.get('e2e_enabled', True)
     handoff = _receipt(stages, 'handoff').get('backend_versions')
     joint_test = _receipt(stages, 'frontend.e2e', partial=True)
-    backend_merge = _receipt(stages, 'backend.integration').get('merged_versions')
-    current_joint = bool(handoff and handoff == backend_merge == joint_test.get('backend_versions'))
+    backend_merge = _receipt(stages, 'backend.integration').get('merged_versions', {})
+    current_joint = bool(handoff and isinstance(backend_merge, dict) and handoff == joint_test.get('backend_versions')
+                         and all(backend_merge.get(key) == sha for key, sha in handoff.items())
+                         and (handoff == backend_merge or stages.get(DEPLOY_STAGE, {}).get('task_blockers')))
+    blocked = blocked_tasks(route, stages)
+    joint_tasks = handoff_tasks(route)
+    scoped = bool(blocked or (stages.get('handoff') or {}).get('outcome') == 'failed')
     for side, tasks in route['tasks'].items():
         for task in tasks:
             key = task['id']
             facts = {'criteria': task.get('acceptance', []), 'joint': task.get('joint_acceptance', False),
                      'dependencies': task.get('depends_on', [])}
+            if key in blocked:
+                facts['blocked'] = blocked[key]
+                decisions[key] = ('open', blocked[key]['reason'], facts)
+                continue
             previous = (history or {}).get(key, {})
             if any(previous.get(field) != value for field, value in facts.items()):
                 previous = {}
@@ -231,7 +247,8 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
                     facts['joint_failure'] = joint_result
                     facts['joint_failure_at'] = stages.get('frontend.e2e', {}).get('ended_at')
                     reason = '联合验收发现该项原验收条件未满足'
-                elif not reason and (side == 'frontend' or task.get('joint_acceptance')):
+                elif not reason and ((side == 'frontend' and (not scoped or key in joint_tasks))
+                                     or task.get('joint_acceptance')):
                     if not current_joint:
                         reason = '等待有效的前后端版本联合验收'
                     elif side == 'backend':
@@ -287,7 +304,7 @@ def refresh(store, item):
                 for component in ('backend', 'frontend'))
             if (previous['disposition'] == 'closed' and (previous['remote_status'] == 'closed' or not changed_versions)
                     and same_criteria and not changed_scope and desired == 'open' and not facts.get('joint_failure')
-                    and not facts.get('deployment_pending')
+                    and not facts.get('deployment_pending') and not facts.get('blocked')
                     and acceptance.get('outcome') != 'failed'):
                 continue
         store.conn.execute('''INSERT INTO task_evidence(item_seq,task_key,disposition,reason,evidence)

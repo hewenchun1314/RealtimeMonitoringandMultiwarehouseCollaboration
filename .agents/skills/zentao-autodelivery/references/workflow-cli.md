@@ -13,6 +13,8 @@
 
 ## `record` 阶段、执行和写回
 
+已拆分工单的 `attempt_start` / `attempt_active` 返回 `task_scope`。其中 `active` 为本步骤可执行的任务编号，`blocked` 保留直接原因和受影响的依赖链。已确认的局部阻断通过 `attempt_finish.evidence.task_blockers` 提交，格式为任务编号到原因的对象，例如 `{"B5":"归档接口缺少全井原子写入契约，证据见 backend/design.md"}`。同一阶段其余任务已完成且满足证据要求时可提交成功，计划及验收证据只覆盖可执行范围。尚需重试的失败按原重试策略推进，最终失败才应用阻断。不可重试时用 `retryable:false`。阻断和已有结果会一并保存在账本，后续阶段可执行无依赖的任务。
+
 新单阶段键使用 `material_check`、`split`、`frontend.<步骤>`、`backend.<步骤>` 和跨端的 `handoff`。请求中的阶段以账本返回为准。前端分支准备传 `application`，后端传 `service`。旧快照继续使用原阶段键。各阶段负责人及版本证据见[工单步骤](stages.md)。
 
 ### 拆分证据示例
