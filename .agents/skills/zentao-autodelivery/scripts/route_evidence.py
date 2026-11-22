@@ -4,8 +4,9 @@ import re
 import subprocess
 from pathlib import Path
 
-from branch_check import git
-from route_execution import get_split, stage_evidence
+from branch_check import git, planned_applications
+from deploy_state import DEPLOY_STAGE, configured_targets, deployed_receipt_matches
+from route_execution import get_split, snapshot, stage_evidence
 
 
 def nonblank(value):
@@ -96,6 +97,37 @@ def repository_evidence(store, item, side, stage, evidence):
         return f'Git evidence could not be verified: {error}'
 
 
+def deployment_requirements(store, item):
+    plan = stage_evidence(store, item, 'backend.plan')
+    services = planned_applications(plan, 'backend')
+    if not services:
+        return {}, [], {}, '缺少经过确认的后端服务计划'
+    targets = configured_targets(snapshot(item))
+    selected = {key: targets[key] for key in services if key in targets}
+    skipped = [key for key in services if key not in targets]
+    if not selected:
+        return selected, skipped, {}, None
+    for stage in ('backend.code_review', 'backend.acceptance', 'backend.integration'):
+        if not stage_evidence(store, item, stage):
+            return selected, skipped, {}, f'缺少成功的 {stage} 回执'
+    merged = stage_evidence(store, item, 'backend.integration').get('merged_versions')
+    if not commit_map(merged) or merged.keys() != set(services):
+        return selected, skipped, {}, '合回回执必须覆盖本单所有后端服务'
+    return selected, skipped, merged, None
+
+
+def deployment_evidence_error(store, item, evidence):
+    targets, skipped, versions, reason = deployment_requirements(store, item)
+    if reason:
+        return reason
+    receipts = evidence.get('services')
+    if not isinstance(receipts, dict) or receipts.keys() != targets.keys() or evidence.get('skipped') != skipped:
+        return 'Provide release receipts for every configured service and identify any skipped service'
+    for service, target in targets.items():
+        if not deployed_receipt_matches(receipts[service], service, versions[service], target):
+            return f'Invalid deployment evidence for {service}'
+
+
 def handoff_error(store, item, evidence):
     route = get_split(store, item)
     blockers = route.get('handoff_blockers', route['blockers'])
@@ -108,6 +140,19 @@ def handoff_error(store, item, evidence):
     versions = evidence.get('backend_versions')
     if not commit_map(versions) or versions != integration.get('merged_versions'):
         return 'The callable backend version must match every merged service'
+    if DEPLOY_STAGE in route.get('stages', ()):
+        deployment = stage_evidence(store, item, DEPLOY_STAGE)
+        if not deployment:
+            return 'The deployment stage must succeed before frontend handoff'
+        if reason := deployment_evidence_error(store, item, deployment):
+            return reason
+        receipts = deployment['services']
+        if receipts:
+            gateways = {receipt['target']['gateway_url'].rstrip('/') for receipt in receipts.values()}
+            gateway = evidence.get('gateway_url')
+            if (evidence.get('deployment') != receipts or not isinstance(gateway, str)
+                    or gateways != {gateway.rstrip('/')}):
+                return 'Handoff must carry the verified deployment receipts and a common gateway'
     if not all(nonblank(evidence.get(key)) for key in ('environment', 'verification', 'document')):
         return 'Supply the handoff document, callable environment and observed call evidence'
     database = Path(store.conn.execute('PRAGMA database_list').fetchone()[2])
@@ -128,6 +173,8 @@ def validate_success(store, item, stage, evidence):
         return 'Stage evidence must be a non-empty object'
     if stage == 'handoff':
         return handoff_error(store, item, evidence)
+    if stage == DEPLOY_STAGE:
+        return deployment_evidence_error(store, item, evidence)
     side, _, name = stage.partition('.')
     if name in ('coding', 'integration'):
         return repository_evidence(store, item, side, name, evidence)
@@ -151,6 +198,19 @@ def validate_success(store, item, stage, evidence):
             handoff = stage_evidence(store, item, 'handoff') or {}
             if not handoff or evidence.get('backend_versions') != handoff.get('backend_versions'):
                 return 'Joint acceptance must verify the backend versions from the latest handoff'
+            deployed = handoff.get('deployment')
+            if deployed:
+                gateway = evidence.get('gateway_url')
+                probes = evidence.get('backend_deployment')
+                if (not isinstance(gateway, str) or gateway.rstrip('/') != handoff['gateway_url'].rstrip('/')
+                        or not isinstance(probes, dict) or probes.keys() != deployed.keys()):
+                    return 'Joint acceptance must identify the deployed gateway and every version probe'
+                for key, receipt in deployed.items():
+                    target = receipt['target']
+                    expected = {'sha': receipt['sha'],
+                                'url': target['gateway_url'].rstrip('/') + target['verification_path']}
+                    if probes[key] != expected:
+                        return f'Joint acceptance verified a different release for {key}'
 
 
 def delivery_summary(route, stages):
@@ -172,5 +232,17 @@ def delivery_summary(route, stages):
                 state = '合回' if merge['outcome'] == 'success' else '部分合回'
                 targets = '、'.join(f'{key}@{sha}' for key, sha in sorted(merged.items()))
                 facts.append(('后端' if side == 'backend' else '前端') + state + ' ' + targets)
+    deployed = stages.get(DEPLOY_STAGE)
+    if deployed:
+        evidence = deployed.get('evidence') or {}
+        if deployed['outcome'] == 'failed':
+            facts.append('后端部署待验证')
+        elif not evidence.get('services'):
+            facts.append('后端部署已跳过（所选服务未配置部署目标）')
+        for key, receipt in sorted(evidence.get('services', {}).items()):
+            if receipt.get('status') == 'deployed':
+                target = receipt['target']
+                facts.append(f'{key} 已部署到 {target["namespace"]}/{target["deployment"]} '
+                             f'{receipt["image"].rsplit(":", 1)[0]}@{receipt["digest"]}')
     facts.extend(route.get('blockers', []))
     return '；'.join(facts)

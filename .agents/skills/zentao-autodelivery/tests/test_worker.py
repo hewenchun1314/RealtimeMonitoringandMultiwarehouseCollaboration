@@ -3,12 +3,66 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+import worker
 from worker import command, worker_roots
 
 
 class WorkerTests(unittest.TestCase):
+    def deployment_route(self, peek, deployments, chat_outcomes):
+        item = {'state': 'running', 'chat_id': '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'}
+        calls = []
+
+        def chat(current_item):
+            self.assertEqual(current_item, item)
+            calls.append('chat')
+            return next(chat_outcomes)
+
+        def deploy(*args, **kwargs):
+            calls.append('deploy')
+            return next(deployments)
+
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}), \
+                patch.object(worker, 'deployment_action',
+                             side_effect=[{'status': state} for state in peek]), \
+                patch.object(worker, 'run_deployment', side_effect=deploy):
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, chat)
+        return result, calls
+
+    def test_work_item_switches_from_chat_to_deployment_and_back(self):
+        result, calls = self.deployment_route(
+            ['deployment_not_pending', 'deployment_pending', 'deployment_not_pending', 'deployment_not_pending'],
+            iter([{'status': 'attempt_finished'}]),
+            iter([({'receipt_path': 'chat-before', 'stop_confirmed': True, 'outcome': 'success'}, None),
+                  ({'receipt_path': 'chat-after', 'stop_confirmed': True, 'outcome': 'success'}, None)]))
+        self.assertEqual(calls, ['chat', 'deploy', 'chat'])
+        self.assertEqual(result['receipt'], 'chat-after')
+
+    def test_resumed_work_item_recovers_deployment_before_starting_chat(self):
+        result, calls = self.deployment_route(
+            ['deployment_pending', 'deployment_not_pending', 'deployment_not_pending'],
+            iter([{'status': 'repair_advanced'}]),
+            iter([({'receipt_path': 'chat-after', 'stop_confirmed': True, 'outcome': 'success'}, None)]))
+        self.assertEqual(calls, ['deploy', 'chat'])
+        self.assertEqual(result['status'], 'worker_stopped')
+
+    def test_unverified_process_ownership_prevents_deployment_and_chat_resume(self):
+        cases = [
+            (['deployment_not_pending'], iter([]),
+             iter([({'receipt_path': 'chat', 'stop_confirmed': False, 'outcome': 'failed'}, None)]),
+             ['chat'], 'worker_stop_unverified'),
+            (['deployment_pending'], iter([{'status': 'deployment_busy', 'attempt_id': 'existing'}]),
+             iter([]), ['deploy'], 'worker_deployment_blocked'),
+        ]
+        for peek, deployments, chat_outcomes, expected_calls, expected_status in cases:
+            with self.subTest(status=expected_status):
+                result, calls = self.deployment_route(peek, deployments, chat_outcomes)
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(result['status'], expected_status)
+
     def test_worker_uses_never_for_new_and_resumed_chats(self):
         cli = Path('codex.exe')
         chat = '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'

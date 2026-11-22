@@ -7,11 +7,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from delivery_scope import project_mode, route_stages
+from deploy_state import DEPLOY_STAGE, validate_configured_targets
 from task_evidence import EVIDENCE_SCHEMA
 
 STAGES = ('material_check', 'design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'e2e', 'integration')
 STAGE_NAMES = dict(zip(STAGES, ('材料评审', '设计', '计划', '分支核验', '编码', '单元测试', 'Code Review', 'E2E', '合回')))
 STAGE_NAMES.update(split='范围判定与任务拆分', handoff='后端联调交接')
+STAGE_NAMES[DEPLOY_STAGE] = '后端部署'
 for scoped_stage in route_stages('fullstack'):
     if '.' in scoped_stage:
         side, step = scoped_stage.split('.')
@@ -48,6 +50,14 @@ CREATE TABLE IF NOT EXISTS attempts (
     UNIQUE(item_seq, run_round, stage, retry_number)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS single_attempt ON attempts(item_seq) WHERE outcome IS NULL;
+CREATE TABLE IF NOT EXISTS deployment_claims (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+    item_seq INTEGER NOT NULL REFERENCES work_items(seq)
+);
+CREATE TABLE IF NOT EXISTS deployment_locks (
+    scope TEXT NOT NULL, resource TEXT NOT NULL, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
+    PRIMARY KEY(scope, resource)
+);
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY, request TEXT NOT NULL, response TEXT NOT NULL
 );
@@ -234,6 +244,7 @@ def validate_config(config):
     if mode != 'frontend_only' or config.get('backend_dependencies'):
         validate_backend(config, development)
     validate_backend_dependencies(config, development)
+    validate_configured_targets(config)
     if mode != 'backend_only' and 'frontend_bundle' in development:
         bundle = require_mapping(development['frontend_bundle'], 'development.frontend_bundle')
         require_text(bundle.get('name'), 'development.frontend_bundle.name')

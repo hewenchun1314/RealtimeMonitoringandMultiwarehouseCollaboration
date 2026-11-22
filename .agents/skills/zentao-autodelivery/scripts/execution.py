@@ -7,6 +7,7 @@ from uuid import uuid4
 from backend_dependencies import backend_services, dependency_context
 from branch_check import branch_context, planned_applications, valid_evidence
 from delivery_scope import read_material
+from deploy_state import DEPLOY_STAGE, release_locks
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
@@ -21,6 +22,7 @@ REPAIR_PHASES = {
 }
 PHASE_TIMERS = {'repair_coding': 'coding', 'repair_unit_test': 'unit_test', 'repair_review': 'code_review'}
 DEFAULT_INTEGRATION_TIMEOUT_MINUTES = 45
+DEFAULT_DEPLOY_TIMEOUT_MINUTES = 60
 
 
 def dispatch(store, item, data):
@@ -151,6 +153,8 @@ def phase_deadline(store, item, phase):
             minutes = DEFAULT_INTEGRATION_TIMEOUT_MINUTES
         elif base == 'branch_check':
             minutes = 15
+        elif base == 'deploy':
+            minutes = DEFAULT_DEPLOY_TIMEOUT_MINUTES
         else:
             raise ValueError(f'Missing timeout for {key}')
     return stamp(store.now + timedelta(minutes=minutes))
@@ -174,17 +178,21 @@ def phase_context(store, item, phase, config_directory):
     return context
 
 
-def attempt_start(store, item, data, *, config_directory):
+def attempt_start(store, item, data, *, config_directory, deployment_worker=False):
     if not execution_matches(store, item, data) or item['state'] != 'running':
         return message('stale_execution')
     if data.get('stage') != item['stage']:
         return message('stage_mismatch', stage=item['stage'])
+    if item['stage'] == DEPLOY_STAGE and not deployment_worker:
+        return message('deployment_worker_required')
     preparation = branch_context(store, item) if item['stage'].rsplit('.', 1)[-1] == 'branch_check' else {}
     routed = is_routed(item)
     if routed:
         preparation['route'] = get_split(store, item)
     active = active_attempt(store, item)
     if active:
+        if active['phase'] == DEPLOY_STAGE and not deployment_worker:
+            return message('deployment_worker_required')
         if routed:
             preparation.update(phase_context(store, item, active['phase'], config_directory))
         return message('attempt_active', attempt_id=active['attempt_id'], deadline_at=active['deadline_at'],
@@ -221,6 +229,8 @@ def attempt_start(store, item, data, *, config_directory):
                     if validate_success(store, item, receipt['phase'], receipt['evidence']):
                         phase, history = receipt['phase'], history[:index]
                         break
+    if phase == DEPLOY_STAGE and not deployment_worker:
+        return message('deployment_worker_required')
     if routed:
         preparation.update(phase_context(store, item, phase, config_directory))
     deadline = phase_deadline(store, item, phase)
@@ -234,13 +244,15 @@ def attempt_start(store, item, data, *, config_directory):
                    **preparation)
 
 
-def repair_advance(store, item, data, *, config_directory):
+def repair_advance(store, item, data, *, config_directory, deployment_worker=False):
     if not execution_matches(store, item, data) or item['state'] != 'running':
         return message('stale_execution')
     trial = active_attempt(store, item)
     if not trial or trial['attempt_id'] != data.get('attempt_id'):
         return message('stale_attempt')
     phase = trial['phase']
+    if phase == DEPLOY_STAGE and not deployment_worker:
+        return message('deployment_worker_required')
     routed = is_routed(item)
     if phase != data.get('phase') or phase == 'verify' or (not routed and phase not in PHASE_TIMERS):
         return message('phase_mismatch', phase=phase)
@@ -337,7 +349,7 @@ def enqueue_note(store, item, label, text):
     return operation_id
 
 
-def attempt_finish(store, item, data, branches_verified=False, config_directory=None):
+def attempt_finish(store, item, data, branches_verified=False, config_directory=None, *, deployment_worker=False):
     if not execution_matches(store, item, data):
         return message('stale_execution')
     attempt_id = require_text(data.get('attempt_id'), 'attempt_id')
@@ -349,6 +361,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     if outcome not in ('success', 'failed', 'timed_out'):
         raise ValueError('outcome must be success, failed or timed_out')
     phase = trial['phase']
+    if (item['stage'] == DEPLOY_STAGE or phase == DEPLOY_STAGE) and not deployment_worker:
+        return message('deployment_worker_required')
     completed_phases = json.loads(trial['phase_history'])
     if data.get('phase', None if completed_phases else 'verify') != phase:
         return message('phase_mismatch', phase=phase)
@@ -428,7 +442,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     number = stages.index(stage)
     no_work = route and route['blockers'] and not any(route['tasks'].values())
     unresolved_contract = routed and not finished and (phase == 'split' or (repair_required and data.get('contract_changed')))
-    stop_route = missing_file or no_work or unresolved_contract or (routed and stage in ('split', 'handoff') and not finished)
+    stop_route = (missing_file or no_work or unresolved_contract or
+                  (routed and (stage in ('split', 'handoff', DEPLOY_STAGE) or phase == DEPLOY_STAGE) and not finished))
     next_stage = stages[number + 1] if not stop_route and number + 1 < len(stages) else None
     result = {'summary': summary, 'evidence': evidence, 'stop_evidence': data.get('stop_evidence'),
               'terminal_step': not retry, 'phase': phase, 'repair_phases': completed_phases,
@@ -446,6 +461,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                        (store.time, outcome, encode(result), attempt_id))
     if routed:
         task_evidence.refresh(store, item)
+    if not retry and (not next_stage or stage == 'frontend.e2e'):
+        release_locks(store, item)
 
     operation_id = None
     if retry:
@@ -571,6 +588,7 @@ def complete(store, item, data):
             note += '完整阻断记录 blockers.md 已保存在本机工单目录。'
     operation_id = enqueue_note(store, item, 'final', note)
     store.update_item(item, state='completed')
+    release_locks(store, item)
     set_dispatch_state(store, dispatch(store, item, data), 'completed')
     return message('completed', conclusion=conclusion, steps=steps, operation_id=operation_id,
                    attachment_id=attachment_id, item=item_identity(item), **extra)

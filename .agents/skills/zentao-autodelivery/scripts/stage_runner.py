@@ -9,9 +9,11 @@ import json
 import os
 from pathlib import Path
 import re
+from socket import gethostname
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 
 class BasicLimit(ctypes.Structure):
@@ -41,7 +43,7 @@ class Accounting(ctypes.Structure):
 class Job:
     """Keep descendants in one non-breakaway job that closes with the supervisor."""
 
-    def __init__(self):
+    def __init__(self, name=None):
         self.api = ctypes.WinDLL('kernel32', use_last_error=True)
         self.api.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
         self.api.CreateJobObjectW.restype = wintypes.HANDLE
@@ -56,8 +58,11 @@ class Job:
         self.api.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
         self.api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         self.api.OpenProcess.restype = wintypes.HANDLE
-        self.handle = self.api.CreateJobObjectW(None, None)
+        self.handle = self.api.CreateJobObjectW(None, name)
         self.check(self.handle)
+        if name is not None and ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            self.close()
+            raise OSError('Recovery Job Object name already exists')
         limits = ExtendedLimit()
         limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         try:
@@ -97,6 +102,39 @@ class Job:
         return info
 
 
+def recover_job_stop(launch):
+    """Return read-only stop evidence for a named Job Object on this Windows host."""
+    name = launch.get('job_name')
+    if (os.name != 'nt' or launch.get('job_host') != gethostname() or not isinstance(name, str)
+            or not re.fullmatch(r'Global\\ZentaoDeploy-[0-9a-f]{32}', name)):
+        return None
+    api = ctypes.WinDLL('kernel32', use_last_error=True)
+    api.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    api.OpenJobObjectW.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+    ]
+    handle = api.OpenJobObjectW(0x0004, False, name)  # JOB_OBJECT_QUERY
+    if handle:
+        try:
+            accounting = Accounting()
+            if (not api.QueryInformationJobObject(handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None)
+                    or accounting.active):
+                return None
+            observed = 'zero_active_processes'
+        finally:
+            api.CloseHandle(handle)
+    elif ctypes.get_last_error() == 2:  # ERROR_FILE_NOT_FOUND
+        # Windows destroys the named job after its handles close and all
+        # associated processes terminate.
+        observed = 'job_destroyed'
+    else:
+        return None
+    return {'mechanism': 'windows_job_object', 'job_name': name, 'job_host': gethostname(),
+            'observation': observed, 'owned_processes_active_after_stop': 0, 'verified_at': utc_now().isoformat()}
+
+
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -134,7 +172,7 @@ def bootstrap(prompt, command):
         return subprocess.call(command, stdin=input_stream)
 
 
-def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None):
+def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None, recoverable=False):
     directory = evidence_dir / attempt_id / phase
     directory.mkdir(parents=True, exist_ok=False)
     receipt_path = directory / 'result.json'
@@ -153,7 +191,10 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
         write_json(receipt_path, result)
         return result
 
-    job = Job()
+    job_name = 'Global\\ZentaoDeploy-' + uuid4().hex if recoverable else None
+    if job_name is not None:
+        evidence.update(job_name=job_name, job_host=gethostname())
+    job = Job(job_name)
     process = None
     try:
         with stdout_path.open('wb') as stdout, stderr_path.open('wb') as stderr:

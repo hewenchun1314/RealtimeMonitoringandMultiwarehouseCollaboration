@@ -1,6 +1,7 @@
 """Launch the project's Playwright browser with a local Windows credential."""
 
 import argparse
+from contextlib import closing
 import ctypes
 from ctypes import wintypes
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
@@ -11,6 +12,7 @@ from socket import create_connection
 import sqlite3
 import subprocess
 from time import monotonic, sleep
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
@@ -110,6 +112,85 @@ def browser_options(config, args):
     return options
 
 
+def deployment_gateway(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9._:/\[\]-]+', value):
+        raise ValueError('Invalid deployment gateway')
+    parsed = urlsplit(value)
+    if (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.port == 0
+            or parsed.netloc.endswith(':') or parsed.path not in ('', '/')):
+        raise ValueError('Use a deployment gateway origin')
+    return value
+
+
+def candidate_workspace(options, config, branches, versions, supplied):
+    from route_evidence import check_candidate
+
+    project = Path(options['workspace']).resolve(strict=True)
+    workspace = (supplied.resolve(strict=True) if supplied else next(
+        (Path(proof['worktree']).resolve(strict=True) for proof in branches.values()
+         if Path(proof['source_root']).resolve(strict=True) == project), None))
+    if (workspace is None or workspace == project or not (workspace / 'package.json').is_file()
+            or not versions or branches.keys() != versions.keys()):
+        raise ValueError('Deployed acceptance requires the assembled candidate frontend workspace')
+    applications = config['development']['frontend_bundle']['applications']
+    for app, sha in versions.items():
+        proof = branches[app]
+        checkout = Path(proof['worktree']).resolve(strict=True)
+        checkout_path = (workspace / applications[app]['repository']).resolve(strict=True)
+        if checkout_path != checkout or check_candidate(proof, sha):
+            raise ValueError('Frontend startup does not include every exact candidate worktree')
+    return str(workspace)
+
+
+def deployed_acceptance(config, options, args):
+    from deploy_state import DEPLOY_STAGE, configured_targets, deployed_receipt_matches
+    from route_execution import read_history
+
+    targets = configured_targets(config)
+    if not targets:
+        return {}
+    with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute('BEGIN')
+        item = conn.execute('SELECT * FROM work_items WHERE marker=?', (args.marker,)).fetchone()
+        if item is None:
+            raise ValueError('Missing work-item state')
+        route, stages = read_history(SimpleNamespace(conn=conn), item)
+        attempt = conn.execute('SELECT phase FROM attempts WHERE item_seq=? AND outcome IS NULL',
+                               (item['seq'],)).fetchone()
+    if not route or route['scope'] != 'fullstack' or DEPLOY_STAGE not in route['stages']:
+        return {}
+    deployed = stages.get(DEPLOY_STAGE, {})
+    if deployed.get('outcome') != 'success':
+        raise ValueError('Current backend deployment is not verified')
+    deployment = deployed['evidence']['services']
+    if not deployment:
+        return {}
+    handoff = stages.get('handoff', {})
+    evidence = handoff.get('evidence', {})
+    effective_stage = (attempt['phase'] if attempt and attempt['phase'] != 'verify' else item['stage'])
+    if (item['state'] != 'running' or effective_stage != 'frontend.e2e' or handoff.get('outcome') != 'success'
+            or evidence.get('deployment') != deployment or not args.startup_log):
+        raise ValueError('Deployed acceptance requires the current handoff and a candidate startup log')
+    gateway = deployment_gateway(evidence['gateway_url'])
+    if any(service not in targets or targets[service]['gateway_url'].rstrip('/') != gateway.rstrip('/')
+           or not deployed_receipt_matches(receipt, service, evidence['backend_versions'].get(service), targets[service])
+           for service, receipt in deployment.items()):
+        raise ValueError('Deployment versions do not match the common handoff gateway')
+    options['startupWorkspace'] = candidate_workspace(
+        options, config, stages['frontend.branch_check']['evidence']['repositories'],
+        stages['frontend.coding']['evidence']['versions'], args.candidate_workspace,
+    )
+    options['gatewayUrl'] = gateway
+    return deployment
+
+
+def verify_deployment(deployment):
+    from backend_deploy import verify_http
+
+    return {service: verify_http(receipt['target'], receipt['sha']) for service, receipt in deployment.items()}
+
+
 def port_open(host, port):
     try:
         with create_connection((host, port), timeout=0.5):
@@ -136,8 +217,9 @@ def http_ready(url):
 def prepare_frontend(config, options, startup_log):
     origin = urlsplit(options['baseUrl'])
     entry_port = origin.port or (443 if origin.scheme == 'https' else 80)
+    gateway = options.get('gatewayUrl')
     if port_open(origin.hostname, entry_port):
-        return {'mode': 'reused'}
+        return ({'mode': 'start-failed', 'reason': 'candidate-port-in-use'} if gateway else {'mode': 'reused'})
 
     extra_ports = config['playwright'].get('preflight_startup_ports', [])
     if not isinstance(extra_ports, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in extra_ports):
@@ -145,15 +227,27 @@ def prepare_frontend(config, options, startup_log):
     command = config['start_command']
     if not isinstance(command, str) or not command.strip():
         raise ValueError('Preflight requires a frontend start command')
+    if gateway:
+        gateway = deployment_gateway(gateway)
+        if any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
+            return {'mode': 'start-failed', 'reason': 'candidate-port-in-use'}
+        # Keep the configured command. Only replace its declared gateway option.
+        flag = r'\s+--gateway(?:=|\s+)(?:"[^"]*"|\x27[^\x27]*\x27|[^\s"\x27]+)'
+        command = re.sub(flag + r'\s*$', '', command)
+        if re.search(r'(?<!\S)--gateway\b', command):
+            raise ValueError('Use a single terminal --gateway option in the frontend start command')
+        command = f"{command.rstrip()} --gateway='{gateway}'"
     with startup_log.open('wb') as output:
         try:
             # The worker runs this process inside the same Windows Job as Playwright.
             process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
-                                       cwd=options['workspace'], stdin=subprocess.DEVNULL,
+                                       cwd=options.get('startupWorkspace', options['workspace']), stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT)
         except OSError:
             return {'mode': 'start-failed', 'reason': 'start-command-unavailable', 'log': str(startup_log)}
     launched = {'pid': process.pid, 'log': str(startup_log)}
+    if gateway:
+        launched['gateway'] = gateway
     ports = dict.fromkeys([entry_port, *extra_ports])
     deadline = monotonic() + 120
     while monotonic() < deadline:
@@ -165,12 +259,18 @@ def prepare_frontend(config, options, startup_log):
     return {'mode': 'start-failed', 'reason': 'startup-timeout', **launched}
 
 
-def run_browser(config, options, args):
+def run_browser(config, options, args, *, deployment=None):
     frontend = None
     if args.startup_log:
         frontend = prepare_frontend(config['e2e'], options, args.startup_log)
         if frontend['mode'] == 'start-failed':
             return {'status': 'blocked', 'stage': 'frontend-startup', 'frontend': frontend}
+    if deployment:
+        try:
+            backend = verify_deployment(deployment)
+        except (OSError, ValueError):
+            return {'status': 'blocked', 'stage': 'backend-deployment', 'frontend': frontend,
+                    'reason': 'backend-version-unverified'}
     login = config['e2e']['login']
     try:
         options['credentials'] = windows_credential(login['credential_ref'], login['username'])
@@ -186,6 +286,14 @@ def run_browser(config, options, args):
         result = {'status': 'blocked', 'stage': 'browser-timeout'}
     if frontend is not None:
         result['frontend'] = frontend
+    if deployment:
+        result['backend_deployment'] = backend
+        if result.get('status') == 'passed':
+            try:
+                verify_deployment(deployment)
+            except (OSError, ValueError):
+                return {**result, 'status': 'blocked', 'stage': 'backend-deployment',
+                        'reason': 'backend-version-changed-during-acceptance'}
     return result
 
 
@@ -196,13 +304,17 @@ def main():
     parser.add_argument('--marker')
     parser.add_argument('--base-url')
     parser.add_argument('--startup-log', type=Path)
+    parser.add_argument('--candidate-workspace', type=Path)
     args = parser.parse_args()
     try:
         config = read_config(args.marker)
         options = browser_options(config, args)
-        if args.startup_log and args.scenario:
+        deployment = deployed_acceptance(config, options, args) if args.scenario else {}
+        if args.startup_log and args.scenario and not deployment:
             raise ValueError('Formal acceptance uses the separate candidate launch')
-        result = run_browser(config, options, args)
+        if args.candidate_workspace and not deployment:
+            raise ValueError('Candidate workspace is only used for deployed acceptance')
+        result = run_browser(config, options, args, deployment=deployment)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError):
         result = {'status': 'blocked', 'stage': 'runner-configuration'}
     print(json.dumps(result, ensure_ascii=False))

@@ -3,6 +3,7 @@
 import json
 
 from delivery_scope import resolve_split, route_stages
+from deploy_state import DEPLOY_STAGE, configured_targets
 from ledger import workflow_stages
 
 
@@ -101,7 +102,8 @@ def split_result(store, item, evidence, *, revision=False):
     config = snapshot(item)
     route = resolve_split(config, {**evidence, 'material': reviewed['material']})
     route['e2e_enabled'] = config.get('e2e', {}).get('enabled', True)
-    route['stages'] = list(route_stages(route['scope'], e2e_enabled=route['e2e_enabled']))
+    route['stages'] = list(route_stages(route['scope'], e2e_enabled=route['e2e_enabled'],
+                                       deploy_enabled=bool(configured_targets(config))))
     if revision:
         previous = get_split(store, item)
         if not previous or previous['scope'] != route['scope']:
@@ -130,13 +132,18 @@ def v2_repair(stage, data, route):
         if acceptance in route['stages']:
             phases.append(acceptance)
     if joint and owner == 'backend':
-        phases.extend(('backend.acceptance', 'backend.integration', 'handoff'))
+        phases.extend(('backend.acceptance', 'backend.integration'))
+        if DEPLOY_STAGE in route['stages']:
+            phases.append(DEPLOY_STAGE)
+        phases.append('handoff')
         if data.get('frontend_changed') or data.get('contract_changed'):
             phases.extend(('frontend.coding', 'frontend.unit_test', 'frontend.code_review'))
     return [*phases, 'verify']
 
 
 def stage_role(stage):
+    if stage == DEPLOY_STAGE:
+        return '发布执行器'
     if stage == 'material_check':
         return '需求评审 Agent'
     if stage == 'split':

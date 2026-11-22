@@ -3,6 +3,8 @@
 import json
 import subprocess
 
+from deploy_state import DEPLOY_STAGE, deployed_receipt_matches
+
 
 # ledger imports this constant during initialization; avoid importing the workflow here.
 EVIDENCE_SCHEMA = """
@@ -192,8 +194,12 @@ def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
     return None
 
 
-def evaluate(route, stages, history=None):
+def evaluate(route, stages, history=None, *, deployment_targets=None):
     decisions = {}
+    targets = deployment_targets or {}
+    deployment = _receipt(stages, DEPLOY_STAGE, partial=True).get('services')
+    if not isinstance(deployment, dict):
+        deployment = {}
     e2e_enabled = route.get('e2e_enabled', True)
     handoff = _receipt(stages, 'handoff').get('backend_versions')
     joint_test = _receipt(stages, 'frontend.e2e', partial=True)
@@ -209,6 +215,16 @@ def evaluate(route, stages, history=None):
                 previous = {}
             skip_e2e = side == 'frontend' and not e2e_enabled
             reason = _side_result(stages, side, key, facts, previous, skip_e2e=skip_e2e)
+            if side == 'backend' and not reason and DEPLOY_STAGE in route.get('stages', []):
+                component = facts[side]
+                for service in sorted(set(component['repositories']) & targets.keys()):
+                    receipt = deployment.get(service)
+                    if deployed_receipt_matches(receipt, service, component['merged'][service], targets[service]):
+                        facts.setdefault('deployment', {})[service] = receipt
+                    else:
+                        facts.setdefault('deployment_pending', []).append(service)
+                if facts.get('deployment_pending'):
+                    reason = '已合回版本待部署核验 ' + '、'.join(facts['deployment_pending'])
             if route['scope'] == 'fullstack' and e2e_enabled:
                 joint_result = joint_test.get('task_results', {}).get(key, {})
                 if current_joint and joint_result.get('outcome') == 'failed':
@@ -228,13 +244,16 @@ def evaluate(route, stages, history=None):
                 closed_reason = '后端服务验收通过且相关仓库已合回，页面联合验收按项目配置跳过'
             else:
                 closed_reason = '独立验收通过且相关仓库已合回'
+            if facts.get('deployment'):
+                closed_reason += '，已核验相关服务部署'
             decisions[key] = ('open' if reason else 'closed', reason or closed_reason, facts)
     return decisions
 
 
 def refresh(store, item):
     import task_sync
-    from route_execution import read_history
+    from deploy_state import configured_targets
+    from route_execution import read_history, snapshot
 
     if not task_sync.enabled(item):
         return
@@ -245,7 +264,8 @@ def refresh(store, item):
         '''SELECT e.*,t.side,t.remote_status FROM task_evidence e JOIN split_tasks t USING(item_seq,task_key)
            WHERE e.item_seq=?''', (item['seq'],))}
     history = {key: json.loads(row['evidence']) for key, row in prior.items()}
-    for task, (desired, reason, facts) in evaluate(route, stages, history).items():
+    targets = configured_targets(snapshot(item)) if DEPLOY_STAGE in route['stages'] else {}
+    for task, (desired, reason, facts) in evaluate(route, stages, history, deployment_targets=targets).items():
         previous = prior.get(task)
         if previous:
             old = history[task]
@@ -267,6 +287,7 @@ def refresh(store, item):
                 for component in ('backend', 'frontend'))
             if (previous['disposition'] == 'closed' and (previous['remote_status'] == 'closed' or not changed_versions)
                     and same_criteria and not changed_scope and desired == 'open' and not facts.get('joint_failure')
+                    and not facts.get('deployment_pending')
                     and acceptance.get('outcome') != 'failed'):
                 continue
         store.conn.execute('''INSERT INTO task_evidence(item_seq,task_key,disposition,reason,evidence)
@@ -282,12 +303,13 @@ def first_unverified_stage(store, item):
 
     if not task_sync.enabled(item):
         return None
-    task = store.conn.execute('''SELECT t.side FROM split_tasks t LEFT JOIN task_evidence e
+    task = store.conn.execute('''SELECT t.side,e.evidence FROM split_tasks t LEFT JOIN task_evidence e
         USING(item_seq,task_key) WHERE t.item_seq=? AND COALESCE(e.disposition,'open') <> 'closed'
         ORDER BY t.side,t.task_key LIMIT 1''', (item['seq'],)).fetchone()
     if not task:
         return None
     if task['side'] == 'backend':
-        return 'backend.acceptance'
+        facts = json.loads(task['evidence']) if task['evidence'] else {}
+        return DEPLOY_STAGE if facts.get('deployment_pending') else 'backend.acceptance'
     route = get_split(store, item)
     return 'frontend.integration' if route and not route.get('e2e_enabled', True) else 'frontend.e2e'

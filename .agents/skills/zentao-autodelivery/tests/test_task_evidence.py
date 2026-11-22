@@ -88,6 +88,33 @@ class TaskEvidenceTests(unittest.TestCase):
         self.stages['frontend.e2e']['evidence']['backend_versions'] = {'api': 'b' * 40}
         self.assertEqual(self.flags()['B'], 'closed')
 
+    def test_only_tasks_with_matching_deployed_service_require_deploy_receipt(self):
+        route = {'scope': 'backend_only', 'stages': ['backend.deploy'],
+                 'tasks': {'backend': [{'id': 'A'}, {'id': 'B'}, {'id': 'C'}]}}
+        versions = {'first': 'a' * 40, 'second': 'b' * 40, 'local': 'c' * 40}
+        target = {'gateway_url': 'https://example.test/', 'registry': 'registry.example.test',
+                  'image_repository': 'team/backend'}
+        targets = {'first': target, 'second': target}
+        passed = {'outcome': 'passed', 'verification': 'endpoint passed'}
+        stages = {
+            'backend.plan': step({'task_repositories': {'A': ['first'], 'B': ['second'], 'C': ['local']}}),
+            'backend.coding': step({'versions': versions}),
+            'backend.acceptance': step({'versions': versions, 'task_results': dict.fromkeys('ABC', passed)}),
+            'backend.integration': step({'versions': versions, 'merged_versions': versions}),
+            'backend.deploy': step({'services': {
+                'first': {'status': 'deployed', 'service': 'first', 'target': target, 'sha': versions['first'],
+                          'digest': 'sha256:' + 'a' * 64, 'image': 'registry.example.test/team/backend:1.0.1',
+                          'verification': {'sha': versions['first']}},
+                'second': {'status': 'deployed', 'service': 'second', 'target': target, 'sha': 'd' * 40,
+                           'digest': 'sha256:' + 'b' * 64, 'image': 'registry.example.test/team/backend:1.0.2',
+                           'verification': {'sha': 'd' * 40}},
+            }}, 'failed'),
+        }
+        decisions = evaluate(route, stages, deployment_targets=targets)
+        self.assertEqual({key: value[0] for key, value in decisions.items()},
+                         {'A': 'closed', 'B': 'open', 'C': 'closed'})
+        self.assertEqual(decisions['B'][2]['deployment_pending'], ['second'])
+
 
 class TaskWorkflowDrill(unittest.TestCase):
     def test_added_requirement_preserves_pending_close_of_delivered_peer(self):

@@ -4,12 +4,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
 RUNNER = Path(__file__).resolve().parents[1] / 'scripts' / 'stage_runner.py'
+sys.path.insert(0, str(RUNNER.parent))
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows stage workers require Windows Job Objects')
@@ -91,6 +93,47 @@ class StageRunnerTests(unittest.TestCase):
             self.assertEqual(evidence['owned_processes_active_after_stop'], 0)
             self.assertTrue(evidence['worker_started'])
             self.assertEqual(Path(result['stdout_path']).read_text(encoding='utf-8').strip(), 'completed')
+
+    def test_recoverable_job_proves_stop_after_supervisor_termination(self):
+        from stage_runner import recover_job_stop
+
+        script = (
+            'import sys\n'
+            'from pathlib import Path\n'
+            'from datetime import timedelta\n'
+            'sys.path.insert(0, sys.argv[1])\n'
+            'from stage_runner import run_stage, utc_now\n'
+            'cwd = Path(sys.argv[2])\n'
+            'run_stage("owned", "publish", utc_now() + timedelta(seconds=30), cwd, cwd, None,\n'
+            '          [sys.executable, "-c", "import time; time.sleep(30)"], recoverable=True)\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            worker = subprocess.Popen([sys.executable, '-B', '-c', script, str(RUNNER.parent), directory],
+                                      stderr=subprocess.PIPE)
+            launch_path = Path(directory) / 'owned' / 'publish' / 'launch.json'
+            try:
+                until = time.monotonic() + 8
+                while not launch_path.exists() and worker.poll() is None and time.monotonic() < until:
+                    time.sleep(0.025)
+                self.assertTrue(launch_path.exists())
+                launch = json.loads(launch_path.read_text(encoding='utf-8'))
+                self.assertIsNone(recover_job_stop(launch))
+                worker.kill()
+                worker.wait(5)
+                until = time.monotonic() + 5
+                stopped = None
+                while stopped is None and time.monotonic() < until:
+                    stopped = recover_job_stop(launch)
+                    if stopped is None:
+                        time.sleep(0.025)
+                self.assertIsNotNone(stopped)
+                self.assertEqual(stopped['owned_processes_active_after_stop'], 0)
+                self.assertIsNone(recover_job_stop({**launch, 'job_host': 'other-host'}))
+                self.assertFalse(launch_path.with_name('result.json').exists())
+            finally:
+                if worker.poll() is None:
+                    worker.kill()
+                worker.communicate(timeout=5)
 
 
 if __name__ == '__main__':

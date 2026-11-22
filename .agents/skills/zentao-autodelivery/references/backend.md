@@ -4,9 +4,17 @@
 
 1. 后端开发 Agent 在 `backend.plan` 提交涉及的服务键。主会话核验目标分支和工作树后，开发 Agent 在该 worktree 实现并构建，运行服务单测，逐服务记录命令、结果、候选 SHA。跨端工单在本单证据目录编写 `round-<n>/backend/handoff.md`，列出关联任务、接口约定、版本、启动/连接方式、测试数据准备、实际成功请求及响应、错误场景和已确认的变化。
 2. 后端测试 Agent 独立审查候选改动，按服务实际入口执行 `acceptance_command` 并读回证据。用版本接口、受控启动工作树或等价方式确认测试对象。后台任务记录输入、执行结果与持久化状态。复用已有服务时保留用户原进程。本次启动的进程由阶段运行器管理。
-3. 主会话逐仓核对候选版本、目标分支和合回结果。多仓部分成功时记录各仓实际提交，重试先读回。纯后端工单在本端合回后收尾。
+3. 主会话逐仓核对候选版本、目标分支和合回结果。多仓部分成功时记录各仓实际提交，重试先读回。启用部署的工单合回后由 Windows 工单启动器交给发布执行器。纯后端工单按适用阶段完成合回或部署后收尾。
 4. 前后端工单额外执行 `handoff`。核对所有必需后端任务、审查、验收、合回提交、可调用版本。提交 `evidence.document`（实际账本同级 `items/<marker>/round-<n>/backend/handoff.md` 绝对路径）、`backend_versions`（服务键到已合回提交）、`environment`（环境地址或可定位的本地实例）、`verification`（调用及版本核验事实）。后端候选与合回内容有差异时，独立复验受影响行为。
 5. 账本交接通过后，主会话把前端任务、联调文档和版本交给前端开发 Agent。后端新增修复进入联调时更新文档与实际版本，再验证受影响的前端行为。对于旧环境、失效接口或缺少必需仓库等情况，记录具体依赖和恢复依据。
+
+## 后端自动部署
+
+按服务在 `development.backend_bundle.services.<服务键>.deployment` 配置 `enabled`、所选 `target` 和 `targets`。目标填写 `registry`、`image_repository`、`platform`、`cluster_id`、`kube_context`、`namespace`、`deployment`、`container`、`gateway_url` 和 `verification_path`。同一实际集群的 kubeconfig 别名共享一个 `cluster_id`。HTTP 版本端点返回 JSON，默认从 `git.commit.id` 读取完整 Git SHA，其他 JSON 字段可配 `version_field`。需要认证的版本探针使用 HTTPS 和可选 `http_credential_ref`、`http_username`。Smart-Geo 的 `deployment.build_dependencies` 要用经验证的 Git SHA 固定 `tet-common-java`。
+
+工单启动器从账本接手于 `backend.deploy` 的工单，独立执行镜像构建、推送、工作负载更新和 HTTP 检查。先核对当前授权和领取快照，再用合回 SHA 构建。按镜像标签和工作负载互斥，镜像标签冲突时保留证据。更新 Kubernetes 用包含前置条件的补丁，按摘要验证实际 Pod。启用前确认该环境、容器和版本探针，并使用运行工单的账号配置 Docker 登录及指定集群的 kubeconfig。部署失败登记「待验证」，部分成功保存在本轮发布回执中。
+
+跨端启用部署时，`handoff` 在已有字段之外提交发布回执中的 `deployment` 服务映射及共同 `gateway_url`，前端联合验收从该网关重验完整后端版本。有关已安装的发布能力和实施上下文见[部署设计](../../../../docs/superpowers/plans/2026-11-22-禅道后端自动部署需求设计与实施计划.md)。
 
 ## 上游依赖与修改权限
 

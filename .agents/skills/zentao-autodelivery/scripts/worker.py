@@ -11,8 +11,10 @@ import re
 import sqlite3
 import sys
 from threading import Event
+import time
 from uuid import UUID, uuid4
 
+from backend_deploy_runner import deployment_action, run_deployment
 from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
@@ -76,6 +78,7 @@ def worker_prompt(operation, item):
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
         '按同名后端服务列入计划并使用核验过的工单工作树。前端使用已配置业务后端的契约。'
+        '若账本的当前阶段或返工分段为 backend.deploy，结束当前轮次，发布执行器会自动接手并续接原会话。'
         '跨端工单在后端合回且联调交接通过后才启动前端。旧工单沿用原阶段。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )
@@ -89,6 +92,90 @@ def probe_passed(receipt):
                     and 'WORKER_RUNTIME_OK' in item.get('aggregated_output', '').split()
                     for item in shell_results)
             and any(event['type'] == 'turn.completed' for event in events))
+
+
+def launch_turn(cli, operation, item, output, deadline):
+    run_id = UUID(item['request_id']).hex if operation == 'prepare' else uuid4().hex
+    config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+    validate_config(config)
+    configs = [config]
+    if item is not None and item['config_snapshot']:
+        configs.append(json.loads(item['config_snapshot']))
+    # Recheck current permissions before each new or resumed turn.
+    protected, writable = worker_roots(configs, CONFIG_PATH.parent, PROJECT_ROOT, codex_directory())
+    argv = command(cli, operation, item['chat_id'] if item is not None else None,
+                   protected_roots=protected, writable_roots=writable)
+    prompt_file = output / f'{run_id}.txt'
+    prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
+    launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
+    if operation != 'run' or not task_sync_enabled(item):
+        return run_stage(*launch), None
+    stop = Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_stage, run_id, 'task-sync', deadline, PROJECT_ROOT, output, None,
+                                 sync_command('--marker', item['marker'], '--chat-id', item['chat_id']),
+                                 stop_event=stop)
+        try:
+            receipt = run_stage(*launch)
+        finally:
+            stop.set()
+        return receipt, future.result()
+
+
+def worker_result(receipt, sync_receipt):
+    stopped = receipt['stop_confirmed'] and (sync_receipt is None or sync_receipt['stop_confirmed'])
+    result = {'status': 'worker_stopped' if stopped else 'worker_stop_unverified',
+              'receipt': receipt['receipt_path'], 'outcome': receipt['outcome']}
+    if sync_receipt:
+        result.update(task_sync_receipt=sync_receipt['receipt_path'], task_sync_outcome=sync_receipt['outcome'])
+    return result
+
+
+def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False):
+    deadline = deadline or utc_now() + timedelta(hours=72)
+
+    def peek():
+        return deployment_action('peek', marker, DATABASE_PATH, CONFIG_PATH)['status']
+
+    state = peek()
+    last_turn = {}
+    last_deployment = None
+    while utc_now() < deadline:
+        item = read_item(marker)
+        if not item or item['state'] not in ('bound', 'running', 'closing'):
+            return last_turn or {'status': 'worker_released'}
+        if state == 'deployment_pending':
+            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
+                deployment = {'status': 'deployment_runtime_blocked'}
+            else:
+                deployment = run_deployment(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT,
+                                            recover=recover_deployment)
+            status = deployment['status']
+            if status == 'deployment_busy' and 'attempt_id' not in deployment:
+                # Another work item owns the target. Its release can be observed
+                # by this launcher without consuming a ledger attempt.
+                remaining = (deadline - utc_now()).total_seconds()
+                if remaining > 0:
+                    time.sleep(min(2, remaining))
+            elif status not in ('attempt_finished', 'repair_advanced', 'deployment_not_pending'):
+                return {**last_turn, 'status': 'worker_deployment_blocked', 'backend_deployment': deployment}
+            else:
+                last_deployment = deployment
+            state = peek()
+            continue
+        if state != 'deployment_not_pending':
+            return {**last_turn, 'status': 'worker_deployment_blocked',
+                    'backend_deployment': {'status': state}}
+        last_turn = worker_result(*launch_chat(item))
+        if last_deployment is not None:
+            last_turn['backend_deployment'] = last_deployment
+        if last_turn['status'] != 'worker_stopped':
+            return last_turn
+        state = peek()
+        if state == 'deployment_not_pending':
+            return last_turn
+    return {**last_turn, 'status': 'worker_deployment_blocked',
+            'backend_deployment': {'status': 'deployment_worker_deadline'}}
 
 
 def run(operation, marker, cli):
@@ -130,47 +217,17 @@ def run(operation, marker, cli):
                 existing = prepared_result(proof)
                 if existing['chat_id'] or not proof['stop_confirmed'] or directory.parent.name == run_id:
                     return existing
-        else:
-            run_id = uuid4().hex
-        config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-        validate_config(config)
-        configs = [config]
-        if item is not None and item['config_snapshot']:
-            configs.append(json.loads(item['config_snapshot']))
-        # The current configuration can narrow permissions for an admitted item.
-        protected, writable = worker_roots(configs, CONFIG_PATH.parent, PROJECT_ROOT, codex_directory())
-        argv = command(cli, operation, item['chat_id'] if item is not None else None,
-                       protected_roots=protected, writable_roots=writable)
-        prompt_file = output / f'{run_id}.txt'
-        prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
         os.environ.pop('CODEX_THREAD_ID', None)
         deadline = utc_now() + (timedelta(hours=72) if operation == 'run' else timedelta(minutes=4))
-        launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
-        sync_receipt = None
-        if operation == 'run' and task_sync_enabled(item):
-            stop = Event()
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(run_stage, run_id, 'task-sync', deadline, PROJECT_ROOT, output, None,
-                                         sync_command('--marker', marker, '--chat-id', item['chat_id']),
-                                         stop_event=stop)
-                try:
-                    receipt = run_stage(*launch)
-                finally:
-                    stop.set()
-                sync_receipt = future.result()
-        else:
-            receipt = run_stage(*launch)
+        if operation == 'run':
+            return dispatch_work_item(
+                marker, lambda current: launch_turn(cli, operation, current, output, deadline), deadline,
+                recover_deployment=True)
+        receipt, _ = launch_turn(cli, operation, item, output, deadline)
         if operation == 'prepare':
             return prepared_result(receipt)
-        if operation == 'probe':
-            return {'status': 'probe_passed' if probe_passed(receipt) else 'probe_failed',
-                    'receipt': receipt['receipt_path']}
-        stopped = receipt['stop_confirmed'] and (sync_receipt is None or sync_receipt['stop_confirmed'])
-        result = {'status': 'worker_stopped' if stopped else 'worker_stop_unverified',
-                  'receipt': receipt['receipt_path'], 'outcome': receipt['outcome']}
-        if sync_receipt:
-            result.update(task_sync_receipt=sync_receipt['receipt_path'], task_sync_outcome=sync_receipt['outcome'])
-        return result
+        return {'status': 'probe_passed' if probe_passed(receipt) else 'probe_failed',
+                'receipt': receipt['receipt_path']}
 
 
 def sync_command(*args):
@@ -256,7 +313,7 @@ def main():
     except (OSError, TypeError, ValueError, sqlite3.Error) as error:
         result = {'status': 'worker_error', 'reason': str(error)}
     print(json.dumps(result, ensure_ascii=True))
-    return int(result['status'] in ('worker_error', 'probe_failed', 'task_sync_incomplete',
+    return int(result['status'] in ('worker_error', 'worker_deployment_blocked', 'probe_failed', 'task_sync_incomplete',
                                     'e2e_preflight_blocked', 'e2e_preflight_busy'))
 
 

@@ -101,7 +101,26 @@
           "build_command": "mvn -B -pl smart-geo/smart-geo-server -am -DskipTests package",
           "test_command": "mvn -B -pl smart-geo/smart-geo-server -am test",
           "start_command": "java -jar (Get-Item 'smart-geo-server/target/smart-geo-server-*.jar').FullName --server.address=127.0.0.1 --server.port=18081",
-          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18081/tet/smart-geo/actuator/health'"
+          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18081/tet/smart-geo/actuator/health'",
+          "deployment": {
+            "enabled": false,
+            "target": "internalrd-test",
+            "build_dependencies": {},
+            "targets": {
+              "internalrd-test": {
+                "registry": "hzhub.tracyenergy.cn:6443",
+                "image_repository": "internalrd/smart-geo-srv",
+                "platform": "linux/amd64",
+                "cluster_id": "c-m-wh2j6p2w",
+                "kube_context": null,
+                "namespace": "internalrd",
+                "deployment": "smart-geo-new",
+                "container": null,
+                "gateway_url": "http://10.10.4.140:31111/",
+                "verification_path": null
+              }
+            }
+          }
         },
         "model-manage-srv": {
           "repository": "model-manage-srv",
@@ -146,7 +165,8 @@
       "unit_test": 45,
       "code_review": 45,
       "e2e": 90,
-      "integration": 45
+      "integration": 45,
+      "backend.deploy": 60
     }
   },
   "backend_dependencies": {

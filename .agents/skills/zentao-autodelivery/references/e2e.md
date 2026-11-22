@@ -20,6 +20,8 @@ E2E 在合回前执行。从工单配置快照读取 `e2e` 设置及当前前端
 
 正式验收从本单已核对的候选工作树启动服务。把实际本地地址、工单标识、测试档案和场景脚本交给 `playwright_e2e.py --marker <marker> --base-url <origin> --profile <JSON路径> --scenario <CJS路径>`，由当前 E2E 阶段运行器执行。场景文件导出 `async ({ page }) => { ... }`，在已经登录且通过数据检查的独立页面上确认前后端实际运行版本、执行本单用例并保存证据。断言失败时抛出错误，并在工单证据中记录脱敏的具体断言和页面状态。只在场景及现有逐项证据校验完成后登记 E2E 通过。
 
+跨端工单若有自动部署结果，再传入 `--startup-log <本轮日志路径>`，由 runner 使用交接网关并启动候选前端。基座本身有工单 worktree 时默认使用该目录。仅子应用有工单 worktree 时，先准备可启动的基座目录并接入所有待验子应用，再通过 `--candidate-workspace <路径>` 传入。候选依赖须事先安装。基座与子应用启动端口须空闲。runner 会核实各前端仓库实际 SHA，并在 Playwright 执行前后核对网关上的后端版本。验收证据从实测回执填入 `gateway_url`（取 `frontend.gateway`）及 `backend_deployment`。
+
 ## 基座应用
 
 1. 根据 `e2e.ready_url`、已打开的业务页面或启动设置识别前端地址。服务已启动时直接复用。优先查看已登录的浏览器页面及应用内导航。需要额外做 HTTP 探测时，页面请求显式使用 `Accept: text/html`，例如 `Invoke-WebRequest -Uri $browserEntry -Headers @{ Accept = 'text/html' } -TimeoutSec 8 -SkipHttpErrorCheck`。缺少 `Accept` 或按 JSON 请求的深层路由可能返回 `404`，应以实际浏览器访问和页面功能作准备结论。HTML 返回 `200` 仅证明前端入口可访问。
