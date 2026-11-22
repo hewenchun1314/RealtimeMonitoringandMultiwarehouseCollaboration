@@ -1,6 +1,6 @@
 # 后端服务验收与联调交接
 
-仅处理账本选中后端的工单。项目通过 `workspaces.backend` 指定后端工作区，`development.backend_bundle` 包含 `name` 和按配置键组织的 `services`。每条服务设置相对于工作区的 `repository`、目标 `branch`、`build_command`、`test_command`、`acceptance_command`，以及 `start_command` 或已有服务的 `service_url`。运行配置只登记项目认可的入口和凭据引用。当前项目启用纯前端，接入时再登记真实服务。
+仅处理账本选中后端的工单。项目通过 `workspaces.backend` 指定后端工作区，`development.backend_bundle` 包含 `name` 和按配置键组织的 `services`。每条服务设置相对于工作区的 `repository`、目标 `branch`、`build_command`、`test_command`、`acceptance_command`，以及 `start_command` 或已有服务的 `service_url`。运行配置只登记项目认可的入口和凭据引用。
 
 1. 后端开发 Agent 在 `backend.plan` 提交涉及的服务键。主会话核验目标分支和工作树后，开发 Agent 在该 worktree 实现并构建，运行服务单测，逐服务记录命令、结果、候选 SHA。跨端工单在本单证据目录编写 `round-<n>/backend/handoff.md`，列出关联任务、接口约定、版本、启动/连接方式、测试数据准备、实际成功请求及响应、错误场景和已确认的变化。
 2. 后端测试 Agent 独立审查候选改动，按服务实际入口执行 `acceptance_command` 并读回证据。用版本接口、受控启动工作树或等价方式确认测试对象。后台任务记录输入、执行结果与持久化状态。复用已有服务时保留用户原进程。本次启动的进程由阶段运行器管理。

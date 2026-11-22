@@ -28,7 +28,7 @@
     "dingtalk": {"enabled": true}
   },
   "development": {
-    "allowed_requirement_types": ["frontend_only"],
+    "allowed_requirement_types": ["frontend_only", "backend_only", "fullstack"],
     "max_concurrent_items": 1,
     "max_retries_per_step": 3,
     "frontend_bundle": {
@@ -213,9 +213,9 @@
   },
   "_comments": {
     "development.allowed_requirement_types": {
-      "纯前端（当前配置）": ["frontend_only"],
+      "纯前端": ["frontend_only"],
       "纯后端": ["backend_only"],
-      "前后端均可": ["frontend_only", "backend_only", "fullstack"],
+      "前后端均可（当前配置）": ["frontend_only", "backend_only", "fullstack"],
       "判定顺序": "单端项目始终只走配置的端。前后端均可时，先看需求 intent.md 中的“研发范围：纯前端 / 纯后端 / 前后端”（三选一）；未填写时由拆分 Agent 判断。",
       "修改生效": "将所选数组填入 development.allowed_requirement_types。新领取的工单使用新配置，已领取的工单按原快照继续。"
     },
