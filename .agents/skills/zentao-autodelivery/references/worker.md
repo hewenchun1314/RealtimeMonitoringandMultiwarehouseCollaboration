@@ -6,6 +6,8 @@
 
 Windows MXC 在可写工作区内仍会保护 Git 元数据。对于已获准执行本地工单分支、提交和合回的服务或应用，用 `runtime.worker_git_write_repositories` 按 `backend:服务键`、`frontend:应用键` 显式登记。启动器核对当前配置和领取快照中解析到的仓库路径一致，再只授予该仓库自己的 `.git` 或对应子模块元数据目录。该规则不扩大只读依赖或父仓库其他 Git 路径的权限。
 
+启用 `runtime.sync_requirement_before_review` 时，同样核对当前配置和领取快照的需求仓库路径，授予该独立仓库及其自身 `.git` 的写权限，以便材料评审前受控快进。
+
 配置了 `backend_dependencies` 时，启动器为该工单 CLI 启用 Windows MXC 权限配置。只有当前项目配置和工单快照均将同一依赖路径设为 `writable` 时，启动器才会为其授予写权限。项目、已配置的前后端工作区、Codex 运行目录及临时目录提供正常的写入空间，`runtime.worker_cache_paths` 另外登记工作区外的构建缓存目录，支持 `~` 和系统环境变量。阶段 CLI 由本工单入口在同一受限进程树内启动。新增依赖后可以先跑 `probe` 确认配置可加载。MXC 无法启动时按现有权限阻断规则处理。
 
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py probe` 运行一次只读的实机探针。它要求 CLI 实际调用 shell 检查项目文件，根据工具输出和进程回执验证通过。不接单、不访问禅道。

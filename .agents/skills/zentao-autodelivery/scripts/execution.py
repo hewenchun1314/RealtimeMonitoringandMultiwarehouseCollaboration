@@ -6,10 +6,11 @@ from uuid import uuid4
 
 from backend_dependencies import backend_services, dependency_context
 from branch_check import branch_context, planned_applications, valid_evidence
-from delivery_scope import read_material
+from delivery_scope import material_location, read_material
 from deploy_state import DEPLOY_STAGE, DEPLOY_STAGES, configured_targets, deployed_receipt_matches, release_locks
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
+from material_sync import requirement_checkout, verify_requirement_intent
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
 from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
                              stage_evidence, stage_role, stage_task_ids, stages_for, task_scope, v2_repair)
@@ -181,6 +182,11 @@ def phase_context(store, item, phase, config_directory):
     return context
 
 
+def material_sync_required(store, item):
+    return (item['kind'] == 'story' and item['stage'] == 'material_check'
+            and store.config.get('runtime', {}).get('sync_requirement_before_review', False))
+
+
 def attempt_start(store, item, data, *, config_directory, deployment_worker=False):
     if not execution_matches(store, item, data) or item['state'] != 'running':
         return message('stale_execution')
@@ -189,6 +195,8 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
     if item['stage'] in DEPLOY_STAGES and not deployment_worker:
         return message('deployment_worker_required')
     preparation = branch_context(store, item) if item['stage'].rsplit('.', 1)[-1] == 'branch_check' else {}
+    if material_sync_required(store, item):
+        preparation['material_sync_required'] = True
     routed = is_routed(item)
     if routed:
         preparation['route'] = get_split(store, item)
@@ -399,6 +407,29 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     evidence = data.get('evidence')
     if isinstance(evidence, dict):
         evidence = evidence.copy()
+    missing_file = (item['kind'] == 'story' and stage == 'material_check' and outcome == 'failed'
+                    and isinstance(evidence, dict) and evidence.get('material_file_status') == 'missing')
+    sync_required = material_sync_required(store, item)
+    sync_receipt = None
+    if sync_required:
+        row = store.conn.execute('SELECT receipt FROM requirement_sync_receipts WHERE attempt_id=?',
+                                 (attempt_id,)).fetchone()
+        if row:
+            sync_receipt = json.loads(row['receipt'])
+        elif finished or missing_file:
+            return message('material_sync_required')
+    if sync_receipt and (finished or missing_file):
+        try:
+            path = None
+            if finished or evidence.get('path'):
+                root, intent = material_location(config, config_directory,
+                                                 evidence.get('path') if isinstance(evidence, dict) else None)
+                path = intent.relative_to(root).as_posix()
+            else:
+                root = requirement_checkout(config, config_directory)
+            verify_requirement_intent(root, sync_receipt['commit'], path, missing=missing_file)
+        except (ValueError, OSError) as exc:
+            return message('evidence_required', reason=str(exc))
     route = None
     current_route, history = read_history(store, item) if routed else (None, {})
     reported = evidence.get('task_blockers') if isinstance(evidence, dict) else None
@@ -430,8 +461,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             if reason:
                 return message('evidence_required', reason=reason)
     stages = stages_for(store, item, route)
-    missing_file = (item['kind'] == 'story' and stage == 'material_check' and outcome == 'failed'
-                    and isinstance(evidence, dict) and evidence.get('material_file_status') == 'missing')
+    if sync_receipt:
+        evidence = {**(evidence if isinstance(evidence, dict) else {}), 'requirement_sync': sync_receipt}
     retry = (not finished and not missing_file and data.get('retryable', True)
              and trial['retry_number'] < development['max_retries_per_step'])
     if routed and repair_required and data.get('contract_changed') and revision_count(store, item) >= development['max_retries_per_step']:
@@ -456,7 +487,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     number = stages.index(stage)
     no_work = route and route['blockers'] and not any(route['tasks'].values())
     unresolved_contract = routed and not finished and (phase == 'split' or (repair_required and data.get('contract_changed')))
-    stop_route = (missing_file or no_work or unresolved_contract or
+    stop_route = (missing_file or (sync_required and not finished) or no_work or unresolved_contract or
                   (routed and (stage in ('split', 'handoff', DEPLOY_STAGE) or phase == DEPLOY_STAGE) and not finished))
     next_stage = stages[number + 1] if not stop_route and number + 1 < len(stages) else None
     recorded_blockers = dict(reported or {}) if not retry else {}

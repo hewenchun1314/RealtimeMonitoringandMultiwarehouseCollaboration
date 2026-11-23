@@ -19,7 +19,7 @@
 
 | 阶段 | 负责人 | 操作和成功证据 |
 | --- | --- | --- |
-| `material_check` | 评审 Agent | 需求核对实际目录并提交 `evidence.path`，例如 `requirements/ZT-123/intent.md`，相对需求工作区。Bug 提交原单复现详情 `evidence.detail`。账本解析材料正文并保留摘要和原标记。需求文件确实缺失时以 `failed` 和 `material_file_status:"missing"` 提交。 |
+| `material_check` | 主会话、评审 Agent | Story 先按[需求材料同步](#需求材料同步)同步仓库，再核对实际目录并提交 `evidence.path`，例如 `requirements/ZT-123/intent.md`，相对需求工作区。Bug 提交原单复现详情 `evidence.detail`。账本解析材料正文并保留摘要和原标记。需求文件确实缺失时以 `failed` 和 `material_file_status:"missing"` 提交。 |
 | `split` | 拆分 Agent | 项目单端设置决定实际范围。项目支持两端时优先用文档标记，缺标记再根据代码、接口与验收条件研判；双端配置中标记非法或矛盾时记录歧义。写 `split.md` 和结构化任务证据，格式见[账本命令](workflow-cli.md)。将超出范围的验收条件写入 `blockers`。 |
 | `<端>.design`、`<端>.plan` | 本端开发 Agent | 按拆分清单在本轮的 `frontend/` 或 `backend/` 写 `design.md`、`plan.md`。设计附文件证据，计划登记非空且唯一的应用键数组 `applications` 或服务键数组 `services`。 |
 | `<端>.branch_check` | 主会话 | 按[分支核验](branches.md)准备并实地核对每个目标仓库的 worktree，提交完整 `repositories`。 |
@@ -60,6 +60,14 @@
 核心验收失败、原 Bug 仍能复现、已有功能明显回归，视为严重问题。Code Review 或 E2E 失败且确需改代码时，通过 `repair_required:true` 登记返工。下一次尝试按账本返回分段处理，依次由开发 Agent 修复并运行相关单测，E2E 返工额外由测试 Agent 复审，最后回到当前步骤验证。环境失败则按普通重试处理。
 
 整轮返工占用当前 Code Review 或 E2E 的一次重试。每个分段成功后，以 `repair_advance` 保存证据、继续同一次尝试，并使用下一分段返回的时限。最终验证使用 `attempt_finish`，任一分段失败或超时也通过 `attempt_finish` 结束当前尝试。将修复后的候选提交和各项验证结果一并交给合回步骤，最终汇总保留未解决的问题。
+
+## 需求材料同步
+
+项目启用 `runtime.sync_requirement_before_review` 时，Story 的每次材料评审尝试（含重试和重新评审）先同步。领取快照和当前配置须指向同一个独立 Git 需求仓库。仓库沿用当前分支已有的远端上游，只允许快进，Git 遇到会覆盖的本地编辑时会拒绝更新。
+
+主会话将 `action:"material_sync"`、工单键 `item`、原 `request_id`、`chat_id` 和 `attempt_id` 写到本次尝试的 JSON 输入文件。在项目根目录用[阶段运行器](stage-runner.md)执行 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`，指定 `--phase material-sync`、原尝试的截止时间及 `--stdin-file`。从该阶段的 `stdout.log` 读回 `material_synced`、分支和提交，再将实际提交交给评审 Agent，继续用原账本分段 `verify` 检查材料。
+
+同步失败时，使用原尝试登记实际原因和运行回执，再按账本重试。重试耗尽则收尾为「阻断」。账本取得该尝试的同步成功回执后才接受评审成功或「待补材料」。评审成功时账本核对本地 `intent.md` 与该提交一致。若已知材料目录但文件缺失，随 `material_file_status:"missing"` 提供预期 `evidence.path`，账本在同步提交中核对该路径。
 
 ## 超时和受控停止
 

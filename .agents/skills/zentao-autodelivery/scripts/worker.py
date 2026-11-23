@@ -77,6 +77,8 @@ def worker_prompt(operation, item):
         '恢复轮次读取本工单 recoveries 的最新记录及其中的本地证据文件，落实已核验的受阻范围。'
         '禁止申请临时权限、弹审批、提问或等待人工确认，也不要开启新的桌面聊天。'
         '每次阶段尝试使用账本截止时间及阶段运行器。'
+        '材料评审返回 material_sync_required 时，先按步骤指引运行 record material_sync，'
+        '取得 material_synced 回执后才派发需求评审；同步失败按原尝试登记。'
         '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'

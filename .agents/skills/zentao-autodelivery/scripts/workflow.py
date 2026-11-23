@@ -16,9 +16,11 @@ from desktop_runtime import runtime_check
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled, enqueue_notification
 from execution import (
     active_attempt, attempt_finish, attempt_start, bind, complete, defer_dispatch, execution_matches,
-    expire_dispatch, recover, repair_advance, resolve_dispatch, start, stop,
+    expire_dispatch, material_sync_required, recover, repair_advance, resolve_dispatch, start, stop,
 )
 from ledger import Ledger, encode, message, require_mapping, require_text, transaction, validate_config
+from material_sync import requirement_checkout, sync_requirement
+from route_execution import snapshot
 from status_board import publish_status
 from task_sync import reconcile_missing
 from writeback import authorize_writeback, claim_writeback, confirm_writeback, find_entry, reconcile_writeback
@@ -79,6 +81,50 @@ def read_branch_attempt(database, config, data, now, config_directory):
         return {**context, 'deadline_at': trial['deadline_at']}
 
 
+def sync_material_attempt(database, config, data, now, config_directory):
+    if not Path(database).is_file():
+        return message('material_sync_inactive')
+
+    def active_trial(store):
+        item = store.find_item(data.get('item'))
+        if not (item['state'] == 'running' and execution_matches(store, item, data)
+                and material_sync_required(store, item)):
+            return None, None
+        trial = active_attempt(store, item)
+        if not trial or trial['attempt_id'] != data.get('attempt_id') or store.time >= trial['deadline_at']:
+            return None, None
+        return item, trial
+
+    with transaction(database) as conn:
+        store = Ledger(conn, config, now or datetime.now(timezone.utc))
+        item, trial = active_trial(store)
+        if trial is None:
+            return message('material_sync_inactive')
+        previous = conn.execute('SELECT receipt FROM requirement_sync_receipts WHERE attempt_id=?',
+                                (trial['attempt_id'],)).fetchone()
+        if previous:
+            return message('material_synced', **json.loads(previous['receipt']))
+        checkout = requirement_checkout(snapshot(item), config_directory)
+        if checkout is None or checkout != requirement_checkout(config, config_directory):
+            return message('material_sync_failed', reason='The configured requirement checkout changed or is invalid')
+        budget = (datetime.fromisoformat(trial['deadline_at']) - store.now).total_seconds()
+
+    try:
+        receipt = sync_requirement(checkout, budget)
+    except (OSError, ValueError) as error:
+        return message('material_sync_failed', reason=str(error))
+
+    with transaction(database) as conn:
+        _, trial = active_trial(Ledger(conn, config, now or datetime.now(timezone.utc)))
+        if trial is None:
+            return message('material_sync_inactive')
+        conn.execute('INSERT OR IGNORE INTO requirement_sync_receipts(attempt_id, receipt) VALUES (?, ?)',
+                     (trial['attempt_id'], encode(receipt)))
+        saved = conn.execute('SELECT receipt FROM requirement_sync_receipts WHERE attempt_id=?',
+                             (trial['attempt_id'],)).fetchone()
+    return message('material_synced', **json.loads(saved['receipt']))
+
+
 def run(command, data, config, database, *, now=None, config_directory=CONFIG_PATH.parent):
     validate_config(config)
     dependency_locations(config, config_directory)
@@ -86,6 +132,8 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
     action = require_text(data.get('action'), 'action')
     if command == 'record' and action == 'runtime_check':
         return runtime_check(require_text(data.get('chat_id'), 'chat_id'))
+    if command == 'record' and action == 'material_sync':
+        return sync_material_attempt(database, config, data, now, config_directory)
     check_time = now or datetime.now(timezone.utc)
     if command == 'record' and action in ('branch_inspect', 'branch_prepare'):
         context = read_branch_attempt(database, config, data, check_time, config_directory)

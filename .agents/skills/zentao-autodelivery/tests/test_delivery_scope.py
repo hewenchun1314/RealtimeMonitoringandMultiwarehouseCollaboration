@@ -67,7 +67,7 @@ class DeliveryScopeTests(unittest.TestCase):
             validate_config(self.config)
         service = dict(repository='.', branch='main', build_command='make', test_command='make test',
                        acceptance_command='make smoke', service_url='http://localhost:1234')
-        self.config['workspaces'] = {'backend': '../services'}
+        self.config['workspaces']['backend'] = '../services'
         del dev['frontend_bundle']
         self.config.pop('e2e', None)
         self.config.pop('backend_dependencies', None)

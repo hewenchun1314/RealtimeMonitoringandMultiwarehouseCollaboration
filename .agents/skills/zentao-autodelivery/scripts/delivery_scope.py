@@ -63,6 +63,17 @@ def _markers(body):
     return values
 
 
+def material_location(config, config_directory, value):
+    workspace = config.get('workspaces', {}).get('requirement')
+    if not isinstance(workspace, str) or not isinstance(value, str) or not value.strip():
+        raise ValueError('Reviewed intent.md path and workspaces.requirement required')
+    root = (Path(config_directory) / workspace).resolve()
+    path = (root / value).resolve()
+    if not path.is_relative_to(root) or path.name != 'intent.md':
+        raise ValueError('Reviewed material must be intent.md under the requirement workspace')
+    return root, path
+
+
 def read_material(config, config_directory, kind, evidence):
     if not isinstance(evidence, dict):
         raise ValueError('Material review evidence required')
@@ -73,14 +84,7 @@ def read_material(config, config_directory, kind, evidence):
         raw = body.encode('utf-8')
         source = 'bug.detail'
     else:
-        workspace = config.get('workspaces', {}).get('requirement')
-        value = evidence.get('path')
-        if not isinstance(workspace, str) or not isinstance(value, str) or not value.strip():
-            raise ValueError('Reviewed intent.md path and workspaces.requirement required')
-        root = (Path(config_directory) / workspace).resolve()
-        path = (root / value).resolve()
-        if not path.is_relative_to(root) or path.name != 'intent.md':
-            raise ValueError('Reviewed material must be intent.md under the requirement workspace')
+        root, path = material_location(config, config_directory, evidence.get('path'))
         try:
             raw = path.read_bytes()
             body = raw.decode('utf-8-sig')

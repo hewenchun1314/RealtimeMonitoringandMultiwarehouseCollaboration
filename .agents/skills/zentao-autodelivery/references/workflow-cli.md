@@ -1,6 +1,6 @@
 # 账本命令
 
-在项目根目录从标准输入传入一个 JSON 请求。命令为 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py claim` 或 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`。隔离验收用 `--config PATH --database PATH` 指向临时配置和临时 SQLite。命令管理本地账本并提供只读 Git 核验。建工作树、运行 Agent 和禅道写入由当前聊天执行。
+在项目根目录从标准输入传入一个 JSON 请求。命令为 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py claim` 或 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`。隔离验收用 `--config PATH --database PATH` 指向临时配置和临时 SQLite。命令管理本地账本，并提供 Git 核验、需求仓库同步和工单工作树准备。运行 Agent 和禅道写入由当前聊天执行。
 
 工单键 `item` 包含 `instance`、`project_id`、`kind`、`id`。项目 ID 来自经实际查询确认的禅道项目，项目和工单 ID 用正整数或相应数字字符串，`kind` 为 `story` 或 `bug`。桌面项目 ID 从当前可用的桌面项目接口确认，使用独立字段 `desktop_project_id`。配置可通过 `runtime.desktop_project_id` 额外固定桌面项目 ID。
 
@@ -40,7 +40,7 @@
 
 ### 工单动作
 
-每个改变账本的请求提供 `action`、稳定的 `event_id` 和 `item`。重复提交同一逻辑事件时保留原事件 ID 和原数据。收到带 `replayed:true` 的回执时核对当前账本，按已发生的原操作继续。只读 `branch_inspect` 和 `runtime_check` 不需要 `event_id`。以下为各操作另外需要的字段。
+改变账本的通用事件请求提供 `action`、稳定的 `event_id` 和 `item`。重复提交同一逻辑事件时保留原事件 ID 和原数据。收到带 `replayed:true` 的回执时核对当前账本，按已发生的原操作继续。`material_sync` 用 `attempt_id` 保存成功回执。`branch_inspect` 和 `runtime_check` 是只读操作。以下为各操作另外需要的字段。
 
 | `action` | 请求字段及用法 |
 | --- | --- |
@@ -51,6 +51,7 @@
 | `expire_dispatch` | `request_id`。核对未领取执行权的过期派发。 |
 | `resolve_dispatch` | `request_id`、`not_created:true` 和非空 `evidence`。有明确证据证明旧请求未创建聊天时，用于释放待建状态。 |
 | `attempt_start` | `request_id`、`chat_id`、`stage`。保存返回的 `attempt_id`、`started_at`、`phase_started_at`、`deadline_at`、`retry_number` 和 `phase`。新单的 `phase` 为 `verify` 或返工的实际分段名。旧单沿用 `repair_coding` 等原分段。按回执的角色和截止时间执行，`attempt_active` 表示原尝试仍存在。 |
+| `material_sync` | `item`、`request_id`、`chat_id`、有效的 Story 材料评审 `attempt_id`。返回 `material_synced` 及快进后核对的 `branch`、`upstream`、`commit`。`material_sync_failed` 包含失败原因。`material_sync_inactive` 表示尝试过期或绑定无效。 |
 | `branch_inspect` | `request_id`、`chat_id`、有效分支核验 `attempt_id`。可传 `worktrees`（应用配置键对应的工作树绝对路径）。首次调用解析分支，准备好工作树后再次调用验证真实提交和工单分支。参照 [分支核验与工作树](branches.md) 处理每项状态。 |
 | `branch_prepare` | `request_id`、`chat_id`、有效分支核验 `attempt_id`、目标 `application`（前端）或 `service`（后端），以及 `desktop_reconciliation` 对象，含 `status`（`no_receipt`、`failed` 或 `unavailable`）和非空 `evidence`。对账后按固定路径创建或恢复核验过的 Git worktree，以实际路径继续。此操作不改变 SQLite 阶段。 |
 | `repair_advance` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`summary` 和本分段的成功 `evidence`。获得新的 `repair_advanced` 后，使用同一 `attempt_id` 执行返回的下一分段及其新截止时间。重放返回 `phase_already_advanced`，需对账当前分段。 |

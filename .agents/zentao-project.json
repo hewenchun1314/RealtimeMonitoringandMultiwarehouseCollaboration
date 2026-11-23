@@ -19,6 +19,7 @@
     "interval_minutes": 60
   },
   "runtime": {
+    "sync_requirement_before_review": true,
     "split_task_sync": true,
     "split_task_progress_sync": true,
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",

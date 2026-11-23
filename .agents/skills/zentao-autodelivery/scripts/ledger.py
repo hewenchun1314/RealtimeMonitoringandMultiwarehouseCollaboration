@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     UNIQUE(item_seq, run_round, stage, retry_number)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS single_attempt ON attempts(item_seq) WHERE outcome IS NULL;
+CREATE TABLE IF NOT EXISTS requirement_sync_receipts (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+    receipt TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS deployment_claims (
     attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
     item_seq INTEGER NOT NULL REFERENCES work_items(seq)
@@ -274,9 +278,12 @@ def validate_config(config):
         side, _, name = target.partition(':')
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
-    for key in ('split_task_sync', 'split_task_progress_sync'):
+    for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review'):
         if key in runtime and type(runtime[key]) is not bool:
             raise ValueError(f'runtime.{key} must be a boolean')
+    if runtime.get('sync_requirement_before_review'):
+        require_text(require_mapping(config.get('workspaces'), 'workspaces').get('requirement'),
+                     'workspaces.requirement')
     if 'desktop_project_id' in runtime:
         require_text(runtime['desktop_project_id'], 'runtime.desktop_project_id')
     if 'require_unattended_approval' in runtime and type(runtime['require_unattended_approval']) is not bool:
