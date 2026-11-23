@@ -101,7 +101,7 @@ def reserve(store, data):
     if scope is None or scope['project_name'] != zentao['project_name']:
         return message('scope_mismatch')
     in_use = store.conn.execute('''SELECT COUNT(*) FROM work_items
-                                  WHERE state IN ('reserved','bound','running','closing')''').fetchone()[0]
+                                  WHERE state IN ('reserved','bound','running','closing','review_handoff')''').fetchone()[0]
     if in_use >= store.config['development']['max_concurrent_items']:
         return message('busy')
     head = candidate(store.conn, *requested[:2])

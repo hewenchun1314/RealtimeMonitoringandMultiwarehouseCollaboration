@@ -195,8 +195,12 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
                 response['replayed'] = True
             return response
         item = store.find_item(data.get('item'))
-        if action.startswith('writeback_') and find_entry(store, item, data)['operation_type'].startswith('task_'):
-            return message('task_sync_required')
+        if action.startswith('writeback_'):
+            operation_type = find_entry(store, item, data)['operation_type']
+            if operation_type.startswith('task_'):
+                return message('task_sync_required')
+            if operation_type == 'story_review':
+                return message('story_review_worker_required')
         if action == 'attempt_finish':
             response = attempt_finish(store, item, data, branches_verified=branches_verified,
                                       config_directory=config_directory)

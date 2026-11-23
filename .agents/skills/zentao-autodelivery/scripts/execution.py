@@ -1,6 +1,7 @@
 """Work-chat binding, attempts, stage progression and closeout."""
 
 import json
+import re
 from datetime import timedelta
 from uuid import uuid4
 
@@ -187,7 +188,14 @@ def material_sync_required(store, item):
             and store.config.get('runtime', {}).get('sync_requirement_before_review', False))
 
 
+def story_review_enabled(item):
+    return (item['kind'] == 'story' and is_routed(item)
+            and snapshot(item).get('runtime', {}).get('story_review_sync', False))
+
+
 def attempt_start(store, item, data, *, config_directory, deployment_worker=False):
+    if item['state'] in ('review_handoff', 'review_wait', 'review_ready') and execution_matches(store, item, data):
+        return message('story_review_pending')
     if not execution_matches(store, item, data) or item['state'] != 'running':
         return message('stale_execution')
     if data.get('stage') != item['stage']:
@@ -197,6 +205,8 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
     preparation = branch_context(store, item) if item['stage'].rsplit('.', 1)[-1] == 'branch_check' else {}
     if material_sync_required(store, item):
         preparation['material_sync_required'] = True
+    if item['stage'] == 'material_check' and story_review_enabled(item):
+        preparation['story_review_required'] = True
     routed = is_routed(item)
     if routed:
         preparation['route'] = get_split(store, item)
@@ -360,6 +370,19 @@ def enqueue_note(store, item, label, text):
     return operation_id
 
 
+def story_review_payload(item, target, result, summary):
+    if (not isinstance(target, dict) or any(not isinstance(target.get(key), str)
+            or not re.fullmatch(pattern, target[key]) for key, pattern in (
+                ('version', r'[1-9][0-9]*'), ('round', r'[1-9][0-9]*'), ('account', r'[A-Za-z0-9_.@-]+'),
+                ('status', r'reviewing|active')))):
+        raise ValueError('禅道评审需要实际读回的需求版本、评审轮次、状态和评审账号')
+    target = {key: target[key] for key in ('version', 'round', 'account', 'status')}
+    operation_id = f'{item["marker"]}/{item["run_round"]}/story-review'
+    vote_key = f'{item["marker"]}/review/{target["version"]}/{target["round"]}/{target["account"]}'
+    comment = f'{summary} [{operation_id}] [{vote_key}]'
+    return operation_id, {**target, 'result': result, 'comment': comment, 'vote_key': vote_key}
+
+
 def attempt_finish(store, item, data, branches_verified=False, config_directory=None, *, deployment_worker=False):
     if not execution_matches(store, item, data):
         return message('stale_execution')
@@ -409,6 +432,9 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         evidence = evidence.copy()
     missing_file = (item['kind'] == 'story' and stage == 'material_check' and outcome == 'failed'
                     and isinstance(evidence, dict) and evidence.get('material_file_status') == 'missing')
+    story_review = stage == 'material_check' and story_review_enabled(item)
+    clarification = (story_review and outcome == 'failed' and isinstance(evidence, dict)
+                     and evidence.get('material_review_status') == 'needs_clarification')
     sync_required = material_sync_required(store, item)
     sync_receipt = None
     if sync_required:
@@ -416,12 +442,12 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                                  (attempt_id,)).fetchone()
         if row:
             sync_receipt = json.loads(row['receipt'])
-        elif finished or missing_file:
+        elif finished or missing_file or clarification:
             return message('material_sync_required')
-    if sync_receipt and (finished or missing_file):
+    if sync_receipt and (finished or missing_file or clarification):
         try:
             path = None
-            if finished or evidence.get('path'):
+            if finished or clarification or evidence.get('path'):
                 root, intent = material_location(config, config_directory,
                                                  evidence.get('path') if isinstance(evidence, dict) else None)
                 path = intent.relative_to(root).as_posix()
@@ -429,6 +455,25 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                 root = requirement_checkout(config, config_directory)
             verify_requirement_intent(root, sync_receipt['commit'], path, missing=missing_file)
         except (ValueError, OSError) as exc:
+            return message('evidence_required', reason=str(exc))
+    review = None
+    if story_review and (finished or missing_file or clarification):
+        target_row = store.conn.execute('SELECT target FROM story_review_targets WHERE attempt_id=?', (attempt_id,)).fetchone()
+        if not target_row:
+            return message('evidence_required', reason='评审前须通过 Windows 启动器取得本次尝试的禅道评审目标')
+        comment = summary
+        if finished:
+            path = evidence.get('path') if isinstance(evidence, dict) else None
+            comment += f'。需求材料：{path or "未登记"}'
+            if sync_receipt:
+                comment += f'，Git 提交：{sync_receipt["commit"]}'
+        try:
+            if clarification and not missing_file:
+                read_material(config, config_directory, item['kind'], evidence)
+            target = json.loads(target_row['target'])
+            review = story_review_payload(item, target, 'pass' if finished else 'clarify', comment)
+            evidence = {**(evidence or {}), 'review_target': target}
+        except ValueError as exc:
             return message('evidence_required', reason=str(exc))
     route = None
     current_route, history = read_history(store, item) if routed else (None, {})
@@ -463,7 +508,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     stages = stages_for(store, item, route)
     if sync_receipt:
         evidence = {**(evidence if isinstance(evidence, dict) else {}), 'requirement_sync': sync_receipt}
-    retry = (not finished and not missing_file and data.get('retryable', True)
+    retry = (not finished and not missing_file and not clarification and data.get('retryable', True)
              and trial['retry_number'] < development['max_retries_per_step'])
     if routed and repair_required and data.get('contract_changed') and revision_count(store, item) >= development['max_retries_per_step']:
         retry = False
@@ -487,7 +532,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     number = stages.index(stage)
     no_work = route and route['blockers'] and not any(route['tasks'].values())
     unresolved_contract = routed and not finished and (phase == 'split' or (repair_required and data.get('contract_changed')))
-    stop_route = (missing_file or (sync_required and not finished) or no_work or unresolved_contract or
+    stop_route = (missing_file or ((sync_required or story_review) and not finished) or no_work or unresolved_contract or
                   (routed and (stage in ('split', 'handoff', DEPLOY_STAGE) or phase == DEPLOY_STAGE) and not finished))
     next_stage = stages[number + 1] if not stop_route and number + 1 < len(stages) else None
     recorded_blockers = dict(reported or {}) if not retry else {}
@@ -527,7 +572,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         result['repair_sequence'] = (v2_repair(stage, data, get_split(store, item)) if repair_required
                                      else prior_repair_sequence(store, item))
     if not finished and not retry:
-        result['completion'] = '待补材料' if missing_file else data.get('completion', '阻断')
+        result['completion'] = '待补材料' if missing_file or clarification else data.get('completion', '阻断')
         if result['completion'] not in ('待补材料', '待验证', '阻断'):
             raise ValueError('Invalid completion for a blocked step')
     store.conn.execute('UPDATE attempts SET ended_at=?,outcome=?,result=? WHERE attempt_id=?',
@@ -553,7 +598,12 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         if recorded_blockers:
             note += ' 受阻任务：' + '；'.join(f'{key} {reason}' for key, reason in recorded_blockers.items()) + '。'
         operation_id = enqueue_note(store, item, stage, note)
-        if next_stage:
+        if review:
+            enqueue(store, item, review[0], 'story_review', review[1])
+            disposition = 'review_wait'
+            next_stage = None
+            store.update_item(item, state='review_handoff')
+        elif next_stage:
             disposition = 'next'
             store.update_item(item, stage=next_stage)
         else:
@@ -567,7 +617,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             disposition = 'close' if conclusion == '已交付' else 'blocked'
             store.update_item(item, state='closing', conclusion=conclusion)
     return message('attempt_finished', attempt_id=attempt_id, step=stage, next_stage=next_stage, outcome=outcome,
-                   attempts_used=trial['retry_number'] + 1, disposition=disposition, operation_id=operation_id)
+                   attempts_used=trial['retry_number'] + 1, disposition=disposition, operation_id=operation_id,
+                   **({'review_operation_id': review[0]} if review else {}))
 
 
 def terminal_steps(store, item):
@@ -601,7 +652,7 @@ def ordered_steps(store, item, order, results, route=None):
     skip_reason = ('因用户要求主动停跑而跳过' if item['conclusion'] == '主动停跑'
                    else f'因 {item["stage"]} 阻断跳过')
     if item['stage'] == 'material_check' and item['conclusion'] == '待补材料':
-        skip_reason = '因需求评审确认缺少需求文件而跳过'
+        skip_reason = '因需求评审确认材料待补充或待明确而跳过'
     for stage in order:
         step = results.get(stage)
         if step is None:
@@ -644,6 +695,16 @@ def complete(store, item, data):
     points = [f'{STAGE_NAMES[step["stage"]]}{statuses[step["outcome"]]}（{step["summary"]}）' for step in steps]
     note = '，'.join(points) + f'。本单收尾为「{conclusion}」。'
     extra = {}
+    formal = store.conn.execute('''SELECT receipt FROM writebacks WHERE item_seq=? AND run_round=?
+                                   AND operation_type='story_review' AND state='confirmed' ''',
+                                (item['seq'], item['run_round'])).fetchone()
+    if formal:
+        review = json.loads(formal['receipt'])
+        extra['story_review'] = review
+        if review.get('progress') == 'clarified':
+            note += f' 禅道已记录「有待明确」（操作 #{review["action_id"]}）。'
+        elif review.get('progress') == 'blocked':
+            note += f' 禅道评审阻断：{review["reason"]}。'
     if is_routed(item):
         route, stages = read_history(store, item)
         if route:
@@ -684,7 +745,7 @@ def complete(store, item, data):
 
 
 def stop(store, item, data):
-    if item['state'] != 'running' or not execution_matches(store, item, data):
+    if item['state'] not in ('running', 'review_handoff', 'review_wait', 'review_ready') or not execution_matches(store, item, data):
         return message('stale_execution')
     if active_attempt(store, item):
         return message('attempt_active')
@@ -693,6 +754,14 @@ def stop(store, item, data):
             or type(evidence.get('owned_processes_active_after_stop')) is not int
             or evidence['owned_processes_active_after_stop'] != 0):
         return message('stop_unverified')
+    if item['state'] in ('review_handoff', 'review_wait', 'review_ready'):
+        if store.conn.execute('''SELECT 1 FROM writebacks WHERE item_seq=? AND run_round=?
+                                  AND operation_type='story_review' AND state='sending' AND expires_at>?''',
+                              (item['seq'], item['run_round'], store.time)).fetchone():
+            return message('story_review_busy')
+        store.conn.execute('''UPDATE writebacks SET state='superseded' WHERE item_seq=? AND run_round=?
+                              AND operation_type='story_review' AND state!='confirmed' ''',
+                           (item['seq'], item['run_round']))
     store.update_item(item, state='closing', conclusion='主动停跑')
     return complete(store, store.find_item(item_identity(item)), data)
 

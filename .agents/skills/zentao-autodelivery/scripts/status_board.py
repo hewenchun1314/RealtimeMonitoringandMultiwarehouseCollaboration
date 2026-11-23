@@ -16,13 +16,16 @@ from route_execution import read_history
 
 
 SECTIONS = (
-    ('执行中', ('reserved', 'bound', 'running', 'closing')),
+    ('执行中', ('reserved', 'bound', 'running', 'closing', 'review_handoff')),
+    ('等待禅道评审', ('review_wait', 'review_ready')),
     ('排队中', ('queued', 'dispatch_uncertain')),
     ('已收尾', ('completed',)),
 )
 STATES = {
     'reserved': '已领取', 'bound': '待启动', 'running': '执行中', 'closing': '收尾中',
     'queued': '排队中', 'dispatch_uncertain': '待核对派发', 'completed': '已收尾',
+    'review_wait': '等待禅道评审', 'review_ready': '评审已核对，待续接',
+    'review_handoff': '等待评审执行交接',
 }
 
 
@@ -72,6 +75,12 @@ def table_row(item, base_url, delivery='', tasks=()):
     if item['state'] == 'queued' and item['dispatch_state'] == 'runtime_blocked':
         status = '待核验无人值守权限'
     progress = STAGE_NAMES.get(item['stage'], '—')
+    if item['state'] in ('review_wait', 'review_ready') and item['review_receipt']:
+        review = json.loads(item['review_receipt'])
+        if review.get('progress') == 'waiting_votes':
+            progress = '已提交通过，等待其他评审结果'
+        elif review.get('reason'):
+            progress = review['reason']
     if item['retry_number'] is not None:
         progress += f'（第 {item["retry_number"] + 1} 次尝试）'
         if item['phase'] and item['phase'] != 'verify':
@@ -94,6 +103,8 @@ def publish_status(database, config):
                             scope).fetchone()
         rows = [] if scan is None else conn.execute('''
             SELECT w.*, a.retry_number, a.phase, d.state AS dispatch_state,
+                   (SELECT b.receipt FROM writebacks b WHERE b.item_seq=w.seq AND b.run_round=w.run_round
+                    AND b.operation_type='story_review' LIMIT 1) AS review_receipt,
                    (SELECT COUNT(*) FROM writebacks b WHERE b.item_seq=w.seq
                     AND b.state NOT IN ('confirmed','superseded')) AS pending
             FROM work_items w

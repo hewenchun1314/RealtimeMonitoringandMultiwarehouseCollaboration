@@ -69,6 +69,16 @@
 
 同步失败时，使用原尝试登记实际原因和运行回执，再按账本重试。重试耗尽则收尾为「阻断」。账本取得该尝试的同步成功回执后才接受评审成功或「待补材料」。评审成功时账本核对本地 `intent.md` 与该提交一致。若已知材料目录但文件缺失，随 `material_file_status:"missing"` 提供预期 `evidence.path`，账本在同步提交中核对该路径。
 
+## 禅道正式评审
+
+启用 `runtime.story_review_sync` 的新 Story 领取后，`material_check` 的 `attempt_start` 返回 `story_review_required:true`。在本次尝试开始后、派发需求评审 Agent 前，从项目根目录执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py review-target --marker <marker>`。取得 `review_target_verified` 回执后，把禅道版本、轮次和材料 Git 提交交给评审 Agent。启动器将目标写入当前尝试的账本。目标读取失败按执行故障登记及重试。
+
+评审 Agent 提交 `attempt_finish` 的材料结论，沿用 `evidence.path`。材料通过时提交 `success`，系统生成「通过」及材料路径和版本。明确缺少文件时提交 `failed` 和 `evidence.material_file_status:"missing"`。文件可读但有已核实的关键缺项时提交 `failed`、实际 `evidence.path` 和 `evidence.material_review_status:"needs_clarification"`。失败的 `summary` 写明具体缺项、影响和需要补什么，系统将它作为「有待明确」的评审备注。同步、权限或超时等执行故障按普通失败处理。
+
+`disposition:review_wait` 表示已将正式评审加入同一事务的回写待办，结束当前工单轮次。Windows 启动器确认工单轮次及其受控进程停止后，释放研发名额，再用原 Story 的禅道 22.6 正式评审表单提交。原生提交按 Story ID 执行，启动器在提交前核对版本、轮次和账号，提交后读回实际评审历史。已核实的通过意见等到 Story 激活再进入拆分。「有待明确」读回后按「待补材料」收尾。材料通过且评审前已激活的 Story 沿用禅道状态。暂时无法读回的提交保留待对账，出现版本或轮次变更则收尾为「阻断」，由原工单重新评审。监测轮次持续核对并用原会话续接。
+
+提交结果不明且后续一直没有回执时，确认上一次请求已结束后，可运行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py review-reconcile --marker <marker> --prior-ended`。程序重新检查禅道历史与本轮待评审资格，并在原写入租约结束后恢复这条待办。监测轮次负责下一次提交。
+
 ## 超时和受控停止
 
 1. 开始每次尝试前，在对应工具中确认能够按时限停止执行。登记实际 Agent 或工具会话及其启动的受控进程归属。进程身份至少核对 PID、启动时间和所属尝试，保留启动工作区或等效证据。

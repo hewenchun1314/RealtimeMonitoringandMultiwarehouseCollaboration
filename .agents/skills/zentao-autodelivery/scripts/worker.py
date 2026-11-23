@@ -19,9 +19,13 @@ from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
 from deploy_state import FRONTEND_DEPLOY_STAGE
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
-from ledger import validate_config
+from ledger import Ledger, encode, item_identity, transaction, validate_config
 from frontend_release_runner import run_frontend_release
-from stage_runner import run_stage, utc_now
+from stage_runner import recover_job_stop, run_stage, utc_now
+from status_board import publish_status
+from story_review_remote import StoryReviewRemote
+from story_review_sync import rearm_uncertain, release_handoff, resume_ready, sync_review
+from task_remote import RemoteRejected
 from task_sync import enabled as task_sync_enabled
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 
@@ -79,6 +83,8 @@ def worker_prompt(operation, item):
         '每次阶段尝试使用账本截止时间及阶段运行器。'
         '材料评审返回 material_sync_required 时，先按步骤指引运行 record material_sync，'
         '取得 material_synced 回执后才派发需求评审；同步失败按原尝试登记。'
+        '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
+        '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
         '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
@@ -114,15 +120,17 @@ def launch_turn(cli, operation, item, output, deadline):
     prompt_file = output / f'{run_id}.txt'
     prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
     launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
+    options = {'recoverable': True} if (operation == 'run' and
+               json.loads(item['config_snapshot']).get('runtime', {}).get('story_review_sync')) else {}
     if operation != 'run' or not task_sync_enabled(item):
-        return run_stage(*launch), None
+        return run_stage(*launch, **options), None
     stop = Event()
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(run_stage, run_id, 'task-sync', deadline, PROJECT_ROOT, output, None,
                                  sync_command('--marker', item['marker'], '--chat-id', item['chat_id']),
-                                 stop_event=stop)
+                                 stop_event=stop, **options)
         try:
-            receipt = run_stage(*launch)
+            receipt = run_stage(*launch, **options)
         finally:
             stop.set()
         return receipt, future.result()
@@ -137,7 +145,26 @@ def worker_result(receipt, sync_receipt):
     return result
 
 
-def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False):
+def review_handoff_stopped(output, item):
+    turns = list(output.glob('*/run'))
+    if not turns:
+        return False
+    turn = max(turns, key=lambda path: path.stat().st_mtime_ns)
+    phases = [turn, turn.parent / 'task-sync'] if task_sync_enabled(item) else [turn]
+    try:
+        for phase in phases:
+            receipt = phase / 'result.json'
+            if receipt.is_file() and json.loads(receipt.read_text(encoding='utf-8')).get('stop_confirmed') is True:
+                continue
+            launch = json.loads((phase / 'launch.json').read_text(encoding='utf-8'))
+            if not recover_job_stop(launch):
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False, recover_review=None):
     deadline = deadline or utc_now() + timedelta(hours=72)
 
     def peek():
@@ -150,8 +177,25 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     while utc_now() < deadline:
         state = pending['status']
         item = read_item(marker)
-        if not item or item['state'] not in ('bound', 'running', 'closing'):
+        if not item or item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready'):
             return last_turn or {'status': 'worker_released'}
+        if item['state'] == 'review_handoff':
+            if last_turn.get('status') != 'worker_stopped' and not (recover_review and recover_review(item)):
+                return {**last_turn, 'status': 'worker_review_stop_unverified'}
+            config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+            release_handoff(DATABASE_PATH, config, item_identity(item))
+            continue
+        if item['state'] in ('review_wait', 'review_ready'):
+            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
+                return {**last_turn, 'status': 'worker_review_wait', 'story_review': {'status': 'review_runtime_blocked'}}
+            config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+            review = sync_item_review(config, item)
+            if review['status'] == 'review_ready':
+                review = resume_ready(DATABASE_PATH, config, item_identity(item))
+            if review['status'] != 'review_resumed':
+                return {**last_turn, 'status': 'worker_review_wait', 'story_review': review}
+            pending = peek()
+            continue
         if state == 'deployment_pending':
             frontend = pending.get('stage') == FRONTEND_DEPLOY_STAGE
             release_key = 'frontend_deployment' if frontend else 'backend_deployment'
@@ -182,6 +226,9 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             last_turn[release_key] = last_deployment
         if last_turn['status'] != 'worker_stopped':
             return last_turn
+        current = read_item(marker)
+        if current and current['state'] in ('review_handoff', 'review_wait', 'review_ready'):
+            continue
         pending = peek()
         if pending['status'] == 'deployment_not_pending':
             return last_turn
@@ -216,7 +263,8 @@ def run(operation, marker, cli):
             item = read_item(marker)
             if operation == 'prepare' and (item['state'] != 'reserved' or item['chat_id']):
                 raise ValueError('Preparing requires a reserved and unbound work item')
-            if operation == 'run' and (item['state'] not in ('bound', 'running', 'closing') or not item['chat_id']):
+            if operation == 'run' and (item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready')
+                                       or not item['chat_id']):
                 raise ValueError('Running requires an active ledger binding')
         if operation == 'prepare':
             run_id = UUID(item['request_id']).hex
@@ -233,7 +281,7 @@ def run(operation, marker, cli):
         if operation == 'run':
             return dispatch_work_item(
                 marker, lambda current: launch_turn(cli, operation, current, output, deadline), deadline,
-                recover_deployment=True)
+                recover_deployment=True, recover_review=lambda current: review_handoff_stopped(output, current))
         receipt, _ = launch_turn(cli, operation, item, output, deadline)
         if operation == 'prepare':
             return prepared_result(receipt)
@@ -243,6 +291,102 @@ def run(operation, marker, cli):
 
 def sync_command(*args):
     return [sys.executable, '-B', str(Path(__file__).with_name('task_sync_runner.py')), *args]
+
+
+def review_remote(config, item):
+    admitted = json.loads(item['config_snapshot'])
+    for key in ('base_url', 'credential_ref', 'project_name'):
+        if config['zentao'].get(key) != admitted['zentao'].get(key):
+            raise RemoteRejected('当前禅道配置与工单快照不匹配')
+    return StoryReviewRemote(admitted)
+
+
+def read_review_target(marker):
+    item = read_item(marker)
+    if (not item or item['kind'] != 'story' or item['state'] != 'running' or item['stage'] != 'material_check'
+            or not json.loads(item['config_snapshot']).get('runtime', {}).get('story_review_sync')
+            or runtime_check(item['chat_id'])['status'] != 'runtime_unattended'):
+        return {'status': 'review_target_inactive'}
+    config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+    with transaction(DATABASE_PATH) as conn:
+        attempt = review_target_attempt(conn, config, item)
+        if not attempt:
+            return {'status': 'review_target_inactive'}
+        if attempt['target']:
+            return {'status': 'review_target_verified', 'target': json.loads(attempt['target'])}
+    try:
+        target = review_remote(config, item).observe(item)['target']
+    except RemoteRejected as error:
+        return {'status': 'review_target_failed', 'reason': str(error)}
+    if target['status'] not in ('active', 'reviewing'):
+        return {'status': 'review_target_failed', 'reason': '禅道需求当前未处于接单所需的评审中或激活状态'}
+    with transaction(DATABASE_PATH) as conn:
+        current = review_target_attempt(conn, config, item)
+        if not current or current['attempt_id'] != attempt['attempt_id']:
+            return {'status': 'review_target_inactive'}
+        if current['target']:
+            target = json.loads(current['target'])
+        else:
+            conn.execute('INSERT INTO story_review_targets(attempt_id,target) VALUES (?,?)',
+                         (attempt['attempt_id'], encode(target)))
+        return {'status': 'review_target_verified', 'target': target}
+
+
+def review_target_attempt(conn, config, item):
+    now = Ledger(conn, config, utc_now()).time
+    return conn.execute('''SELECT a.attempt_id,t.target FROM attempts a
+                           JOIN work_items w ON w.seq=a.item_seq AND w.run_round=a.run_round
+                           LEFT JOIN story_review_targets t ON t.attempt_id=a.attempt_id
+                           WHERE a.item_seq=? AND a.stage='material_check' AND a.outcome IS NULL
+                           AND a.deadline_at>? AND w.request_id=? AND w.state='running' AND w.stage=a.stage''',
+                        (item['seq'], now, item['request_id'])).fetchone()
+
+
+def sync_item_review(config, item):
+    try:
+        remote = review_remote(config, item)
+    except RemoteRejected as error:
+        return {'status': 'review_retry', 'reason': str(error)}
+    result = sync_review(DATABASE_PATH, config, remote, item_identity(item))
+    try:
+        publish_status(DATABASE_PATH, config)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f'Status page refresh failed: {error}', file=sys.stderr)
+    return result
+
+
+def reconcile_review(marker, prior_ended):
+    if not prior_ended:
+        return {'status': 'review_prior_request_unverified'}
+    item = read_item(marker)
+    if not item or item['state'] != 'review_wait':
+        return {'status': 'review_not_rearmable'}
+    config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+    remote = review_remote(config, item)
+    return rearm_uncertain(DATABASE_PATH, config, remote, item_identity(item), prior_ended=prior_ended)
+
+
+def sync_monitor_reviews(config):
+    if not DATABASE_PATH.is_file():
+        return {'checked': [], 'ready': []}
+    zentao = config['zentao']
+    scope = (zentao['base_url'].rstrip('/'), zentao['project_name'])
+    with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        projects = conn.execute('SELECT project_id FROM scans WHERE instance=? AND project_name=?', scope).fetchall()
+        if len(projects) != 1:
+            return {'checked': [], 'ready': []}
+        items = conn.execute('''SELECT w.* FROM work_items w JOIN writebacks b ON b.item_seq=w.seq
+                                AND b.run_round=w.run_round AND b.operation_type='story_review'
+                                WHERE w.instance=? AND w.project_id=? AND w.state='review_wait'
+                                ORDER BY COALESCE(json_extract(b.receipt,'$.checked_at'), ''), w.seq LIMIT 4''',
+                             (scope[0], projects[0]['project_id'])).fetchall()
+    checked = [{'marker': item['marker'], **sync_item_review(config, item)} for item in items]
+    with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
+        ready = [row[0] for row in conn.execute('''SELECT marker FROM work_items WHERE instance=? AND project_id=?
+                                                   AND state IN ('review_handoff','review_ready') ORDER BY seq''',
+                                               (scope[0], projects[0]['project_id']))]
+    return {'checked': checked, 'ready': ready}
 
 
 def run_monitor_sync():
@@ -255,6 +399,7 @@ def run_monitor_sync():
               'receipt': receipt['receipt_path']}
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        result['story_reviews'] = sync_monitor_reviews(config)
         if dingtalk_enabled(config):
             result['dingtalk'] = dispatch_dingtalk()
     except (OSError, ValueError, TypeError, AttributeError):
@@ -307,25 +452,33 @@ def run_e2e_preflight(profile):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks', 'e2e-preflight'))
+    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks', 'e2e-preflight',
+                                             'review-target', 'review-reconcile'))
     parser.add_argument('--marker')
     parser.add_argument('--profile', type=Path)
+    parser.add_argument('--prior-ended', action='store_true')
     args = parser.parse_args()
     if args.profile and args.operation != 'e2e-preflight':
         parser.error('--profile is only supported for e2e-preflight')
+    if args.prior_ended and args.operation != 'review-reconcile':
+        parser.error('--prior-ended is only supported for review-reconcile')
     cli = codex_directory() / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
     try:
         if args.operation == 'e2e-preflight':
             result = run_e2e_preflight(args.profile)
         elif args.operation == 'sync-tasks':
             result = run_monitor_sync()
+        elif args.operation == 'review-target':
+            result = read_review_target(args.marker)
+        elif args.operation == 'review-reconcile':
+            result = reconcile_review(args.marker, args.prior_ended)
         else:
             result = run(args.operation, args.marker, cli.resolve(strict=True))
     except (OSError, TypeError, ValueError, sqlite3.Error) as error:
         result = {'status': 'worker_error', 'reason': str(error)}
     print(json.dumps(result, ensure_ascii=True))
     return int(result['status'] in ('worker_error', 'worker_deployment_blocked', 'probe_failed', 'task_sync_incomplete',
-                                    'e2e_preflight_blocked', 'e2e_preflight_busy'))
+                                    'e2e_preflight_blocked', 'e2e_preflight_busy', 'worker_review_stop_unverified'))
 
 
 if __name__ == '__main__':

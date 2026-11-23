@@ -25,6 +25,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 
 1. 对账已有工单、派发不明的请求、超时尝试及待写回事项。使用 `record runtime_check` 核对监测聊天的实际权限。只有返回 `runtime_unattended` 才执行需要外部访问的监测或写回。关闭 `monitor.enabled` 或指派白名单为空时，跳过新单扫描和领取。仅在当前请求授权范围内处理已有工单和回写。
    在正式监测会话中执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py sync-tasks`，由受控同步进程按工单快照补办本项目 Task，覆盖已收尾工单。每轮核对回执，保留未完成项供续接。扫描和领取原 Story 备注及附件时，只处理 `comment`、`attachment` 两类操作。
+   `sync-tasks` 也返回 `story_reviews`。按 `ready` 的标识用原 `worker.py run --marker` 续接，遇到 `review_capacity_wait` 留到下一轮。等待禅道评审的工单无需重复扫描领取或重启聊天。
 2. 根据 `zentao.accepted_statuses` 只扫描状态列表非空的工单类型。使用经验证的禅道只读接口分页查询，参考 `zentao-query` 和项目内 `zentao-cron-dashboard`。完整扫描须证明目标项目唯一匹配、工单归属明确、所有启用类型的分页结束且权限有效。只向账本传递指派账号和状态符合配置的工单，指派账号区分大小写。接口失败、权限缺失或分页不完整时，以 `complete:false` 登记部分扫描并保留已有队列。
 3. 调用 `claim` 登记完整扫描，首次记录历史基线，随后按优先级和发现顺序返回待复核队首。项目开启页面 E2E 并配置 `e2e.playwright.preflight_checks` 时，在领取适用工单前运行 `worker.py e2e-preflight`。默认预检使用项目配置，确认本地前端可用、自动登录、工区已选和页面控件可见。凭本轮 `e2e_preflight_passed` 回执推进，失败或运行忙时保留排队状态并记录结果。然后重新读取工单归属、状态和指派人，再调用 `claim` 领取。若返回队首变化，复核新的队首。以事务返回的领取结果确认名额。
 4. 首次派发和后续续接统一使用 [工单启动器](references/worker.md)。首次 `prepare` 用 `never` 创建只回复就绪的工单聊天，读回实际聊天 ID，核对或挂载桌面项目后登记 `record bind`。正式执行调用 `run`，它用 `never` 恢复同一聊天。禁止通过桌面建聊或发送消息工具启动业务轮次。启动器回执不明时，按原派发标记及其证据目录核对，确认停止后才能重试；执行权仍以账本为准。
@@ -41,6 +42,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
    后端阶段把回执里的 `backend_dependencies` 交给对应 Agent。先看业务服务自己的接口、实现与调用链，只有本单实际涉及上游时才按[依赖配置](references/backend.md#上游依赖与修改权限)查契约或登记修改目标。前端仍从已配置业务后端和联调交接获取接口契约。
    当账本进入 `backend.deploy`（含返工分段）或 `frontend.deploy` 时，结束本轮并把执行权交还 Windows 工单启动器。发布执行器自动认领、发布、核验和登记。启动器恢复原工单聊天后，从账本读取发布结果，再继续联调交接或收尾。遇到 `deployment_worker_required` 也走同一交接。前端发布的完成条件见[前端镜像发布](references/frontend-release.md)。
    Story 的材料评审尝试返回 `material_sync_required:true` 时，先用阶段运行器执行 `record material_sync`。取得 `material_synced` 后才派发评审 Agent。同步失败按本次尝试的普通失败处理。命令和回执见[步骤指引](references/stages.md#需求材料同步)。
+   返回 `story_review_required:true` 时按[禅道正式评审](references/stages.md#禅道正式评审)核实评审目标。需求评审 Agent 负责材料结论及理由。`attempt_finish` 返回 `disposition:review_wait` 时结束当前轮次，由 Windows 启动器提交、回读并决定续接。
 3. 使用 `record` 保存步骤、尝试、工单和聊天绑定、实际起止时间、结果、证据与失败原因。阶段结果与待回写记录一起提交。确认失败可重试时按配置执行，默认首次执行后最多重试三次，每次独立计时。
 4. 确认无法继续或用尽重试次数时，登记本步骤失败，按 `next_stage` 继续。下一步缺少必要输入时，记录该步自己的阻断原因并继续推进。写 `blockers.md` 记录工单、受阻步骤、失败证据和尝试、影响的后续步骤及最终结果。账本进入收尾状态后，汇总各步结果，保存「已交付」「待补材料」「待验证」或「阻断」的收尾结果，释放已安全停止的执行名额。
 

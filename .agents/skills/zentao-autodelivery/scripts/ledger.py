@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS writebacks (
     reconcile_required INTEGER NOT NULL DEFAULT 0, receipt TEXT
 );
 CREATE INDEX IF NOT EXISTS pending_writebacks ON writebacks(state, expires_at);
+CREATE TABLE IF NOT EXISTS story_review_targets (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id), target TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS split_task_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
     WHERE operation_type IN ('task_create','task_close','task_reopen');
 CREATE INDEX IF NOT EXISTS split_task_progress_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
@@ -278,7 +281,7 @@ def validate_config(config):
         side, _, name = target.partition(':')
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
-    for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review'):
+    for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync'):
         if key in runtime and type(runtime[key]) is not bool:
             raise ValueError(f'runtime.{key} must be a boolean')
     if runtime.get('sync_requirement_before_review'):
