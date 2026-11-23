@@ -10,6 +10,8 @@ from threading import Event, Thread
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from ledger import Ledger, transaction
+import task_sync
+from task_remote import RemoteRejected
 from task_sync import reconcile_missing, register_split, set_desired, sync_once
 
 
@@ -45,6 +47,17 @@ class Remote:
         if assignee:
             self.tasks[number]['assignee'] = assignee
 
+    def start(self, number, started_at):
+        self.calls.append('start')
+        self.tasks[number]['status'] = 'doing'
+
+    def comment(self, number, text, marker):
+        self.calls.append('comment')
+        self.tasks[number].setdefault('comments', {})[marker] = text
+
+    def has_comment(self, number, marker):
+        return marker in self.tasks[number].get('comments', {})
+
 
 class TaskSyncTests(unittest.TestCase):
     def setUp(self):
@@ -74,6 +87,83 @@ class TaskSyncTests(unittest.TestCase):
     def ready(self):
         with closing(sqlite3.connect(self.database)) as conn, conn:
             conn.execute("UPDATE split_tasks SET retry_at=NULL")
+
+    def test_start_and_blocker_are_scoped_and_receipts_prevent_duplicate_comments(self):
+        self.change(register_split, self.tasks)
+        self.change(task_sync.record_start, 'F1', '2026-11-23T06:10:00Z')
+        for _ in range(2):
+            self.change(task_sync.record_note, 'F1', '开发已合回，部署失败')
+            self.change(task_sync.record_note, 'F2', '等待后端部署')
+        while self.tick():
+            pass
+        self.assertEqual(self.remote.tasks['100']['status'], 'doing')
+        self.assertEqual(self.remote.tasks['101']['status'], 'wait')
+        self.assertEqual(self.remote.calls.count('comment'), 2)
+
+    def test_missing_effort_does_not_block_notes_or_eventual_close(self):
+        self.tasks['tasks']['frontend'].pop()
+        self.change(register_split, self.tasks)
+        self.change(task_sync.record_start, 'F1', '2026-11-23T06:10:00Z')
+        def blocked(*args):
+            raise RemoteRejected('缺少有效工时')
+        self.remote.start = blocked
+        self.change(task_sync.record_note, 'F1', '部署失败')
+        while self.tick():
+            pass
+        task = self.remote.tasks['100']
+        self.assertEqual(task['status'], 'wait')
+        self.assertIn('部署失败', task['comments'].values())
+        self.assertTrue(any('已开工' in note for note in task['comments'].values()))
+        with closing(sqlite3.connect(self.database)) as conn:
+            self.assertIn('缺少有效工时', conn.execute('SELECT last_error FROM split_tasks').fetchone()[0])
+        self.change(set_desired, 'F1', 'closed')
+        while self.tick():
+            pass
+        self.assertEqual(task['status'], 'closed')
+
+    def test_lost_comment_response_is_reconciled_by_marker(self):
+        self.tasks['tasks']['frontend'].pop()
+        self.change(register_split, self.tasks)
+        self.change(task_sync.record_note, 'F1', '部署失败')
+        comment = self.remote.comment
+
+        def lost(*args):
+            comment(*args)
+            raise TimeoutError('response lost')
+
+        self.remote.comment = lost
+        self.tick()
+        self.tick()
+        self.ready()
+        self.tick()
+        self.assertEqual(self.remote.calls.count('comment'), 1)
+
+    def test_deferred_start_retries_with_original_start_time_after_effort_is_available(self):
+        started_at = '2026-11-23T06:10:00Z'
+        self.tasks['tasks']['frontend'].pop()
+        self.change(register_split, self.tasks)
+        self.change(task_sync.record_start, 'F1', started_at)
+        original = self.remote.start
+        starts = []
+
+        def start(task_id, when):
+            starts.append(when)
+            if len(starts) == 1:
+                raise RemoteRejected('缺少有效工时')
+            original(task_id, when)
+
+        self.remote.start = start
+        while self.tick():
+            pass
+        with closing(sqlite3.connect(self.database)) as conn, conn:
+            conn.execute("UPDATE writebacks SET expires_at='2000-01-01' WHERE state='deferred'")
+        while self.tick():
+            pass
+        self.assertEqual(starts, [started_at, started_at])
+        self.assertEqual(self.remote.tasks['100']['status'], 'doing')
+        self.assertEqual(self.remote.calls.count('comment'), 1)
+        with closing(sqlite3.connect(self.database)) as conn:
+            self.assertIsNone(conn.execute('SELECT last_error FROM split_tasks').fetchone()[0])
 
     def test_split_create_close_reopen_and_distinct_new_requirement(self):
         self.change(register_split, self.tasks)

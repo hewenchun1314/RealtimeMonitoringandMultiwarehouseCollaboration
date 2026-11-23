@@ -267,6 +267,37 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
     return decisions
 
 
+def progress_note(task, side, facts, stages, blocked):
+    """Describe an evidenced blocker without turning a dependency wait into an actual start."""
+    block = facts.get('blocked')
+    if not block:
+        for stage in ('frontend.e2e', 'backend.acceptance'):
+            receipt = stages.get(stage, {})
+            result = _receipt(stages, stage, partial=True).get('task_results', {}).get(task, {})
+            if receipt.get('terminal_step') and result.get('outcome') in ('failed', 'pending'):
+                return '联调或验收待通过：' + result['verification'][:300] + '。待问题处理后复验。'
+        return None
+    dependencies = block.get('depends_on')
+    if dependencies:
+        reasons = ['%s（%s）' % (key, blocked[key]['reason']) for key in dependencies]
+        return '等待前置任务：' + '、'.join(reasons) + '。前置任务恢复后继续开发或联调。'
+    if block.get('stage') in (DEPLOY_STAGE, 'frontend.deploy'):
+        repositories = _receipt(stages, side + '.plan').get('task_repositories', {}).get(task, [])
+        merged = _receipt(stages, side + '.integration', partial=True).get('merged_versions', {})
+        versions = [f'{repository} {merged[repository][:12]}' for repository in repositories
+                    if merged.get(repository)]
+        if versions:
+            prefix = '开发已完成，代码已合回（' + '、'.join(versions) + '）。'
+        else:
+            prefix = ''
+        services = _receipt(stages, block['stage'], partial=True).get('services') or {}
+        failures = [f'{repository}：{services[repository]["reason"][:200]}' for repository in repositories
+                    if repository in services and services[repository].get('reason')]
+        kind = '后端' if side == 'backend' else '前端'
+        return prefix + '阻塞于' + kind + '部署：' + '；'.join(failures or [block['reason']]) + '。待部署核验通过后继续。'
+    return '任务受阻：' + block['reason'] + '。解除阻塞后继续。'
+
+
 def refresh(store, item):
     import task_sync
     from deploy_state import configured_targets
@@ -282,7 +313,11 @@ def refresh(store, item):
            WHERE e.item_seq=?''', (item['seq'],))}
     history = {key: json.loads(row['evidence']) for key, row in prior.items()}
     targets = configured_targets(snapshot(item)) if DEPLOY_STAGE in route['stages'] else {}
-    for task, (desired, reason, facts) in evaluate(route, stages, history, deployment_targets=targets).items():
+    decisions = evaluate(route, stages, history, deployment_targets=targets)
+    progress = task_sync.progress_enabled(item)
+    blocked = {key: facts['blocked'] for key, (_, _, facts) in decisions.items() if 'blocked' in facts}
+    sides = {task['id']: side for side, tasks in route['tasks'].items() for task in tasks}
+    for task, (desired, reason, facts) in decisions.items():
         previous = prior.get(task)
         if previous:
             old = history[task]
@@ -312,6 +347,10 @@ def refresh(store, item):
             reason=excluded.reason,evidence=excluded.evidence''',
                            (item['seq'], task, desired, reason, json.dumps(facts, ensure_ascii=False)))
         task_sync.set_desired(store, item, task, desired)
+        if desired == 'open' and progress:
+            note = progress_note(task, sides[task], facts, stages, blocked)
+            if note:
+                task_sync.record_note(store, item, task, note)
 
 
 def first_unverified_stage(store, item):

@@ -2,11 +2,14 @@
 
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
+import sqlite3
 
 from ledger import Ledger, encode, message, require_text, stamp, transaction
 from writeback import claim_writeback, confirm_writeback, lease_matches
+
+OPERATIONS = "('task_create','task_close','task_reopen','task_start','task_note')"
 
 
 def enabled(item):
@@ -15,18 +18,74 @@ def enabled(item):
             and snapshot.get('runtime', {}).get('split_task_sync') is True)
 
 
+def progress_enabled(item):
+    return enabled(item) and json.loads(item['config_snapshot'])['runtime'].get('split_task_progress_sync') is True
+
+
 def task_marker(item, task_key):
     identity = encode([item['instance'], item['project_id'], item['item_id'], task_key])
     return 'ZT-SPLIT-' + hashlib.sha256(identity.encode()).hexdigest()[:32]
 
 
-def queue(store, item, key, action, generation):
+def queue(store, item, key, action, generation, *, details=None, suffix=''):
     marker = task_marker(item, key)
-    operation_id = f'{marker}/{generation}/{action}'
+    operation_id = f'{marker}/{generation}/{action}{suffix}'
     store.conn.execute("""INSERT INTO writebacks(operation_id,item_seq,run_round,operation_type,payload)
                           VALUES(?,?,?,?,?) ON CONFLICT(operation_id) DO NOTHING""",
                        (operation_id, item['seq'], item['run_round'], 'task_' + action,
-                        encode({'key': key, 'marker': marker, 'generation': generation})))
+                        encode({'key': key, 'marker': marker, 'generation': generation, **(details or {})})))
+
+
+def record_start(store, item, key, started_at):
+    task = store.conn.execute('SELECT desired,generation FROM split_tasks WHERE item_seq=? AND task_key=?',
+                              (item['seq'], key)).fetchone()
+    if task and task['desired'] == 'open':
+        queue(store, item, key, 'start', task['generation'], details={'started_at': started_at})
+
+
+def record_note(store, item, key, note):
+    task = store.conn.execute('SELECT desired,generation FROM split_tasks WHERE item_seq=? AND task_key=?',
+                              (item['seq'], key)).fetchone()
+    if task and task['desired'] == 'open':
+        digest = hashlib.sha256(note.encode()).hexdigest()[:32]
+        queue(store, item, key, 'note', task['generation'], details={'note': note}, suffix='/' + digest)
+
+
+def coding_attempt(database, attempt_id, phase, chat_id):
+    if not database.is_file():
+        return False
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=0.2)) as conn:
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("""SELECT w.* FROM work_items w JOIN attempts a ON a.item_seq=w.seq
+            WHERE a.attempt_id=? AND a.outcome IS NULL AND a.phase=? AND w.chat_id=? AND w.state='running'
+            AND CASE WHEN a.phase='verify' THEN a.stage ELSE a.phase END IN ('backend.coding','frontend.coding')""",
+                            (attempt_id, phase, chat_id)).fetchone()
+        return bool(item and progress_enabled(item))
+
+
+def record_coding_start(database, attempt_id, phase, deadline, started_at, chat_id):
+    from route_execution import task_scope
+
+    if not database.is_file() or not chat_id:
+        return
+    with transaction(database, timeout=0.2) as conn:
+        attempt = conn.execute('SELECT * FROM attempts WHERE attempt_id=? AND outcome IS NULL',
+                               (attempt_id,)).fetchone()
+        if not attempt or attempt['phase'] != phase or attempt['deadline_at'] != stamp(deadline):
+            return
+        stage = attempt['stage'] if phase == 'verify' else phase
+        if stage not in ('backend.coding', 'frontend.coding'):
+            return
+        if not attempt['phase_started_at'] <= stamp(started_at) < attempt['deadline_at']:
+            return
+        item = conn.execute('SELECT * FROM work_items WHERE seq=?', (attempt['item_seq'],)).fetchone()
+        if (item['state'] != 'running' or item['stage'] != attempt['stage'] or item['chat_id'] != chat_id
+                or item['run_round'] != attempt['run_round'] or not progress_enabled(item)):
+            return
+        store = Ledger(conn, json.loads(item['config_snapshot']), started_at)
+        scope = task_scope(store, item, stage)
+        for key in (scope or {}).get('active', []):
+            record_start(store, item, key, store.time)
 
 
 def register_split(store, item, route):
@@ -57,6 +116,10 @@ def set_desired(store, item, task_id, desired):
     generation = task['generation'] + 1
     store.conn.execute('UPDATE split_tasks SET desired=?,generation=? WHERE item_seq=? AND task_key=?',
                        (desired, generation, item['seq'], task_id))
+    store.conn.execute("""UPDATE writebacks SET state='superseded'
+        WHERE item_seq=? AND json_extract(payload,'$.key')=? AND operation_type IN ('task_start','task_note')
+        AND state IN ('pending','deferred') AND json_extract(payload,'$.sent') IS NULL""",
+                       (item['seq'], task_id))
     queue(store, item, task_id, 'close' if desired == 'closed' else 'reopen', generation)
 
 
@@ -64,16 +127,16 @@ def claim_next(database, marker):
     with transaction(database) as conn:
         now = datetime.now(timezone.utc)
         current = stamp(now)
-        row = conn.execute("""SELECT b.operation_id,b.operation_type,b.payload,b.item_seq,t.*,w.marker AS item_marker
+        row = conn.execute(f"""SELECT b.operation_id,b.operation_type,b.payload,b.item_seq,t.*,w.marker AS item_marker
             FROM writebacks b JOIN split_tasks t ON b.item_seq=t.item_seq AND json_extract(b.payload,'$.key')=t.task_key
             JOIN work_items w ON w.seq=b.item_seq
-            WHERE b.operation_type IN ('task_create','task_close','task_reopen')
+            WHERE b.operation_type IN {OPERATIONS}
             AND (? IS NULL OR w.marker=?) AND (t.retry_at IS NULL OR t.retry_at<=?)
-            AND (b.state='pending' OR (b.state IN ('leased','sending') AND b.expires_at<=?))
+            AND (b.state='pending' OR (b.state IN ('leased','sending','deferred') AND b.expires_at<=?))
             AND NOT EXISTS (SELECT 1 FROM writebacks older WHERE older.item_seq=b.item_seq
-                AND older.operation_type IN ('task_create','task_close','task_reopen')
+                AND older.operation_type IN {OPERATIONS}
                 AND json_extract(older.payload,'$.key')=t.task_key AND older.rowid<b.rowid
-                AND older.state NOT IN ('confirmed','superseded')) ORDER BY b.rowid LIMIT 1""",
+                AND older.state NOT IN ('confirmed','superseded','deferred')) ORDER BY b.rowid LIMIT 1""",
                            (marker, marker, current, current)).fetchone()
         if row is None:
             return None
@@ -91,7 +154,7 @@ def reconcile_missing(store, item, data):
     operation = require_text(data.get('operation_id'), 'operation_id')
     entry = store.conn.execute('SELECT * FROM writebacks WHERE item_seq=? AND operation_id=?',
                                (item['seq'], operation)).fetchone()
-    if not enabled(item) or not entry or entry['operation_type'] not in ('task_create', 'task_close', 'task_reopen'):
+    if not enabled(item) or not entry or not entry['operation_type'].startswith('task_'):
         raise ValueError('Unknown split-task operation')
     if entry['state'] in ('confirmed', 'superseded'):
         return message('task_already_resolved')
@@ -206,6 +269,11 @@ def sync_remote(database, job, remote):
         actual = remote.get(row['remote_id'])
         if not matches_task(actual, row, item, target):
             raise ValueError('远端任务身份与已登记的拆分项不符')
+        if action in ('start', 'note'):
+            outcome = sync_progress(database, job, remote, actual, payload, action)
+            return {'id': str(actual['id']), 'story': item['item_id'], 'project': item['project_id'],
+                    'execution': str(target['execution']), 'assignee': target['assignee'],
+                    'status': outcome.pop('status'), **outcome}
         acceptable = {'closed'} if action == 'close' else {'wait', 'doing', 'pause'}
         if actual.get('status') not in acceptable:
             if sent:
@@ -222,6 +290,37 @@ def sync_remote(database, job, remote):
             'execution': str(target['execution']), 'assignee': target['assignee'], 'status': actual['status']}
 
 
+def sync_progress(database, job, remote, actual, payload, action):
+    row, item, _, _ = job
+    number = row['remote_id']
+    sent = payload.get('sent')
+    status = actual['status']
+    if action == 'start':
+        if status != 'wait':
+            return {'status': status, 'applied': status == 'doing'}
+        if sent:
+            raise ValueError('开工请求已发送，尚未读回进行中状态')
+        send(database, job, {'id': number, 'action': action}, remote.start, number, payload['started_at'])
+        updated = remote.get(number)
+        target = {'execution': row['execution_id']}
+        if not matches_task(updated, row, item, target) or updated['status'] != 'doing':
+            raise ValueError('禅道尚未确认开工状态')
+        return {'status': updated['status'], 'applied': True}
+
+    comment_marker = 'ZT-PROGRESS-' + hashlib.sha256(row['operation_id'].encode()).hexdigest()[:32]
+    if remote.has_comment(number, comment_marker):
+        return {'status': status, 'comment_marker': comment_marker}
+    if sent:
+        raise ValueError('任务备注已发送，尚未读回备注标识')
+    if status not in ('wait', 'doing', 'pause'):
+        return {'status': status, 'applied': False}
+    send(database, job, {'id': number, 'comment_marker': comment_marker},
+         remote.comment, number, payload['note'], comment_marker)
+    if not remote.has_comment(number, comment_marker):
+        raise ValueError('禅道尚未确认任务备注')
+    return {'status': remote.get(number)['status'], 'comment_marker': comment_marker}
+
+
 def sync_once(database, marker=None, remote_factory=None):
     """Process one eligible operation, or return False when the queue is idle."""
     job = claim_next(database, marker)
@@ -236,9 +335,13 @@ def sync_once(database, marker=None, remote_factory=None):
         receipt = sync_remote(database, job, remote_factory(snapshot))
         if receipt is not None:
             with owned(database, job) as (store, data, _):
+                deferred = store.conn.execute("""SELECT json_extract(receipt,'$.reason') FROM writebacks
+                    WHERE item_seq=? AND json_extract(payload,'$.key')=? AND operation_type='task_start'
+                    AND state='deferred' ORDER BY rowid DESC LIMIT 1""", identity).fetchone()
                 store.conn.execute("""UPDATE split_tasks SET remote_id=?,remote_status=?,execution_id=?,assignee=?,
-                                     last_error=NULL,retry_at=NULL WHERE item_seq=? AND task_key=?""",
-                                   (receipt['id'], receipt['status'], receipt['execution'], receipt['assignee'], *identity))
+                                     last_error=?,retry_at=NULL WHERE item_seq=? AND task_key=?""",
+                                   (receipt['id'], receipt['status'], receipt['execution'], receipt['assignee'],
+                                    deferred[0] if deferred else None, *identity))
                 confirm_writeback(store, item, {**data, 'receipt': receipt})
     except LeaseLost:
         pass
@@ -246,6 +349,23 @@ def sync_once(database, marker=None, remote_factory=None):
         # No retry of an uncertain external send; the saved target is reconciled on the next pass.
         try:
             with owned(database, job) as (store, _, entry):
+                payload = json.loads(entry['payload'])
+                if (row['operation_type'] == 'task_start' and getattr(exc, 'safe_to_retry', False)
+                        and 'sent' not in payload):
+                    generation = store.conn.execute('SELECT generation FROM split_tasks WHERE item_seq=? AND task_key=?',
+                                                    identity).fetchone()[0]
+                    if generation != payload['generation']:
+                        store.conn.execute("UPDATE writebacks SET state='superseded' WHERE operation_id=?",
+                                           (entry['operation_id'],))
+                        return True
+                    reason = str(exc)[:350]
+                    store.conn.execute("""UPDATE writebacks SET state='deferred',lease_id=NULL,expires_at=?,receipt=?
+                        WHERE operation_id=?""", (stamp(store.now + timedelta(minutes=5)),
+                                                  encode({'reason': reason}), entry['operation_id']))
+                    record_note(store, item, row['task_key'], '研发已开工。禅道开工状态待同步：' + reason + '。')
+                    store.conn.execute('UPDATE split_tasks SET last_error=? WHERE item_seq=? AND task_key=?',
+                                       (reason, *identity))
+                    return True
                 store.conn.execute("UPDATE writebacks SET state='pending',lease_id=NULL WHERE operation_id=?",
                                    (entry['operation_id'],))
                 store.conn.execute('UPDATE split_tasks SET retry_at=?,last_error=? WHERE item_seq=? AND task_key=?',

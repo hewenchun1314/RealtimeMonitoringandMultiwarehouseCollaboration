@@ -10,7 +10,7 @@ import time
 
 from desktop_runtime import runtime_check
 from status_board import publish_status
-from task_sync import enabled, sync_once
+from task_sync import OPERATIONS, enabled, sync_once
 from workflow import CONFIG_PATH, DATABASE_PATH
 
 
@@ -30,13 +30,13 @@ def pending_task_markers(database, config):
                                 (instance, scope['project_name'])).fetchall()
         if len(projects) != 1:
             return []
-        return [row[0] for row in conn.execute("""
+        return [row[0] for row in conn.execute(f"""
             SELECT w.marker FROM work_items w
             WHERE w.instance=? AND w.project_id=? AND w.kind='story'
               AND json_extract(w.config_snapshot,'$.runtime.split_task_sync')=1
               AND json_extract(w.config_snapshot,'$.workflow_version')=2
               AND EXISTS (SELECT 1 FROM writebacks b WHERE b.item_seq=w.seq
-                AND b.operation_type IN ('task_create','task_close','task_reopen')
+                AND b.operation_type IN {OPERATIONS}
                 AND b.state NOT IN ('confirmed','superseded'))
             ORDER BY w.seq""", (instance, projects[0][0]))]
 
@@ -79,9 +79,9 @@ def watch_item(config, marker, chat_id):
             item = conn.execute('SELECT * FROM work_items WHERE marker=?', (marker,)).fetchone()
             if not item or item['chat_id'] != chat_id or item['state'] not in ('bound', 'running', 'closing'):
                 return {'status': 'worker_released'}
-            pending = conn.execute("""SELECT 1 FROM writebacks WHERE item_seq=?
-                AND state NOT IN ('confirmed','superseded') AND operation_type IN
-                ('task_create','task_close','task_reopen') LIMIT 1""", (item['seq'],)).fetchone()
+            pending = conn.execute(f"""SELECT 1 FROM writebacks WHERE item_seq=?
+                AND state NOT IN ('confirmed','superseded') AND operation_type IN {OPERATIONS} LIMIT 1""",
+                                   (item['seq'],)).fetchone()
             if pending and can_sync_item(item, chat_id) and sync_and_publish(marker, config):
                 continue
             time.sleep(5)

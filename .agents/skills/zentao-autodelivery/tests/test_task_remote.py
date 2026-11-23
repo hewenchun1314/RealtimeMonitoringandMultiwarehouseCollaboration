@@ -100,6 +100,38 @@ class TaskRemoteTests(unittest.TestCase):
         self.remote.transition(1, 'reopen', assignee='Alice')
         self.assertEqual(self.api._v2.call_args.args[2]['left'], '2')
 
+    def test_start_preserves_owner_and_uses_recorded_effort_only(self):
+        task = {'id': 1, 'status': 'wait', 'assignedTo': 'Bob', 'estimate': '0.00', 'left': '0.00',
+                'consumed': '0.00'}
+        self.api.get_task.return_value = task
+        with self.assertRaisesRegex(RemoteRejected, '缺少有效工时'):
+            self.remote.start(1, '2026-11-23T06:10:00Z')
+        self.api.start_task.assert_not_called()
+        self.api.start_task.return_value = {'status': 'success'}
+        task['estimate'] = '2.50'
+        self.remote.start(1, '2026-11-23T06:10:00Z')
+        task_id, payload = self.api.start_task.call_args.args
+        self.assertEqual((task_id, payload['assignedTo'], payload['left'], payload['consumed']), (1, 'Bob', '2.50', 0))
+        task['consumed'] = '1.25'
+        self.remote.start(1, '2026-11-23T06:10:00Z')
+        self.assertEqual(self.api.start_task.call_args.args[1]['left'], '1.25')
+        self.assertEqual(self.api.start_task.call_args.args[1]['consumed'], 1.25)
+        task['estimate'] = '1.25'
+        with self.assertRaisesRegex(RemoteRejected, '缺少有效工时'):
+            self.remote.start(1, '2026-11-23T06:10:00Z')
+        task['status'] = 'done'
+        self.remote.start(1, '2026-11-23T06:10:00Z')
+        self.assertEqual(self.api.start_task.call_count, 2)
+
+    def test_comment_is_escaped_and_verified_by_marker_in_task_history(self):
+        self.api.comment_task.return_value = {'status': 'success'}
+        self.remote.comment(1, 'Build <failed>', 'event-1')
+        body = self.api.comment_task.call_args.args[1]
+        self.assertIn('Build &lt;failed&gt;', body)
+        self.api.get_task.return_value = {'id': 1, 'actions': {'2': {'comment': body}}}
+        self.assertTrue(self.remote.has_comment(1, 'event-1'))
+        self.assertFalse(self.remote.has_comment(1, 'event-2'))
+
     def test_writes_distinguish_permission_refusal_and_dropped_response(self):
         args = ({'execution': '7', 'assignee': 'Alice'}, 34, 'Title', 'Text', 'F1')
         self.api.create_task.side_effect = ZenTaoError('response-with-credentials', status=403)

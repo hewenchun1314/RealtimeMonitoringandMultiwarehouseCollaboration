@@ -16,3 +16,5 @@ python -B .agents/skills/zentao-autodelivery/scripts/stage_runner.py `
 监督器只在启动器加入 Job 后才开闸。达到截止时间时直接终止该 Job，并检查所属活动进程数为零后给出 `stop_confirmed:true`。即使监督器异常退出，Job 句柄关闭也会终止其所属进程。作业只覆盖本次启动的本地 Codex CLI 及后代，证据中的 Codex 事件仅记录可观察到的本地会话状态。正常退出时会收尾本次遗留的后台进程。
 
 每次分段在 `<evidenceDir>/<attempt_id>/<phase>/` 保存 `launch.json`、`result.json`、`stdout.log` 和 `stderr.log`。工单主聊天从 `result.json` 读取结果。超时且停止已确认时，把原 `phase`、`outcome: "timed_out"`、`stop_confirmed`、`stop_evidence` 和收据路径交给 `record attempt_finish`。其他退出仍须核对工作版本、测试结果和阶段证据后才登记成功。启动器未返回、收据缺失或停止未确认时按原尝试对账，收到充分停止证据前不启动下一次。
+
+启用拆分任务进度回写时，阶段运行器在开发轮次输出 `turn.started` 后，按已绑定聊天、当前尝试和有效任务范围登记开工。部署或联调受阻后，由工单主聊天或发布执行器登记实际结果，任务同步器根据逐项证据更新禅道。

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 from socket import gethostname
+import sqlite3
 import subprocess
 import sys
 import time
@@ -159,9 +160,31 @@ def parse_session(path):
                 continue
             if event.get('type') == 'thread.started' and isinstance(event.get('thread_id'), str):
                 session['thread_id'] = event['thread_id']
+            if event.get('type') == 'turn.started':
+                session['turn_started'] = True
             if event.get('type') in ('turn.started', 'turn.completed', 'turn.failed'):
                 session['last_turn_event'] = event['type']
     return session
+
+
+def coding_start_callback(attempt_id, phase, deadline):
+    chat_id = os.environ.get('CODEX_THREAD_ID')
+    if not chat_id or phase not in ('verify', 'backend.coding', 'frontend.coding'):
+        return None
+    from task_sync import coding_attempt, record_coding_start
+    from workflow import DATABASE_PATH
+
+    try:
+        if not coding_attempt(DATABASE_PATH, attempt_id, phase, chat_id):
+            return None
+    except (OSError, sqlite3.Error) as error:
+        print(f'Could not read the coding attempt {attempt_id}: {error}', file=sys.stderr)
+        return None
+
+    def record(started_at):
+        record_coding_start(DATABASE_PATH, attempt_id, phase, deadline, started_at, chat_id)
+
+    return record
 
 
 def bootstrap(prompt, command):
@@ -179,6 +202,7 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
     stdout_path = directory / 'stdout.log'
     stderr_path = directory / 'stderr.log'
     hosted_agent = Path(command[0]).name.lower() in ('codex', 'codex.exe') and 'exec' in command[1:]
+    record_start = coding_start_callback(attempt_id, phase, deadline) if hosted_agent else None
     result = {
         'attempt_id': attempt_id, 'phase': phase, 'deadline_at': deadline.isoformat(),
         'receipt_path': str(receipt_path), 'stdout_path': str(stdout_path), 'stderr_path': str(stderr_path),
@@ -210,12 +234,24 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
                 process.stdin.write(b'G')
                 process.stdin.flush()
             process.stdin.close()
-            while process.poll() is None and utc_now() < deadline:
+            observed_start = None
+            while utc_now() < deadline:
+                if record_start and (observed_start or parse_session(stdout_path).get('turn_started')):
+                    observed_start = observed_start or utc_now()
+                    try:
+                        record_start(observed_start)
+                    except (OSError, sqlite3.Error) as error:
+                        print(f'Could not record coding start for {attempt_id}: {error}', file=sys.stderr)
+                    else:
+                        record_start = None
+                if process.poll() is not None:
+                    break
                 if stop_event is not None and stop_event.is_set():
                     break
                 remaining = max(0, (deadline - utc_now()).total_seconds())
                 try:
-                    process.wait(timeout=remaining if stop_event is None else min(0.25, remaining))
+                    wait = min(0.25, remaining) if stop_event is not None else remaining
+                    process.wait(timeout=min(1, wait) if record_start else wait)
                 except subprocess.TimeoutExpired:
                     continue
             timed_out = utc_now() >= deadline

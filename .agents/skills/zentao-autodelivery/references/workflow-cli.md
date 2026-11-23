@@ -73,6 +73,8 @@
 
 账本记录里只保存对象标识、非敏感证据和回执。禅道密码、登录会话和原始认证响应禁止进入命令请求或 SQLite。
 
-启用 `runtime.split_task_sync` 的新 Story 会把每个拆分编号登记在 `split_tasks`。监测与工单会话在选取原需求备注和附件时，只领取类型为 `comment` 或 `attachment` 的操作。类型为 `task_create`、`task_close`、`task_reopen` 的回写由任务同步器处理；对其调用通用 `record writeback_*` 返回 `task_sync_required`。任务管理继承工单快照、稳定拆分编号和已绑定的禅道 Task ID。
+启用 `runtime.split_task_sync` 的新 Story 会把每个拆分编号登记在 `split_tasks`。监测与工单会话在选取原需求备注和附件时，只领取类型为 `comment` 或 `attachment` 的操作。任务同步器处理 `task_create`、`task_start`、`task_note`、`task_close` 和 `task_reopen`。对这些操作调用通用 `record writeback_*` 返回 `task_sync_required`。任务管理继承工单快照、稳定拆分编号和已绑定的禅道 Task ID。
+
+同时启用 `runtime.split_task_progress_sync` 的新 Story 按实际开工和逐项阻塞证据同步进度。阶段运行器观察研发 CLI 启动后，仅为本次开发的 `task_scope.active` 登记开工。任务同步器使用任务已登记的工时。工时不足时保留待同步原因并写开工备注，阻塞备注和后续关单仍可继续。阻塞备注使用稳定标识读回确认，重复处理同一结果时保留原备注。已领取工单沿用原快照。
 
 发送结果不明后，任务同步器持续读取原发送目标。若确认原请求已经终止且该动作确实没有生效，可用 `record task_reconcile_missing` 登记 `operation_id`、与原 `payload.sent` 一致的 `original_target`、`prior_ended:true`、`missing:true`，以及分别证明请求结束和结果缺失的 `termination_evidence`、`readback_evidence`。只有已释放或到期的操作可恢复，下一次发送仍重新读取目标并核对拆分标记。

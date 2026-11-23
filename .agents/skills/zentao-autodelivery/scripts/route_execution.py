@@ -66,6 +66,8 @@ def read_history(store, item):
         entry = {'stage': stage, 'outcome': 'success' if record['outcome'] == 'success' else 'failed',
                  'summary': result['summary'], 'evidence': result['evidence'], 'started_at': record['started_at'],
                  'ended_at': record['ended_at'], 'retries': record['retry_number']}
+        if 'terminal_step' in result:
+            entry['terminal_step'] = result['terminal_step']
         if result.get('task_blockers'):
             entry['task_blockers'] = result['task_blockers']
         if entry['outcome'] == 'failed':

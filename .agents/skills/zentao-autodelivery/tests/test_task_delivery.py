@@ -2,14 +2,53 @@
 
 import unittest
 from contextlib import closing
+from datetime import datetime
 import sqlite3
 
 import test_route_drills as drills
-from task_sync import sync_once
+from task_sync import coding_attempt, record_coding_start, sync_once
 from test_task_sync import Remote
 
 
 class TaskDeliveryTests(unittest.TestCase):
+    def test_launched_coding_updates_its_side_and_does_not_backfill_older_snapshots(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                fixture = drills.RouteDrills()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.config['runtime'].update(split_task_sync=True, split_task_progress_sync=enabled)
+                fixture.begin_drill('fullstack', '前后端')
+                remote = Remote()
+                stage = 'material_check'
+                while stage != 'backend.coding':
+                    attempt = fixture.record('attempt_start', stage=stage)
+                    evidence = fixture.evidence(stage, attempt)
+                    if stage == 'backend.plan':
+                        evidence['task_repositories'] = {'backend': [fixture.key]}
+                    stage = fixture.finish(stage, attempt, evidence)['next_stage']
+
+                while sync_once(fixture.database, remote_factory=lambda _: remote):
+                    pass
+                attempt = fixture.record('attempt_start', stage=stage)
+                self.assertFalse(sync_once(fixture.database, remote_factory=lambda _: remote))
+                start_args = (fixture.database, attempt['attempt_id'], attempt['phase'],
+                              datetime.fromisoformat(attempt['deadline_at']),
+                              datetime.fromisoformat(attempt['phase_started_at']))
+                self.assertFalse(coding_attempt(*start_args[:3], 'wrong chat'))
+                record_coding_start(*start_args, 'wrong chat')
+                self.assertFalse(sync_once(fixture.database, remote_factory=lambda _: remote))
+                caller = fixture.binding['chat_id']
+                self.assertEqual(coding_attempt(*start_args[:3], caller), enabled)
+                for _ in range(2):
+                    record_coding_start(*start_args, caller)
+                while sync_once(fixture.database, remote_factory=lambda _: remote):
+                    pass
+                with closing(sqlite3.connect(fixture.database)) as conn:
+                    rows = dict(conn.execute('SELECT side,remote_status FROM split_tasks'))
+                self.assertEqual(rows, {'backend': 'doing' if enabled else 'wait', 'frontend': 'wait'})
+                self.assertEqual(remote.calls.count('start'), int(enabled))
+
     def test_disabled_page_acceptance_skips_e2e_and_closes_reviewed_merged_tasks(self):
         for scope, mark in [('frontend_only', '纯前端'), ('fullstack', '前后端')]:
             with self.subTest(scope=scope):
@@ -93,7 +132,7 @@ class TaskDeliveryTests(unittest.TestCase):
         fixture = drills.RouteDrills()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
-        fixture.config['runtime']['split_task_sync'] = True
+        fixture.config['runtime'].update(split_task_sync=True, split_task_progress_sync=True)
         fixture.begin_drill('fullstack', '前后端')
         ids = {'backend': ['B1', 'B2'], 'frontend': ['F1', 'F2', 'F3']}
         remote = Remote()
@@ -101,6 +140,10 @@ class TaskDeliveryTests(unittest.TestCase):
         while stage:
             attempt = fixture.record('attempt_start', stage=stage)
             self.assertEqual(attempt['status'], 'attempt_started', attempt)
+            if stage.endswith('.coding'):
+                record_coding_start(fixture.database, attempt['attempt_id'], attempt['phase'],
+                                    datetime.fromisoformat(attempt['deadline_at']),
+                                    datetime.fromisoformat(attempt['phase_started_at']), fixture.binding['chat_id'])
             evidence = fixture.evidence(stage, attempt)
             side, _, step = stage.partition('.')
             if stage == 'split':
@@ -131,4 +174,5 @@ class TaskDeliveryTests(unittest.TestCase):
         self.assertEqual(final['conclusion'], '阻断')
         with closing(sqlite3.connect(fixture.database)) as conn:
             rows = dict(conn.execute('SELECT task_key,remote_status FROM split_tasks'))
-        self.assertEqual(rows, {'B1': 'closed', 'B2': 'closed', 'F1': 'closed', 'F2': 'wait', 'F3': 'wait'})
+        self.assertEqual(rows, {'B1': 'closed', 'B2': 'closed', 'F1': 'closed', 'F2': 'doing', 'F3': 'doing'})
+        self.assertEqual(remote.calls.count('comment'), 2)

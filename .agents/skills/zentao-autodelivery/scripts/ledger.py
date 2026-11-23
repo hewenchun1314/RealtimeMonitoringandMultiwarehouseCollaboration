@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS writebacks (
 CREATE INDEX IF NOT EXISTS pending_writebacks ON writebacks(state, expires_at);
 CREATE INDEX IF NOT EXISTS split_task_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
     WHERE operation_type IN ('task_create','task_close','task_reopen');
+CREATE INDEX IF NOT EXISTS split_task_progress_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
+    WHERE operation_type IN ('task_create','task_close','task_reopen','task_start','task_note');
 CREATE TABLE IF NOT EXISTS split_tasks (
     item_seq INTEGER NOT NULL REFERENCES work_items(seq), task_key TEXT NOT NULL,
     instance TEXT NOT NULL, side TEXT NOT NULL, definition TEXT NOT NULL,
@@ -272,8 +274,9 @@ def validate_config(config):
         side, _, name = target.partition(':')
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
-    if 'split_task_sync' in runtime and type(runtime['split_task_sync']) is not bool:
-        raise ValueError('runtime.split_task_sync must be a boolean')
+    for key in ('split_task_sync', 'split_task_progress_sync'):
+        if key in runtime and type(runtime[key]) is not bool:
+            raise ValueError(f'runtime.{key} must be a boolean')
     if 'desktop_project_id' in runtime:
         require_text(runtime['desktop_project_id'], 'runtime.desktop_project_id')
     if 'require_unattended_approval' in runtime and type(runtime['require_unattended_approval']) is not bool:
@@ -321,9 +324,9 @@ class Ledger:
 
 
 @contextmanager
-def transaction(database):
+def transaction(database, *, timeout=10):
     Path(database).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(database, timeout=10)
+    conn = sqlite3.connect(database, timeout=timeout)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute('PRAGMA foreign_keys = ON')

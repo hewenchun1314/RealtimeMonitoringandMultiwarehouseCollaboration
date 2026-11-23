@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from pathlib import Path
@@ -196,6 +197,39 @@ class TaskRemote:
         except (KeyError, RemoteRejected):
             raise RemoteUnknown('禅道建单未返回可核对的编号') from None
 
+    def start(self, task_id, started_at):
+        task = self._detail(task_id)
+        if task['status'] != 'wait':
+            return
+        consumed = self._hours(task, 'consumed')
+        left = self._hours(task, 'left')
+        if not left:
+            left = self._hours(task, 'estimate') - consumed
+        # ZenTao treats starting a single-owner task with zero remaining effort as completing it.
+        if left <= 0:
+            raise RemoteRejected('缺少有效工时，禅道需要正数预计剩余工时才能登记为进行中')
+        owner = _account(task.get('assignedTo'))
+        if not owner or owner == 'closed':
+            raise RemoteRejected('任务缺少有效指派人')
+        local_start = datetime.fromisoformat(started_at).astimezone().strftime('%Y-%m-%d %H:%M:%S')
+        _write(self.session.start_task, int(task['id']), {
+            'realStarted': local_start, 'left': str(left), 'consumed': float(consumed), 'assignedTo': owner,
+            'comment': '拆分任务已实际开工。',
+        })
+
+    @_read
+    def has_comment(self, task_id, marker):
+        actions = self._detail(task_id).get('actions')
+        if isinstance(actions, dict):
+            actions = actions.values()
+        elif not isinstance(actions, list):
+            raise RemoteRejected('无法核验任务备注历史')
+        return any(_marker(marker) in html.unescape(action.get('comment') or '') for action in actions)
+
+    def comment(self, task_id, text, marker):
+        _write(self.session.comment_task, int(_id(task_id)),
+               '<p>' + html.escape(text) + '</p><p>' + _marker(marker) + '</p>')
+
     def transition(self, task_id, action, *, assignee=None):
         task = self._detail(task_id)
         task_id, status = _id(task['id']), task['status']
@@ -237,17 +271,21 @@ class TaskRemote:
         return _account(story.get('assignedTo'))
 
     @staticmethod
-    def _remaining_hours(task):
+    def _hours(task, field):
+        try:
+            hours = Decimal(str(task.get(field) or 0))
+        except InvalidOperation:
+            raise RemoteRejected('无法核实禅道任务工时') from None
+        if not hours.is_finite() or hours < 0:
+            raise RemoteRejected('无法核实禅道任务工时')
+        return hours
+
+    @classmethod
+    def _remaining_hours(cls, task):
         for field in ('left', 'estimate'):
-            raw = str(task.get(field) or 0)
-            try:
-                hours = Decimal(raw)
-            except InvalidOperation:
-                raise RemoteRejected('无法核实禅道任务的剩余工时或估时') from None
-            if not hours.is_finite() or hours < 0:
-                raise RemoteRejected('无法核实禅道任务的剩余工时或估时')
+            hours = cls._hours(task, field)
             if hours > 0:
-                return raw
+                return str(hours)
         return None
 
 

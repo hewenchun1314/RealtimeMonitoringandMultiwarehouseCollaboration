@@ -5,7 +5,7 @@ from contextlib import closing
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from task_evidence import evaluate, validate_merge_tests, validate_task_fields
+from task_evidence import evaluate, progress_note, validate_merge_tests, validate_task_fields
 
 
 def step(data, outcome='success'):
@@ -114,6 +114,23 @@ class TaskEvidenceTests(unittest.TestCase):
         self.assertEqual({key: value[0] for key, value in decisions.items()},
                          {'A': 'closed', 'B': 'open', 'C': 'closed'})
         self.assertEqual(decisions['B'][2]['deployment_pending'], ['second'])
+
+    def test_notes_distinguish_merged_backend_from_waiting_frontend(self):
+        route = {'scope': 'fullstack', 'tasks': {
+            'backend': [{'id': 'B'}], 'frontend': [{'id': 'F', 'depends_on': ['B']}]}}
+        stages = {
+            'backend.plan': step({'task_repositories': {'B': ['smart-geo']}}),
+            'backend.integration': step({'merged_versions': {'smart-geo': 'a' * 40}}),
+            'backend.deploy': {**step({'services': {'smart-geo': {'reason': 'mvn -B failed (exit 1)'}}}, 'failed'),
+                               'task_blockers': {'B': '待核验部署：smart-geo'}},
+        }
+        decisions = evaluate(route, stages)
+        backend, frontend = decisions['B'][2], decisions['F'][2]
+        blocked = {'B': backend['blocked'], 'F': frontend['blocked']}
+        self.assertIn('代码已合回（smart-geo aaaaaaaaaaaa）', progress_note('B', 'backend', backend, stages, blocked))
+        self.assertIn('mvn -B failed', progress_note('B', 'backend', backend, stages, blocked))
+        self.assertIn('等待前置任务：B（待核验部署：smart-geo）',
+                      progress_note('F', 'frontend', frontend, stages, blocked))
 
 
 class TaskWorkflowDrill(unittest.TestCase):
