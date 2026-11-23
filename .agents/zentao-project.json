@@ -122,7 +122,8 @@
             "enabled": true,
             "target": "internalrd-test",
             "build_dependencies": {
-              "tet-common-java": "d2b889fa0199b6c4fc947adbc790e7c282193e29"
+              "tet-common-java": "d2b889fa0199b6c4fc947adbc790e7c282193e29",
+              "model-manage-srv": "91c48c29ef379947d45e23a9744ac2d1fa7d3f28"
             },
             "targets": {
               "internalrd-test": {
