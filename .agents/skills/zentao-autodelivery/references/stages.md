@@ -27,8 +27,9 @@
 | `<端>.code_review` | 本端测试 Agent | 审查本端计划与候选改动，提交 `versions` 和 `verification`，记录位置、结论和严重度。 |
 | `backend.acceptance`、`frontend.e2e` | 本端测试 Agent | 按[后端服务验收](backend.md)或[前端页面验收](e2e.md)实际运行用例。提交 `versions`、`verification` 和逐项验证的本端任务编号数组 `verified_tasks`，覆盖当前有效清单。联合验收加 `backend_versions`，核对已交接服务版本。 |
 | `<端>.integration` | 主会话 | 在配置目标分支逐仓合回并读回，保存 `versions`（候选提交）及 `merged_versions`（实际合回提交）。合回树与候选树内容有差异时，用 `merged_verification` 写明最终版本的复验结果。部分合回或冲突时记录已完成仓库及失败原因；恢复先核对现状。需要改业务逻辑的冲突交本端开发和测试 Agent 处理。 |
-| `backend.deploy` | Windows 工单启动器和发布执行器 | 后端审查、独立验收和合回成功后，按快照和当前授权选择实际服务的部署目标。用已合回版本打包并推送，按摘要更新 Deployment，核验 Pod 与网关版本后自动登记回执。工单主会话在此阶段交还执行权。详见[后端部署](backend.md#后端自动部署)。 |
-| `frontend.deploy` | Windows 工单启动器和前端部署 Agent | 前端验证及合回成功后，逐仓推送合回 SHA 并读回远端，核对本地停服，从固定 SHA 打包并读回 Harbor 摘要。配置 Rancher 时继续更新并核验新 Ready Pod。详见[前端镜像发布](frontend-release.md)。 |
+| `backend.push`、`frontend.push` | Windows 工单启动器和 Git 推送执行器 | 工单快照启用 `runtime.git_push_enabled` 时，逐仓推送验收并合回的 SHA，即使该端没有镜像部署。部分交付依赖逐任务验收、实际合回及最终内容复验证据。核对快照、当前配置和分支核验回执，向配置分支普通推送并读回远端。已包含该 SHA 时登记已有远端版本。遇到分叉、权限或目标错误时记录该仓失败，保留其他仓结果。 |
+| `backend.deploy` | Windows 工单启动器和发布执行器 | 后端审查、独立验收、合回和已启用的 Git 推送成功后，按快照和当前授权选择实际服务的部署目标。用已合回版本打包并推送，按摘要更新 Deployment，核验 Pod 与网关版本后自动登记回执。工单主会话在此阶段交还执行权。详见[后端部署](backend.md#后端自动部署)。 |
+| `frontend.deploy` | Windows 工单启动器和前端部署 Agent | 核验前端 Git 远端已包含合回 SHA，核对本地停服，从固定 SHA 打包并读回 Harbor 摘要。配置 Rancher 时继续更新并核验新 Ready Pod。详见[前端镜像发布](frontend-release.md)。 |
 | `handoff` | 主会话 | 仅跨端运行。后端合回后读取联调文档、独立验收和实际环境版本，提交[交接证据](backend.md)。交接失败后记录依赖交接的任务，按账本继续独立的前端任务。 |
 
 端内返工依次完成修复、单测、复审或重验。联合验收发现后端缺陷时注明责任端，按同一尝试中账本返回的分段修复并再次交接，使用新版本跑受影响的联合验收。涉及任务或接口约定变化时，由拆分 Agent 更新任务并说明依据。主会话收尾以有效版本、实际验收和所有必需任务为准；安全合回成功的事实与未解决的验收项分别记账。

@@ -5,10 +5,11 @@ import subprocess
 from pathlib import Path
 
 from branch_check import git, planned_applications
-from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, TAG,
+from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, GIT_PUSH_STAGES, TAG,
                           configured_targets, deployed_receipt_matches, frontend_release_config,
                           mcp_rollout_matches, release_verification)
 from route_execution import blocked_tasks, get_split, handoff_tasks, read_history, snapshot, stage_evidence
+from task_evidence import verified_task_merge
 
 
 def nonblank(value):
@@ -99,6 +100,83 @@ def repository_evidence(store, item, side, stage, evidence):
         return f'Git evidence could not be verified: {error}'
 
 
+def git_push_requirements(store, item, stage):
+    from task_sync import enabled as task_sync_enabled
+
+    route, history = read_history(store, item)
+    side = stage.split('.')[0]
+    if not route or stage not in route['stages']:
+        return {}, {}, {}, '工单未启用该端 Git 推送'
+    for step in ('plan', 'branch_check', 'coding', 'unit_test', 'code_review'):
+        name = side + '.' + step
+        if history.get(name, {}).get('outcome') != 'success':
+            return {}, {}, {}, f'Git 推送缺少成功的 {name} 回执'
+    plan = history[side + '.plan']['evidence']
+    planned = planned_applications(plan, side)
+    integration = history.get(side + '.integration', {})
+    merged = (integration.get('evidence') or {}).get('merged_versions')
+    branches = history[side + '.branch_check']['evidence'].get('repositories', {})
+    if not planned or not commit_map(merged) or not merged.keys() <= set(planned) or branches.keys() != set(planned):
+        return {}, {}, {}, 'Git 推送需要一致的计划、分支核验及合回 SHA'
+    acceptance_stage = 'backend.acceptance' if side == 'backend' else 'frontend.e2e'
+    skip_e2e = acceptance_stage not in route['stages']
+    acceptance = history.get(acceptance_stage, {})
+    full = (skip_e2e or acceptance.get('outcome') == 'success') and integration.get('outcome') == 'success'
+    if not full and not task_sync_enabled(item):
+        return {}, {}, {}, 'Git 部分交付需要已核验的逐任务验收及合回证据'
+    if not full and ((not skip_e2e and not (acceptance.get('terminal_step') or acceptance.get('outcome') == 'success'))
+                     or not (integration.get('terminal_step') or integration.get('outcome') == 'success')):
+        return {}, {}, {}, 'Git 推送缺少已结束的验收或合回回执'
+    blocked = blocked_tasks(route, {name: receipt for name, receipt in history.items() if name != stage})
+    mapping = plan.get('task_repositories', {})
+    passed = {task: verified_task_merge(history, side, task, skip_e2e=skip_e2e)
+              for task in mapping if task not in blocked} if not full else {}
+    selected, withheld = {}, {}
+    for key in planned:
+        affected = {task for task, keys in mapping.items() if key in keys}
+        if affected & blocked.keys():
+            if affected - blocked.keys():
+                withheld[key] = '同一仓库仍有受阻任务'
+        elif key in merged and (full or (affected and all(passed[task].get(key) == merged[key] for task in affected))):
+            selected[key] = merged[key]
+        else:
+            withheld[key] = '缺少该仓全部任务的验收及实际合回证据'
+    if not selected and not withheld:
+        return {}, {}, {}, '没有已验收且可推送的仓库'
+    return selected, branches, withheld, None
+
+
+def git_push_evidence_error(store, item, stage, evidence, *, partial=False):
+    versions, branches, withheld, reason = git_push_requirements(store, item, stage)
+    receipts = evidence.get('repositories')
+    if (not isinstance(receipts, dict) or not receipts.keys() <= versions.keys()
+            or (not partial and (reason or withheld or receipts.keys() != versions.keys()))):
+        return reason or 'Git 回执需要覆盖本单可推送的仓库'
+    for key, entry in receipts.items():
+        if (not isinstance(entry, dict) or entry.get('sha') != versions[key]
+                or entry.get('branch') != branches[key].get('target_branch')
+                or not isinstance(entry.get('remote_sha'), str) or not COMMIT.fullmatch(entry['remote_sha'])):
+            return f'{key} 的 Git 远端回执不匹配'
+
+
+def push_covers(store, item, stage, versions):
+    route = get_split(store, item) or {}
+    if stage not in route.get('stages', ()):
+        return True
+    receipts = (stage_evidence(store, item, stage) or {}).get('repositories', {})
+    return bool(receipts) and all(receipts.get(key, {}).get('sha') == sha for key, sha in versions.items())
+
+
+def pushed_backend_versions(route, stages, versions):
+    if 'backend.push' not in route.get('stages', ()):
+        return versions
+    push = stages.get('backend.push', {})
+    if push.get('outcome') != 'success' and not push.get('terminal_step'):
+        return {}
+    receipts = (push.get('evidence') or {}).get('repositories', {})
+    return {key: sha for key, sha in versions.items() if receipts.get(key, {}).get('sha') == sha}
+
+
 def deployment_requirements(store, item):
     plan = stage_evidence(store, item, 'backend.plan')
     services = planned_applications(plan, 'backend')
@@ -109,6 +187,16 @@ def deployment_requirements(store, item):
     skipped = [key for key in services if key not in targets]
     if not selected:
         return selected, skipped, {}, None
+    route, history = read_history(store, item)
+    if 'backend.push' in route.get('stages', ()):
+        integration = history.get('backend.integration', {})
+        merged = (integration.get('evidence') or {}).get('merged_versions') or {}
+        verified = pushed_backend_versions(route, history, merged)
+        available = {key: target for key, target in selected.items() if key in verified}
+        if not verified:
+            return selected, skipped, {}, '缺少后端 Git 远端核验成功回执'
+        skipped.extend(key for key in selected if key not in available)
+        return available, skipped, verified, None
     for stage in ('backend.code_review', 'backend.acceptance', 'backend.integration'):
         if not stage_evidence(store, item, stage):
             return selected, skipped, {}, f'缺少成功的 {stage} 回执'
@@ -135,15 +223,24 @@ def handoff_error(store, item, evidence):
     blockers = route.get('handoff_blockers', route['blockers'])
     if blockers:
         return 'Backend handoff is blocked: ' + ', '.join(blockers)
-    for name in ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'acceptance', 'integration'):
+    prerequisites = ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review')
+    git_delivery = 'backend.push' in route.get('stages', ())
+    if not git_delivery:
+        prerequisites += ('acceptance', 'integration')
+    for name in prerequisites:
         if not stage_evidence(store, item, 'backend.' + name):
             return f'Backend {name} must succeed before frontend handoff'
-    integration = stage_evidence(store, item, 'backend.integration')
+    _, stages = read_history(store, item)
+    integration = stage_evidence(store, item, 'backend.integration') or stages.get('backend.integration', {}).get('evidence')
+    merged = (integration or {}).get('merged_versions', {})
+    if git_delivery:
+        verified = pushed_backend_versions(route, stages, merged)
+        if not verified or (verified != merged and not blocked_tasks(route, stages)):
+            return '后端 Git 远端核验通过后才可联调交接'
+        merged = verified
     versions = evidence.get('backend_versions')
-    merged = integration.get('merged_versions')
     partial_deployment = None
     if DEPLOY_STAGE in route.get('stages', ()) and not stage_evidence(store, item, DEPLOY_STAGE):
-        _, stages = read_history(store, item)
         receipt = stages.get(DEPLOY_STAGE, {})
         if receipt.get('task_blockers'):
             targets, _, deployed_versions, error = deployment_requirements(store, item)
@@ -191,11 +288,15 @@ def validate_success(store, item, stage, evidence, *, task_blockers=None):
         return 'Stage evidence must be a non-empty object'
     if stage == 'handoff':
         return handoff_error(store, item, evidence)
+    if stage in GIT_PUSH_STAGES:
+        return git_push_evidence_error(store, item, stage, evidence)
     if stage == DEPLOY_STAGE:
         return deployment_evidence_error(store, item, evidence)
     if stage == FRONTEND_DEPLOY_STAGE:
         settings = frontend_release_config(snapshot(item))
         merged = (stage_evidence(store, item, 'frontend.integration') or {}).get('merged_versions')
+        if not push_covers(store, item, 'frontend.push', merged or {}):
+            return '缺少前端 Git 远端核验成功回执'
         image = evidence.get('image')
         remote = evidence.get('remote_versions')
         digests = (evidence.get('digest'), evidence.get('config_digest'))
@@ -282,13 +383,22 @@ def delivery_summary(route, stages):
                 state = '合回' if merge['outcome'] == 'success' else '部分合回'
                 targets = '、'.join(f'{key}@{sha}' for key, sha in sorted(merged.items()))
                 facts.append(('后端' if side == 'backend' else '前端') + state + ' ' + targets)
+        push = stages.get(side + '.push')
+        if push:
+            repositories = (push.get('evidence') or {}).get('repositories', {})
+            label = '后端' if side == 'backend' else '前端'
+            if repositories:
+                reported = '、'.join(f'{key}@{entry["sha"]}' for key, entry in sorted(repositories.items()))
+                facts.append(f'{label} Git 远端已核验 {reported}')
+            if push['outcome'] != 'success':
+                facts.append(f'{label} Git 推送待完成')
     deployed = stages.get(DEPLOY_STAGE)
     if deployed:
         evidence = deployed.get('evidence') or {}
         if deployed['outcome'] == 'failed':
             facts.append('后端部署待验证')
         elif not evidence.get('services'):
-            facts.append('后端部署已跳过（所选服务未配置部署目标）')
+            facts.append('后端部署已跳过（本轮无适用目标）')
         for key, receipt in sorted(evidence.get('services', {}).items()):
             if receipt.get('status') == 'deployed':
                 target = receipt['target']

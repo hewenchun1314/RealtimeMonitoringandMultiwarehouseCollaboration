@@ -56,7 +56,7 @@ def read_remote(root, ref):
     raise DeploymentError('Git remote branch changed repeatedly during verification')
 
 
-def synchronize_branch(root, branch, sha):
+def synchronize_branch(root, branch, sha, *, allow_push=True):
     ref = f'refs/heads/{branch}'
     current = git(root, 'rev-parse', '--verify', ref).stdout.strip()
     if not COMMIT.fullmatch(sha) or not ancestor(root, sha, current):
@@ -68,6 +68,8 @@ def synchronize_branch(root, branch, sha):
     remote = read_remote(root, ref)
     if remote and ancestor(root, sha, remote):
         return remote
+    if not allow_push:
+        raise DeploymentError('Git remote no longer contains the verified merge SHA')
     if remote and not ancestor(root, remote, sha):
         raise DeploymentError('Git remote has diverged from the admitted merge SHA')
     git(root, 'push', '--no-follow-tags', '--recurse-submodules=no', 'origin', f'{sha}:{ref}')
@@ -205,7 +207,11 @@ def publish(request, journal):
     verify_toolchain(request)
     for key, app in sorted(request['applications'].items()):
         try:
-            result['remote_versions'][key] = synchronize_branch(Path(app['repository']), app['branch'], app['sha'])
+            args = (Path(app['repository']), app['branch'], app['sha'])
+            if request.get('git_push_verified'):
+                result['remote_versions'][key] = synchronize_branch(*args, allow_push=False)
+            else:
+                result['remote_versions'][key] = synchronize_branch(*args)
         except DeploymentError as error:
             raise DeploymentError(f'{key}: {error}') from error
         write_json(journal, result)

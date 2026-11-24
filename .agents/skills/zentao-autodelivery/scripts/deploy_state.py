@@ -7,6 +7,8 @@ from urllib.parse import urlsplit
 DEPLOY_STAGE = 'backend.deploy'
 FRONTEND_DEPLOY_STAGE = 'frontend.deploy'
 DEPLOY_STAGES = (DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE)
+GIT_PUSH_STAGES = ('backend.push', 'frontend.push')
+WORKER_STAGES = (*DEPLOY_STAGES, *GIT_PUSH_STAGES)
 FRONTEND_PROFILE = 'zentao-ai-development'
 TARGET_FIELDS = {
     'registry': r'[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?',

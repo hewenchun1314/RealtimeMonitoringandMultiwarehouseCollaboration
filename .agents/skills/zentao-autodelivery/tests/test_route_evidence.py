@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from route_evidence import delivery_summary, validate_success
+from route_evidence import delivery_summary, deployment_requirements, validate_success
 from status_board import table_row
 
 
@@ -59,6 +59,35 @@ class RouteEvidenceTests(unittest.TestCase):
             self.assertIsNone(self.check('handoff', proof))
             wrong = {**proof, 'backend_versions': self.history['backend.integration']['merged_versions']}
             self.assertIsNotNone(self.check('handoff', wrong))
+
+    def test_handoff_excludes_backends_that_failed_git_delivery(self):
+        self.route['stages'] = ['backend.push']
+        self.history['backend.integration']['merged_versions'] = {**self.merged, 'archive': 'c' * 40}
+        push = {'backend.push': {'outcome': 'failed', 'terminal_step': True,
+                                 'task_blockers': {'B2': 'Archive push failed'},
+                                 'evidence': {'repositories': {'reports': {'sha': self.merged['reports']}}}}}
+        with patch('route_evidence.read_history', return_value=(self.route, push)):
+            self.assertIsNone(self.check('handoff', self.handoff))
+            self.assertIsNotNone(self.check('handoff', {
+                **self.handoff, 'backend_versions': self.history['backend.integration']['merged_versions']}))
+
+    def test_unpushed_deploy_target_does_not_block_another_verified_local_service(self):
+        self.route['stages'] = ['backend.push', 'backend.deploy']
+        self.history['backend.plan'] = {'services': ['reports', 'archive']}
+        versions = {**self.merged, 'archive': 'c' * 40}
+        stages = {
+            'backend.integration': {'evidence': {'merged_versions': versions}},
+            'backend.push': {'outcome': 'failed', 'terminal_step': True,
+                             'evidence': {'repositories': {'reports': {'sha': versions['reports']}}}},
+        }
+        with (patch('route_evidence.read_history', return_value=(self.route, stages)),
+              patch('route_evidence.snapshot', return_value={}),
+              patch('route_evidence.configured_targets', return_value={'archive': {'target': 'test'}})):
+            selected, skipped, verified, reason = deployment_requirements(self.store, self.item)
+        self.assertEqual(selected, {})
+        self.assertEqual(skipped, ['reports', 'archive'])
+        self.assertEqual(verified, self.merged)
+        self.assertIsNone(reason)
 
     def local_candidate(self):
         source, tree = self.root / 'source', self.root / 'item'

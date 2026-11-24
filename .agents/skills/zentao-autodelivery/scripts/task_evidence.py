@@ -3,7 +3,7 @@
 import json
 import subprocess
 
-from deploy_state import DEPLOY_STAGE, deployed_receipt_matches
+from deploy_state import COMMIT, DEPLOY_STAGE, deployed_receipt_matches
 
 
 # ledger imports this constant during initialization; avoid importing the workflow here.
@@ -199,7 +199,30 @@ def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
     return None
 
 
+def _push_result(route, stages, side, facts):
+    stage = side + '.push'
+    if stage not in route.get('stages', ()):
+        return None
+    receipts = _receipt(stages, stage, partial=True).get('repositories', {})
+    pending = []
+    for key, sha in facts[side]['merged'].items():
+        entry = receipts.get(key, {})
+        if entry.get('sha') != sha or not COMMIT.fullmatch(entry.get('remote_sha') or ''):
+            pending.append(key)
+    if pending:
+        facts.setdefault('push_pending', {})[side] = pending
+        return '已合回版本待远端核验 ' + '、'.join(pending)
+
+
+def verified_task_merge(stages, side, task, *, skip_e2e=False):
+    facts = {}
+    if _side_result(stages, side, task, facts, {}, skip_e2e=skip_e2e):
+        return {}
+    return facts[side]['merged']
+
+
 def evaluate(route, stages, history=None, *, deployment_targets=None):
+    from route_evidence import pushed_backend_versions
     from route_execution import blocked_tasks, handoff_tasks
 
     decisions = {}
@@ -210,7 +233,9 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
     e2e_enabled = route.get('e2e_enabled', True)
     handoff = _receipt(stages, 'handoff').get('backend_versions')
     joint_test = _receipt(stages, 'frontend.e2e', partial=True)
-    backend_merge = _receipt(stages, 'backend.integration').get('merged_versions', {})
+    backend_merge = _receipt(stages, 'backend.integration', partial='backend.push' in route.get('stages', ())).get(
+        'merged_versions', {})
+    backend_merge = pushed_backend_versions(route, stages, backend_merge)
     current_joint = bool(handoff and isinstance(backend_merge, dict) and handoff == joint_test.get('backend_versions')
                          and all(backend_merge.get(key) == sha for key, sha in handoff.items())
                          and (handoff == backend_merge or stages.get(DEPLOY_STAGE, {}).get('task_blockers')))
@@ -231,6 +256,8 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
                 previous = {}
             skip_e2e = side == 'frontend' and not e2e_enabled
             reason = _side_result(stages, side, key, facts, previous, skip_e2e=skip_e2e)
+            if not reason:
+                reason = _push_result(route, stages, side, facts)
             if side == 'backend' and not reason and DEPLOY_STAGE in route.get('stages', []):
                 component = facts[side]
                 for service in sorted(set(component['repositories']) & targets.keys()):
@@ -253,6 +280,8 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
                         reason = '等待有效的前后端版本联合验收'
                     elif side == 'backend':
                         reason = _side_result(stages, 'frontend', key, facts, previous)
+                        if not reason:
+                            reason = _push_result(route, stages, 'frontend', facts)
             if skip_e2e:
                 facts['e2e_skipped'] = True
                 closed_reason = '单测和代码审查通过且相关仓库已合回，页面验收按项目配置跳过'
@@ -261,6 +290,8 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
                 closed_reason = '后端服务验收通过且相关仓库已合回，页面联合验收按项目配置跳过'
             else:
                 closed_reason = '独立验收通过且相关仓库已合回'
+            if side + '.push' in route.get('stages', []):
+                closed_reason += '，已核验 Git 远端'
             if facts.get('deployment'):
                 closed_reason += '，已核验相关服务部署'
             decisions[key] = ('open' if reason else 'closed', reason or closed_reason, facts)
@@ -339,7 +370,7 @@ def refresh(store, item):
                 for component in ('backend', 'frontend'))
             if (previous['disposition'] == 'closed' and (previous['remote_status'] == 'closed' or not changed_versions)
                     and same_criteria and not changed_scope and desired == 'open' and not facts.get('joint_failure')
-                    and not facts.get('deployment_pending') and not facts.get('blocked')
+                    and not facts.get('deployment_pending') and not facts.get('push_pending') and not facts.get('blocked')
                     and acceptance.get('outcome') != 'failed'):
                 continue
         store.conn.execute('''INSERT INTO task_evidence(item_seq,task_key,disposition,reason,evidence)
@@ -364,8 +395,10 @@ def first_unverified_stage(store, item):
         ORDER BY t.side,t.task_key LIMIT 1''', (item['seq'],)).fetchone()
     if not task:
         return None
+    facts = json.loads(task['evidence']) if task['evidence'] else {}
+    if facts.get('push_pending'):
+        return next(iter(facts['push_pending'])) + '.push'
     if task['side'] == 'backend':
-        facts = json.loads(task['evidence']) if task['evidence'] else {}
         return DEPLOY_STAGE if facts.get('deployment_pending') else 'backend.acceptance'
     route = get_split(store, item)
     return 'frontend.integration' if route and not route.get('e2e_enabled', True) else 'frontend.e2e'

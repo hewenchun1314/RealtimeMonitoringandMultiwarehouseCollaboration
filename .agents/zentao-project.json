@@ -23,6 +23,7 @@
     "story_review_sync": true,
     "split_task_sync": true,
     "split_task_progress_sync": true,
+    "git_push_enabled": true,
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true,
     "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"],

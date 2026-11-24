@@ -23,12 +23,15 @@ def project_mode(development):
     raise ValueError('Invalid development.allowed_requirement_types')
 
 
-def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_deploy_enabled=False):
+def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_deploy_enabled=False,
+                 git_push_enabled=False):
     if scope not in SCOPES.values():
         raise ValueError('Unknown delivery scope')
     stages = list(PREFIX)
     if scope in ('backend_only', 'fullstack'):
         stages.extend('backend.' + step for step in (*SIDE_STEPS, 'acceptance', 'integration'))
+        if git_push_enabled:
+            stages.append('backend.push')
         if deploy_enabled:
             stages.append(DEPLOY_STAGE)
     if scope == 'fullstack':
@@ -38,6 +41,8 @@ def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_depl
         if e2e_enabled:
             stages.append('frontend.e2e')
         stages.append('frontend.integration')
+        if git_push_enabled:
+            stages.append('frontend.push')
         if frontend_deploy_enabled:
             stages.append(FRONTEND_DEPLOY_STAGE)
     return tuple(stages)

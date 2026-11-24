@@ -189,7 +189,7 @@ def run_deployment(marker, database, config_path, project_root, *, recover=False
         result.update(outcome='failed', summary=claim['blocked'], retryable=False)
         return record_finish(action, checkpoint, deadline, result)
     if not requests:
-        result['summary'] = '本单涉及的后端服务未配置部署目标'
+        result['summary'] = '本轮没有适用的后端部署目标'
         return record_finish(action, checkpoint, deadline, result)
 
     write_json(checkpoint.with_name('batch.json'), {

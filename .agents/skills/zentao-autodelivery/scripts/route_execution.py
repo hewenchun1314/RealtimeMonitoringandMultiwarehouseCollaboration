@@ -3,7 +3,7 @@
 import json
 
 from delivery_scope import resolve_split, route_stages
-from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, configured_targets, frontend_release_config
+from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, configured_targets, frontend_release_config
 from ledger import workflow_stages
 
 
@@ -23,7 +23,7 @@ def invalidate_repaired_outputs(stages, phase, route):
     for stage in order[order.index(phase) + 1:]:
         if (stage.partition('.')[0] == side or
                 (side in ('backend', 'handoff') and stage in (
-                    'handoff', 'frontend.e2e', 'frontend.integration', FRONTEND_DEPLOY_STAGE))):
+                    'handoff', 'frontend.e2e', 'frontend.integration', 'frontend.push', FRONTEND_DEPLOY_STAGE))):
             stages.pop(stage, None)
 
 
@@ -154,7 +154,8 @@ def split_result(store, item, evidence, *, revision=False):
     route['e2e_enabled'] = config.get('e2e', {}).get('enabled', True)
     route['stages'] = list(route_stages(route['scope'], e2e_enabled=route['e2e_enabled'],
                                        deploy_enabled=bool(configured_targets(config)),
-                                       frontend_deploy_enabled=frontend_release_config(config).get('enabled', False)))
+                                       frontend_deploy_enabled=frontend_release_config(config).get('enabled', False),
+                                       git_push_enabled=config.get('runtime', {}).get('git_push_enabled', False)))
     if revision:
         previous = get_split(store, item)
         if not previous or previous['scope'] != route['scope']:
@@ -184,6 +185,8 @@ def v2_repair(stage, data, route):
             phases.append(acceptance)
     if joint and owner == 'backend':
         phases.extend(('backend.acceptance', 'backend.integration'))
+        if 'backend.push' in route['stages']:
+            phases.append('backend.push')
         if DEPLOY_STAGE in route['stages']:
             phases.append(DEPLOY_STAGE)
         phases.append('handoff')
@@ -193,6 +196,8 @@ def v2_repair(stage, data, route):
 
 
 def stage_role(stage):
+    if stage in GIT_PUSH_STAGES:
+        return 'Git 推送执行器'
     if stage == FRONTEND_DEPLOY_STAGE:
         return '前端部署 Agent'
     if stage == DEPLOY_STAGE:

@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from delivery_scope import project_mode, route_stages
-from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, validate_configured_targets, validate_frontend_release
+from deploy_state import (DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, validate_configured_targets,
+                          validate_frontend_release)
 from task_evidence import EVIDENCE_SCHEMA
 
 STAGES = ('material_check', 'design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review', 'e2e', 'integration')
@@ -15,6 +16,7 @@ STAGE_NAMES = dict(zip(STAGES, ('材料评审', '设计', '计划', '分支核�
 STAGE_NAMES.update(split='范围判定与任务拆分', handoff='后端联调交接')
 STAGE_NAMES[DEPLOY_STAGE] = '后端部署'
 STAGE_NAMES[FRONTEND_DEPLOY_STAGE] = '前端镜像发布'
+STAGE_NAMES.update(zip(GIT_PUSH_STAGES, ('后端代码推送', '前端代码推送')))
 for scoped_stage in route_stages('fullstack'):
     if '.' in scoped_stage:
         side, step = scoped_stage.split('.')
@@ -281,7 +283,8 @@ def validate_config(config):
         side, _, name = target.partition(':')
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
-    for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync'):
+    for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync',
+                'git_push_enabled'):
         if key in runtime and type(runtime[key]) is not bool:
             raise ValueError(f'runtime.{key} must be a boolean')
     if runtime.get('sync_requirement_before_review'):

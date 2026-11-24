@@ -17,10 +17,11 @@ from uuid import UUID, uuid4
 from backend_deploy_runner import deployment_action, run_deployment
 from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
-from deploy_state import FRONTEND_DEPLOY_STAGE
+from deploy_state import FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
 from ledger import Ledger, encode, item_identity, transaction, validate_config
 from frontend_release_runner import run_frontend_release
+from git_delivery_runner import run_git_delivery
 from stage_runner import recover_job_stop, run_stage, utc_now
 from status_board import publish_status
 from story_review_remote import StoryReviewRemote
@@ -89,7 +90,8 @@ def worker_prompt(operation, item):
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
         '按同名后端服务列入计划并使用核验过的工单工作树。前端使用已配置业务后端的契约。'
-        '若账本进入 backend.deploy（含返工分段）或 frontend.deploy，结束当前轮次，发布执行器会接手并续接原会话。'
+        '若账本进入 backend.push、frontend.push、backend.deploy 或 frontend.deploy（含返工分段），'
+        '结束当前轮次，Windows 执行器会接手并续接原会话。'
         '各阶段按 task_scope.active 派发，按编号记录 task_blockers 与证据。'
         '跨端依赖须验证交接；交接受阻时按账本继续独立的前端任务。旧工单沿用原阶段。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
@@ -197,12 +199,19 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             pending = peek()
             continue
         if state == 'deployment_pending':
-            frontend = pending.get('stage') == FRONTEND_DEPLOY_STAGE
-            release_key = 'frontend_deployment' if frontend else 'backend_deployment'
+            stage = pending.get('stage')
+            if stage in GIT_PUSH_STAGES:
+                runner = run_git_delivery
+                release_key = 'git_delivery'
+            elif stage == FRONTEND_DEPLOY_STAGE:
+                runner = run_frontend_release
+                release_key = 'frontend_deployment'
+            else:
+                runner = run_deployment
+                release_key = 'backend_deployment'
             if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
                 deployment = {'status': 'deployment_runtime_blocked'}
             else:
-                runner = run_frontend_release if frontend else run_deployment
                 deployment = runner(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT,
                                     recover=recover_deployment)
             status = deployment['status']

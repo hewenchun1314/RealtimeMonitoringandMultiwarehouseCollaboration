@@ -4,28 +4,28 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from deploy_state import (COMMIT, DEPLOY_STAGE, DEPLOY_STAGES, FRONTEND_DEPLOY_STAGE, TAG,
+from backend_dependencies import backend_services, writable_dependencies
+from branch_check import valid_target
+from deploy_state import (COMMIT, DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, TAG, WORKER_STAGES,
                           deployed_receipt_matches, frontend_release_config, project_services, release_locks, target_key)
-from execution import active_attempt, attempt_finish, attempt_start, execution_matches, repair_advance
+from execution import active_attempt, attempt_finish, attempt_seed, attempt_start, execution_matches, repair_advance
 from ledger import Ledger, item_identity, message, transaction, validate_config
-from route_evidence import deployment_requirements
+from route_evidence import deployment_requirements, git_push_evidence_error, git_push_requirements, push_covers
 from route_execution import get_split, is_routed, read_history, snapshot
 
 
-def deployment_pending(store, item):
+def pending_worker_stage(store, item):
     if item['state'] != 'running' or not is_routed(item):
-        return False
-    if item['stage'] in DEPLOY_STAGES:
-        return True
+        return None
+    if item['stage'] in WORKER_STAGES:
+        return item['stage']
     trial = active_attempt(store, item)
     if trial:
-        return trial['phase'] == DEPLOY_STAGE
+        return trial['phase'] if trial['phase'] in WORKER_STAGES else None
     if item['stage'] != 'frontend.e2e':
-        return False
-    previous = store.conn.execute('''SELECT result FROM attempts WHERE item_seq=? AND run_round=? AND stage=?
-        AND outcome IS NOT NULL ORDER BY rowid DESC LIMIT 1''', (item['seq'], item['run_round'], item['stage'])).fetchone()
-    result = json.loads(previous['result']) if previous else {}
-    return result.get('phase') == DEPLOY_STAGE and not result.get('terminal_step')
+        return None
+    seed = attempt_seed(store, item, routed=True)
+    return seed[1] if seed and seed[1] in WORKER_STAGES else None
 
 
 def acquire_locks(store, item, scope, resources):
@@ -92,13 +92,16 @@ def frontend_request(store, item, directory):
             or source != (directory / store.config.get('workspaces', {}).get('frontend', '.')).resolve()):
         raise ValueError('前端镜像发布或前端工作区授权已变更')
     route, steps = read_history(store, item)
-    required = [name for name in route['stages'] if name.startswith('frontend.') and name != FRONTEND_DEPLOY_STAGE]
+    required = [name for name in route['stages'] if name.startswith('frontend.') and name not in
+                (FRONTEND_DEPLOY_STAGE, 'frontend.push')]
     if any(steps.get(name, {}).get('outcome') != 'success' for name in required):
         raise ValueError('前端发布需要本单前端验证及合回成功')
     planned = steps['frontend.plan']['evidence']['applications']
     versions = steps['frontend.integration']['evidence']['merged_versions']
     if not planned or set(planned) != versions.keys():
         raise ValueError('前端应用与合回 SHA 清单不一致')
+    if not push_covers(store, item, 'frontend.push', versions):
+        raise ValueError('前端整包发布需要全部计划应用的 Git 远端回执')
     application_settings = config['development']['frontend_bundle']['applications']
     live_apps = store.config['development']['frontend_bundle']['applications']
     applications = {}
@@ -115,7 +118,59 @@ def frontend_request(store, item, directory):
     if len({app['repository'] for app in applications.values()}) != len(applications):
         raise ValueError('前端发布应用必须映射到不同仓库')
     return {'marker': item['marker'], 'settings': approved, 'applications': applications,
+            'git_push_verified': 'frontend.push' in route['stages'],
             'release_dir': str(directory.parent / 'customized-release')}
+
+
+def push_location(config, directory, side, key):
+    dependency = writable_dependencies(config).get(key) if side == 'backend' else None
+    if side == 'backend':
+        target = backend_services(config).get(key)
+    else:
+        target = config['development'].get('frontend_bundle', {}).get('applications', {}).get(key)
+    workspace = dependency['source_path'] if dependency else config.get('workspaces', {}).get(side)
+    if not workspace or not valid_target(target):
+        return None
+    root = (directory / workspace).resolve()
+    repository = (root / target['repository']).resolve()
+    if not repository.is_relative_to(root):
+        return None
+    return repository, target['branch']
+
+
+def push_request(store, item, directory, stage):
+    config = snapshot(item)
+    if not all(settings.get('runtime', {}).get('git_push_enabled') for settings in (config, store.config)):
+        return {}, {}, 'Git 推送授权已关闭'
+    versions, branches, errors, blocked = git_push_requirements(store, item, stage)
+    side = stage.split('.')[0]
+    requests = {}
+    for key, sha in sorted(versions.items()):
+        location = push_location(config, directory, side, key)
+        current = push_location(store.config, directory, side, key)
+        proof = branches[key]
+        if (not location or location != current or proof.get('status') != 'verified'
+                or (str(location[0]), location[1]) != (proof.get('source_root'), proof.get('target_branch'))):
+            errors[key] = '仓库或目标分支授权已变更，或不匹配分支核验回执'
+            continue
+        repository, branch = location
+        requests[key] = {'repository': str(repository), 'branch': branch, 'sha': sha}
+    return requests, errors, blocked
+
+
+def claim_push(store, item, directory, stage):
+    requests, errors, blocked = push_request(store, item, directory, stage)
+    resources = sorted({json.dumps([str(Path(request['repository'])), request['branch']])
+                        for request in requests.values()})
+    if not acquire_locks(store, item, 'git-ref', resources):
+        return message('deployment_busy', reason='同一仓库目标分支已有工单在推送')
+    trial = attempt_start(store, item, {**binding(item), 'stage': item['stage']},
+                          config_directory=directory, deployment_worker=True)
+    if trial['status'] not in ('attempt_started', 'attempt_active'):
+        return trial
+    store.conn.execute('INSERT INTO deployment_claims VALUES(?,?)', (trial['attempt_id'], item['seq']))
+    return message('deployment_claimed', **trial_fields(item, trial), push_requests=requests,
+                   errors=errors, blocked=blocked)
 
 
 def claim_frontend(store, item, directory):
@@ -139,13 +194,15 @@ def claim_frontend(store, item, directory):
     return message('deployment_claimed', **trial_fields(item, trial), frontend_request=request, blocked=blocked)
 
 
-def claim_deployment(store, item, directory):
+def claim_deployment(store, item, directory, stage):
     if not execution_matches(store, item, binding(item)):
         return message('stale_execution')
     active = active_attempt(store, item)
     if active and store.conn.execute('SELECT 1 FROM deployment_claims WHERE attempt_id=?',
                                      (active['attempt_id'],)).fetchone():
         return message('deployment_busy', **trial_fields(item, active))
+    if stage in GIT_PUSH_STAGES:
+        return claim_push(store, item, directory, stage)
     if item['stage'] == FRONTEND_DEPLOY_STAGE:
         return claim_frontend(store, item, directory)
     requests, skipped, gateway, blocked = release_requests(store, item, directory)
@@ -180,6 +237,24 @@ def lock_image_tags(store, item, directory, fields):
 def finish_deployment(store, item, trial, directory, fields):
     data = {**fields, **binding(item), 'phase': trial['phase']}
     evidence = data.get('evidence')
+    stage = trial['phase'] if trial['phase'] != 'verify' else item['stage']
+    if stage in GIT_PUSH_STAGES:
+        if not isinstance(evidence, dict):
+            return message('evidence_required', reason='Git 推送需要逐仓回执')
+        if reason := git_push_evidence_error(store, item, stage, evidence, partial=data.get('outcome') != 'success'):
+            return message('evidence_required', reason=reason)
+        if data.get('outcome') == 'success':
+            requests, errors, blocked = push_request(store, item, directory, stage)
+            if blocked or errors or requests.keys() != evidence['repositories'].keys():
+                data.update(outcome='failed', summary=blocked or 'Git 推送授权在执行期间变更', retryable=False)
+        if data.get('outcome') == 'success' and trial['phase'] != 'verify':
+            result = repair_advance(store, item, data, config_directory=directory, deployment_worker=True)
+        else:
+            result = attempt_finish(store, item, data, config_directory=directory, deployment_worker=True)
+        if result['status'] in ('attempt_finished', 'repair_advanced'):
+            store.conn.execute("DELETE FROM deployment_locks WHERE scope='git-ref' AND item_seq=?", (item['seq'],))
+            store.conn.execute('DELETE FROM deployment_claims WHERE attempt_id=?', (trial['attempt_id'],))
+        return result
     if item['stage'] == FRONTEND_DEPLOY_STAGE:
         if data.get('outcome') == 'success':
             try:
@@ -232,12 +307,13 @@ def deployment_action(action, marker, database, config_path, **fields):
     with transaction(database) as conn:
         store = Ledger(conn, config, datetime.now(timezone.utc))
         item = conn.execute('SELECT * FROM work_items WHERE marker=?', (marker,)).fetchone()
-        if not item or not deployment_pending(store, item):
+        stage = pending_worker_stage(store, item) if item else None
+        if not stage:
             return message('deployment_not_pending')
         if action == 'peek':
-            return message('deployment_pending', stage=item['stage'])
+            return message('deployment_pending', stage=stage)
         if action == 'claim':
-            return claim_deployment(store, item, directory)
+            return claim_deployment(store, item, directory, stage)
         trial = active_attempt(store, item)
         if (not trial or trial['attempt_id'] != fields.get('attempt_id')
                 or not conn.execute('SELECT 1 FROM deployment_claims WHERE attempt_id=? AND item_seq=?',

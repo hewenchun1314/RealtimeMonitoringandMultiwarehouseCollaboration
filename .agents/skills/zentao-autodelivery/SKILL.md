@@ -40,7 +40,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 1. 核对当前聊天 ID、工单唯一键、派发请求和执行名额，通过 `record start` 领取执行权。若返回 `dispatch_runtime_blocked`，本轮结束。对已领取过的工单，每个续接轮次先用 `record runtime_check` 核对本轮权限，无法满足时在当前权限内逐步核对、记录各步实际阻断并推进。重复启动、旧凭证和旧尝试按账本结果处理。已有有效尝试时沿该尝试核对进度，禁止重复启动 Agent 或受控进程。
 2. 按 [步骤指引](references/stages.md) 执行当前步骤。确认执行环境可以按截止时间停止本次 Agent 和受控进程，登记本次尝试后立即执行。当前环境缺少可用的停止能力时，登记该步骤及阻断，以不可重试失败结束本次尝试并按账本结果推进。本次未启动 Agent 或进程时一并记录。E2E 读取 [环境准备](references/e2e.md)。提前完成就保存结果并立即进入下一步。
    后端阶段把回执里的 `backend_dependencies` 交给对应 Agent。先看业务服务自己的接口、实现与调用链，只有本单实际涉及上游时才按[依赖配置](references/backend.md#上游依赖与修改权限)查契约或登记修改目标。前端仍从已配置业务后端和联调交接获取接口契约。
-   当账本进入 `backend.deploy`（含返工分段）或 `frontend.deploy` 时，结束本轮并把执行权交还 Windows 工单启动器。发布执行器自动认领、发布、核验和登记。启动器恢复原工单聊天后，从账本读取发布结果，再继续联调交接或收尾。遇到 `deployment_worker_required` 也走同一交接。前端发布的完成条件见[前端镜像发布](references/frontend-release.md)。
+   当账本进入 `backend.push`、`frontend.push`、`backend.deploy` 或 `frontend.deploy`（含返工分段）时，结束本轮并把执行权交还 Windows 工单启动器。受控执行器认领、执行和登记结果，启动器恢复原工单聊天。遇到 `deployment_worker_required` 也走同一交接。Git 推送见[步骤指引](references/stages.md)，镜像发布见[前端镜像发布](references/frontend-release.md)。
    Story 的材料评审尝试返回 `material_sync_required:true` 时，先用阶段运行器执行 `record material_sync`。取得 `material_synced` 后才派发评审 Agent。同步失败按本次尝试的普通失败处理。命令和回执见[步骤指引](references/stages.md#需求材料同步)。
    返回 `story_review_required:true` 时按[禅道正式评审](references/stages.md#禅道正式评审)核实评审目标。需求评审 Agent 负责材料结论及理由。`attempt_finish` 返回 `disposition:review_wait` 时结束当前轮次，由 Windows 启动器提交、回读并决定续接。
 3. 使用 `record` 保存步骤、尝试、工单和聊天绑定、实际起止时间、结果、证据与失败原因。阶段结果与待回写记录一起提交。确认失败可重试时按配置执行，默认首次执行后最多重试三次，每次独立计时。
@@ -50,7 +50,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 
 Windows 上需要受控超时的 Agent 和本次自有进程使用 [阶段运行器](references/stage-runner.md) 启动。把 SQLite 返回的绝对截止时间传入运行器，按它的终态和清理证据登记原尝试。已启动的用户服务不进入本次受控进程组。
 
-启用 `runtime.split_task_sync` 的新 Story 由启动器为拆分 Agent 并行管理 Task。拆分登记后研发即可开始；同步器读取原 Story 的迭代、项目和建单时指派账号，每个稳定拆分编号对应一张 Task。研发和测试按[步骤指引](references/stages.md)提供逐项证据，账本在独立验收及相关仓库实际合回均满足时安排关闭。迭代待定时保留待建单，原任务返工后重开同一 Task。收尾备注和进度页分别报告研发与禅道现状。
+启用 `runtime.split_task_sync` 的新 Story 由启动器为拆分 Agent 并行管理 Task。拆分登记后研发即可开始；同步器读取原 Story 的迭代、项目和建单时指派账号，每个稳定拆分编号对应一张 Task。研发和测试按[步骤指引](references/stages.md)提供逐项证据，账本在独立验收、相关仓库合回及已配置的 Git 推送和部署核验条件满足时安排关闭。迭代待定时保留待建单，原任务返工后重开同一 Task。收尾备注和进度页分别报告研发与禅道现状。
 
 启用 `runtime.split_task_progress_sync` 的新 Story 在实际开工后同步「进行中」，遇到部署、依赖或联调验收受阻时按任务追加备注。等待前置依赖的任务保持「未开始」。工单主聊天继续按任务编号登记阶段结果，任务同步器负责写入并读回。
 

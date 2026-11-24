@@ -8,7 +8,8 @@ from uuid import uuid4
 from backend_dependencies import backend_services, dependency_context
 from branch_check import branch_context, planned_applications, valid_evidence
 from delivery_scope import material_location, read_material
-from deploy_state import DEPLOY_STAGE, DEPLOY_STAGES, configured_targets, deployed_receipt_matches, release_locks
+from deploy_state import (DEPLOY_STAGE, GIT_PUSH_STAGES, WORKER_STAGES, configured_targets,
+                          deployed_receipt_matches, release_locks)
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from material_sync import requirement_checkout, verify_requirement_intent
@@ -148,7 +149,7 @@ def phase_deadline(store, item, phase):
     timeouts = snapshot(item)['development']['step_timeout_minutes']
     key = item['stage'] if phase == 'verify' else PHASE_TIMERS.get(phase, phase)
     name = key.rsplit('.', 1)[-1]
-    base = {'split': 'plan', 'handoff': 'integration', 'acceptance': 'e2e'}.get(name, name)
+    base = {'split': 'plan', 'handoff': 'integration', 'acceptance': 'e2e', 'push': 'integration'}.get(name, name)
     minutes = timeouts.get(key, timeouts.get(name, timeouts.get(base)))
     if minutes is None:
         if base == 'integration':
@@ -193,6 +194,37 @@ def story_review_enabled(item):
             and snapshot(item).get('runtime', {}).get('story_review_sync', False))
 
 
+def attempt_seed(store, item, routed):
+    previous = store.conn.execute('''SELECT run_round,retry_number,result FROM attempts
+                                     WHERE item_seq=? AND stage=?
+                                     ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
+                                  (item['seq'], item['stage'])).fetchone()
+    new_round = previous and previous['run_round'] != item['run_round']
+    retries = previous['retry_number'] + 1 if previous and not new_round else 0
+    if retries > snapshot(item)['development']['max_retries_per_step']:
+        return None
+    last_result = json.loads(previous['result']) if previous else {}
+    if routed and new_round and last_result.get('repair_required'):
+        entered_round = store.conn.execute('SELECT 1 FROM attempts WHERE item_seq=? AND run_round=? LIMIT 1',
+                                           (item['seq'], item['run_round'])).fetchone()
+        stage_record = read_history(store, item)[1].get(item['stage'])
+        # A re-split or an earlier step in the new round invalidates the old itinerary.
+        if entered_round or not stage_record or stage_record['outcome'] != 'failed':
+            last_result = {}
+    if not last_result.get('repair_required'):
+        return retries, 'verify', []
+    if not routed:
+        return retries, 'repair_coding', []
+    if last_result['phase'] == 'verify':
+        return retries, last_result['repair_sequence'][0], []
+    history = last_result['repair_phases']
+    if new_round:
+        for index, receipt in enumerate(history):
+            if validate_success(store, item, receipt['phase'], receipt['evidence']):
+                return retries, receipt['phase'], history[:index]
+    return retries, last_result['phase'], history
+
+
 def attempt_start(store, item, data, *, config_directory, deployment_worker=False):
     if item['state'] in ('review_handoff', 'review_wait', 'review_ready') and execution_matches(store, item, data):
         return message('story_review_pending')
@@ -200,7 +232,7 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
         return message('stale_execution')
     if data.get('stage') != item['stage']:
         return message('stage_mismatch', stage=item['stage'])
-    if item['stage'] in DEPLOY_STAGES and not deployment_worker:
+    if item['stage'] in WORKER_STAGES and not deployment_worker:
         return message('deployment_worker_required')
     preparation = branch_context(store, item) if item['stage'].rsplit('.', 1)[-1] == 'branch_check' else {}
     if material_sync_required(store, item):
@@ -212,45 +244,18 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
         preparation['route'] = get_split(store, item)
     active = active_attempt(store, item)
     if active:
-        if active['phase'] == DEPLOY_STAGE and not deployment_worker:
+        if active['phase'] in WORKER_STAGES and not deployment_worker:
             return message('deployment_worker_required')
         if routed:
             preparation.update(phase_context(store, item, active['phase'], config_directory))
         return message('attempt_active', attempt_id=active['attempt_id'], deadline_at=active['deadline_at'],
                        phase=active['phase'], retry_number=active['retry_number'],
                        phase_started_at=active['phase_started_at'], **preparation)
-    development = json.loads(item['config_snapshot'])['development']
-    previous = store.conn.execute('''SELECT run_round,retry_number,result FROM attempts
-                                     WHERE item_seq=? AND stage=?
-                                     ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
-                                  (item['seq'], item['stage'])).fetchone()
-    retries = previous['retry_number'] + 1 if previous and previous['run_round'] == item['run_round'] else 0
-    if retries > development['max_retries_per_step']:
+    seed = attempt_seed(store, item, routed)
+    if seed is None:
         return message('retry_exhausted')
-    last_result = json.loads(previous['result']) if previous else {}
-    if routed and previous and previous['run_round'] != item['run_round'] and last_result.get('repair_required'):
-        entered_round = store.conn.execute('SELECT 1 FROM attempts WHERE item_seq=? AND run_round=? LIMIT 1',
-                                           (item['seq'], item['run_round'])).fetchone()
-        stage_record = read_history(store, item)[1].get(item['stage'])
-        # Direct recovery may repair the same failure. A re-split or any
-        # earlier step executed in this round invalidates that old itinerary.
-        if entered_round or not stage_record or stage_record['outcome'] != 'failed':
-            last_result = {}
-    phase = 'verify'
-    history = []
-    if last_result.get('repair_required'):
-        phase = last_result['repair_sequence'][0] if routed else 'repair_coding'
-        if routed and last_result['phase'] != 'verify':
-            # An environment failure after a merge resumes its handoff, even across
-            # recovery rounds, without merging the same candidate a second time.
-            history = last_result['repair_phases']
-            phase = last_result['phase']
-            if previous['run_round'] != item['run_round']:
-                for index, receipt in enumerate(history):
-                    if validate_success(store, item, receipt['phase'], receipt['evidence']):
-                        phase, history = receipt['phase'], history[:index]
-                        break
-    if phase == DEPLOY_STAGE and not deployment_worker:
+    retries, phase, history = seed
+    if phase in WORKER_STAGES and not deployment_worker:
         return message('deployment_worker_required')
     deadline = phase_deadline(store, item, phase)
     attempt_id = uuid4().hex
@@ -272,7 +277,7 @@ def repair_advance(store, item, data, *, config_directory, deployment_worker=Fal
     if not trial or trial['attempt_id'] != data.get('attempt_id'):
         return message('stale_attempt')
     phase = trial['phase']
-    if phase == DEPLOY_STAGE and not deployment_worker:
+    if phase in WORKER_STAGES and not deployment_worker:
         return message('deployment_worker_required')
     routed = is_routed(item)
     if phase != data.get('phase') or phase == 'verify' or (not routed and phase not in PHASE_TIMERS):
@@ -395,7 +400,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     if outcome not in ('success', 'failed', 'timed_out'):
         raise ValueError('outcome must be success, failed or timed_out')
     phase = trial['phase']
-    if (item['stage'] in DEPLOY_STAGES or phase == DEPLOY_STAGE) and not deployment_worker:
+    if (item['stage'] in WORKER_STAGES or phase in WORKER_STAGES) and not deployment_worker:
         return message('deployment_worker_required')
     completed_phases = json.loads(trial['phase_history'])
     if data.get('phase', None if completed_phases else 'verify') != phase:
@@ -538,6 +543,15 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     recorded_blockers = dict(reported or {}) if not retry else {}
     if current_route and not retry and phase == 'verify':
         existing = blocked_tasks(current_route, history)
+        if not finished and stage in GIT_PUSH_STAGES:
+            side = stage.split('.')[0]
+            plan = stage_evidence(store, item, side + '.plan') or {}
+            pushed = (evidence or {}).get('repositories', {})
+            recorded_blockers.update({
+                key: '待核验远端代码：' + '、'.join(sorted(set(repositories) - pushed.keys()))
+                for key, repositories in plan.get('task_repositories', {}).items()
+                if key in stage_tasks - existing.keys() and set(repositories) - pushed.keys()
+            })
         if not finished and stage == 'handoff':
             recorded_blockers.update({key: summary for key in stage_tasks - existing.keys() - recorded_blockers.keys()})
         if not finished and stage == DEPLOY_STAGE and not recorded_blockers:
