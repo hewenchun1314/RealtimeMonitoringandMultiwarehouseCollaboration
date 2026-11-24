@@ -495,11 +495,58 @@ class DevelopmentGitTests(unittest.TestCase):
         git(source, 'config', 'core.hooksPath', '.husky/_')
         git(source, 'add', '--', '.husky/pre-commit')
         git(source, 'commit', '-m', 'Fixture original Husky check without installed runtime')
+        before = git(source, 'rev-parse', 'HEAD')
+        self.request('branch_prepare')
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        self.assertIn('runtime', failed['repositories'][self.d.key]['reason'].lower())
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
+
+    def test_preparation_requires_original_postcheckout_husky_runtime(self):
+        source = self.d.repositories['frontend']
+        checks = source / '.husky'
+        checks.mkdir()
+        (checks / 'post-checkout').write_text('exit 1\n')
+        git(source, 'config', 'core.hooksPath', '.husky/_')
+        git(source, 'add', '--', '.husky/post-checkout')
+        git(source, 'commit', '-m', 'Fixture tracked checkout check without generated runtime')
+        self.request('branch_prepare')
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        self.assertIn('runtime', failed['repositories'][self.d.key]['reason'].lower())
+        self.assertFalse((self.d.database.parent / 'worktrees').exists())
+
+    def test_target_only_husky_check_requires_runtime_even_when_source_branch_has_no_check(self):
+        source = self.d.repositories['frontend']
+        base = git(source, 'rev-parse', 'HEAD')
+        checks = source / '.husky'
+        checks.mkdir()
+        (checks / 'pre-commit').write_text('exit 1\n')
+        git(source, 'add', '--', '.husky/pre-commit')
+        git(source, 'commit', '-m', 'Fixture target adds original precommit')
+        git(source, 'switch', '-c', 'user-branch-without-check', base)
+        git(source, 'config', 'core.hooksPath', '.husky/_')
         root = self.begin_coding()
+        self.assertFalse((source / '.husky/pre-commit').exists())
+        self.assertTrue((root / '.husky/pre-commit').is_file())
         (root / 'index.html').write_text('<output>approved</output>\n')
-        before = git(root, 'rev-parse', 'HEAD')
         self.candidate(root)
         failed = self.host()
         self.assertEqual(failed['status'], 'host_git_failed', failed)
         self.assertIn('runtime', failed['repositories'][self.d.key]['reason'].lower())
-        self.assertEqual(git(root, 'rev-parse', 'HEAD'), before)
+
+    def test_target_only_postcheckout_requires_runtime_before_first_checkout(self):
+        source = self.d.repositories['frontend']
+        base = git(source, 'rev-parse', 'HEAD')
+        checks = source / '.husky'
+        checks.mkdir()
+        (checks / 'post-checkout').write_text('exit 1\n')
+        git(source, 'add', '--', '.husky/post-checkout')
+        git(source, 'commit', '-m', 'Fixture target adds original checkout check')
+        git(source, 'switch', '-c', 'user-branch-without-check', base)
+        git(source, 'config', 'core.hooksPath', '.husky/_')
+        self.request('branch_prepare')
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        self.assertIn('runtime', failed['repositories'][self.d.key]['reason'].lower())
+        self.assertFalse((self.d.database.parent / 'worktrees').exists())

@@ -128,7 +128,7 @@ def hooks(root, journal, deadline):
         raise ValueError('An original Git hook failed; fix its checks before retrying')
 
 
-def ensure_hooks(source, root, deadline):
+def ensure_hooks(source, root, deadline, *, checkout=None):
     source_hooks = Path(git(source, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks', deadline=deadline))
     item_hooks = Path(git(root, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks', deadline=deadline))
     if source_hooks != item_hooks and source_hooks.is_dir():
@@ -144,13 +144,19 @@ def ensure_hooks(source, root, deadline):
                     raise ValueError('Install original generated hooks; host bootstrap only copies ignored regular runtime files')
                 item_hooks.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(entry, destination)
-    names = ('pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'pre-merge-commit', 'post-merge')
+    names = ('post-checkout', 'pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'pre-merge-commit', 'post-merge')
     for name in names:
         if (source_hooks / name).is_file() and not (item_hooks / name).is_file():
             raise ValueError('Install the registered repository hooks in this item worktree before host Git work')
     if source_hooks.name == '_' and source_hooks.parent.name == '.husky':
+        # The source can be on another user branch. Conservatively check runtime
+        # readiness for the locked target tree before creating its checkout.
+        if (checkout and git(source, 'cat-file', '-e', checkout + ':.husky/post-checkout',
+                             deadline=deadline, allowed=(0, 128)) is not None
+                and (not (source_hooks / 'post-checkout').is_file() or not os.access(source_hooks / 'post-checkout', os.X_OK))):
+            raise ValueError('Install the original generated Husky runtime before running the tracked checkout check')
         for name in names:
-            if ((source_hooks.parent / name).is_file()
+            if (((source_hooks.parent / name).is_file() or (item_hooks.parent / name).is_file())
                     and (not (item_hooks / name).is_file() or not os.access(item_hooks / name, os.X_OK))):
                 raise ValueError('Install the original generated Husky runtime before running the tracked checks')
             if (source_hooks.parent / name).is_file() and not (item_hooks.parent / name).is_file():
@@ -215,6 +221,7 @@ def prepare(proof, context, key, database, journal, payload=None):
         raise ValueError('The locked preparation baseline changed')
     write_json(effect, {'base_commit': base, 'worktree': str(worktree), 'source_ref': ref})
     if not worktree.exists():
+        ensure_hooks(source, source, deadline, checkout=base)
         worktree.parent.mkdir(parents=True, exist_ok=True)
         branch_exists = git(source, 'show-ref', '--verify', '--quiet', 'refs/heads/' + proof['worktree_branch'],
                             deadline=deadline, allowed=(0, 1)) is not None
@@ -364,6 +371,7 @@ def integrate(proof, context, operation, key, journal, database, payload):
     if git(source, 'merge-base', '--is-ancestor', tip, candidate, deadline=deadline, allowed=(0, 1)) is None:
         raise ValueError('This fixed operation supports only fast-forward/already-contained results; resolve divergence through a separate controlled path')
     if merge_root == temporary and not temporary.exists():
+        ensure_hooks(source, source, deadline, checkout=tip)
         temporary.parent.mkdir(parents=True, exist_ok=True)
         write_json(ownership_path, identity)
         write_json(effect, {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(merge_root)})
