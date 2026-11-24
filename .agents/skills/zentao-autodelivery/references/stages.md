@@ -23,10 +23,11 @@
 | `split` | 拆分 Agent | 项目单端设置决定实际范围。项目支持两端时优先用文档标记，缺标记再根据代码、接口与验收条件研判；双端配置中标记非法或矛盾时记录歧义。写 `split.md` 和结构化任务证据，格式见[账本命令](workflow-cli.md)。将超出范围的验收条件写入 `blockers`。 |
 | `<端>.design`、`<端>.plan` | 本端开发 Agent | 按拆分清单在本轮的 `frontend/` 或 `backend/` 写 `design.md`、`plan.md`。设计附文件证据，计划登记非空且唯一的应用键数组 `applications` 或服务键数组 `services`。 |
 | `<端>.branch_check` | 主会话 | 按[分支核验](branches.md)准备并实地核对每个目标仓库的 worktree，提交完整 `repositories`。 |
-| `<端>.coding`、`<端>.unit_test` | 本端开发 Agent | 在已核验工作树实施并创建候选提交。`versions` 映射本端配置键到候选 SHA；单测额外用 `verification` 记录实际命令、运行结果与证据。后端开发 Agent 还运行配置的构建命令，跨端时编写联调文档。 |
+| `<端>.coding` | 本端开发 Agent、主会话 | 开发 Agent 在已核验工作树编辑、构建和测试，返回逐仓文件清单、原 HEAD、提交说明及验证证据。主会话通过 [candidate_commit](branches.md#编码与候选提交) 交宿主运行原 hooks，恢复后把成功 `versions` 登记为候选。后端还运行配置的构建命令，跨端时编写联调文档。 |
+| `<端>.unit_test` | 本端开发 Agent | 对有效 coding 的同一 `versions` 跑测试，以 `verification` 保存实际命令、结果和证据；不得自行提交。需要代码或生成文件修订时，失败结果传 `repair_required:true`，回到 coding 后重跑单测。 |
 | `<端>.code_review` | 本端测试 Agent | 按[代码审查](#代码审查)逐仓准备 OCR 文件清单和评审规则，审查本端计划及候选改动。提交 `versions` 和 `verification`，记录位置、结论和严重度。 |
 | `backend.acceptance`、`frontend.e2e` | 本端测试 Agent | 按[后端服务验收](backend.md)或[前端页面验收](e2e.md)实际运行用例。提交 `versions`、`verification` 和逐项验证的本端任务编号数组 `verified_tasks`，覆盖当前有效清单。联合验收加 `backend_versions`，核对已交接服务版本。 |
-| `<端>.integration` | 主会话 | 在配置目标分支逐仓合回并读回，保存 `versions`（候选提交）及 `merged_versions`（实际合回提交）。合回树与候选树内容有差异时，用 `merged_verification` 写明最终版本的复验结果。部分合回或冲突时记录已完成仓库及失败原因；恢复先核对现状。需要改业务逻辑的冲突交本端开发和测试 Agent 处理。 |
+| `<端>.integration` | 主会话、宿主执行器 | 通过 [integration_merge](branches.md#合回与恢复) 请求固定目标的安全快进或已包含核验，结束本轮交宿主执行；恢复后保存候选 `versions` 及实际 `merged_versions`。最终树与候选不同仍需 `merged_verification`。部分成功保留实际结果；目标分叉需要另行授权的受控历史处理，不在沙箱自行 merge、rebase 或 cherry-pick。 |
 | `backend.push`、`frontend.push` | Windows 工单启动器和 Git 推送执行器 | 工单快照启用 `runtime.git_push_enabled` 时，逐仓推送验收并合回的 SHA，即使该端没有镜像部署。部分交付依赖逐任务验收、实际合回及最终内容复验证据。核对快照、当前配置和分支核验回执，向配置分支普通推送并读回远端。已包含该 SHA 时登记已有远端版本。遇到分叉、权限或目标错误时记录该仓失败，保留其他仓结果。 |
 | `backend.deploy` | Windows 工单启动器和发布执行器 | 后端审查、独立验收、合回和已启用的 Git 推送成功后，按快照和当前授权选择实际服务的部署目标。用已合回版本打包并推送，按摘要更新 Deployment，核验 Pod 与网关版本后自动登记回执。工单主会话在此阶段交还执行权。详见[后端部署](backend.md#后端自动部署)。 |
 | `frontend.deploy` | Windows 工单启动器和前端部署 Agent | 核验前端 Git 远端已包含合回 SHA，核对本地停服，从固定 SHA 打包并读回 Harbor 摘要。配置 Rancher 时继续更新并核验新 Ready Pod。详见[前端镜像发布](frontend-release.md)。 |
@@ -34,7 +35,7 @@
 
 端内返工依次完成修复、单测、复审或重验。联合验收发现后端缺陷时注明责任端，按同一尝试中账本返回的分段修复并再次交接，使用新版本跑受影响的联合验收。涉及任务或接口约定变化时，由拆分 Agent 更新任务并说明依据。主会话收尾以有效版本、实际验收和所有必需任务为准；安全合回成功的事实与未解决的验收项分别记账。
 
-编码、单测、审查和验收提交成功时，账本会读回本端工单 worktree 的 HEAD、已跟踪文件和暂存区。运行命令前先确认实现与测试所需的文件已进入候选提交；若测试工具改写了已跟踪文件，核对改动，按实际提交重新运行受影响的测试。主工作区中用户已有的改动由主会话在合回时独立核对。
+编码、单测、审查和验收登记成功时，账本会读回工单工作树的 HEAD、已跟踪文件和暂存区。单测发现需要修订时，普通单测失败的 `repair_required:true` 生成同端 coding→verify 序列；返工中单测失败则回到紧邻的同端 coding，保留此前有效历史。新 coding 回执使旧版本的下游证据失效，单测、审查和验收按新 SHA 重跑。跨轮恢复先复核保留的历史。hooks 自动改文件、提交后检查失败或回执丢失按[候选恢复](branches.md#编码与候选提交)处理，不能直接登记旧版本成功。主工作区中用户已有的改动须保留。
 
 ## 代码审查
 

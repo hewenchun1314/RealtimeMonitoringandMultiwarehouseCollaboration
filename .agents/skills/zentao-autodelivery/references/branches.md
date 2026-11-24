@@ -1,29 +1,30 @@
-# 分支核验与工作树
+# 分支核验、候选提交与合回
 
-设为 `writable` 的后端依赖也可以按依赖键列入后端计划。该目标的仓库位置来自 `source_path`，`branch` 来自其 `delivery`，仍须通过同一套工单工作树与合回核验。
+前后端编辑、构建和测试留在 `never` 的 MXC 工单环境。认证、建树和调用 Git hooks 的固定操作交 Windows 宿主启动器。主聊天和阶段 Agent 禁止在沙箱自行 fetch、worktree add、commit、checkout、merge、rebase 或 cherry-pick，也不能用 `HUSKY=0`、`--no-verify` 或修改 hooks 配置绕过检查。
 
-前端计划在 `frontend.plan` 的 `evidence.applications` 登记应用键，核对快照中的 `development.frontend_bundle.applications` 和 `workspaces.frontend`。后端计划在 `backend.plan` 的 `evidence.services` 登记服务键，核对 `development.backend_bundle.services` 和 `workspaces.backend`。键严格区分大小写。`repository` 相对于对应端工作区，`branch` 是基线及合回目标。两端分别准备工作树，同名服务和应用也使用各自的工单分支。已领取的旧单沿用原计划、阶段名与工作树。
+前端计划用 `evidence.applications`，后端用 `evidence.services` 登记本端配置键。后端 `writable` 依赖可按依赖键列入计划，路径和目标来自 `source_path` 和 `delivery`。当前配置与领取快照必须仍授权同一个仓库、分支。任一配置声明 `runtime.worker_git_write_repositories` 时，两者都必须包含对应 `frontend:<键>` 或 `backend:<键>`；删除或清空既有登记视为撤销。两者从未声明登记的旧配置沿用计划与仓库配置授权。
 
-下列步骤在账本返回的 `frontend.branch_check` 或 `backend.branch_check` 运行，旧单仍使用 `branch_check`。`branch_prepare` 的前端请求传 `application`，后端请求传 `service`。`branch_inspect.worktrees` 和核验回执 `repositories` 的键始终使用本端计划中的配置键。纯后端工单核对服务工作区和独立验收入口。
+## 准备工作树
 
-## 计划完成后
+1. 主聊天领取 `<端>.branch_check`（旧单为 `branch_check`），保存原尝试、分段和绝对截止时间。`branch_inspect` 仅作只读诊断，不能用缺少目标 ref 推断远端无分支。
+2. 调用 `record branch_prepare`，传绑定、`attempt_id`、`phase` 和稳定 `event_id`。一次请求准备整个成功计划；`application` 或 `service` 仅核对计划键，批次仍覆盖该端全部目标。返回 `host_git_worker_required` 后立即结束本轮，让启动器确认 CLI、阶段子进程和 Task 同步器均已停止。
+3. 宿主仅在目标 ref 本地不存在时，非交互抓取 `origin` 精确分支；锁定基线，在账本固定路径创建工单工作树，保留源仓库位置、当前分支和用户改动。原 hooks 与过滤器照常执行。仅可把源仓库已安装、被 Git 忽略的 `.husky/_` 生成运行文件复制到工单树，不覆盖跟踪脚本或运行自由安装命令；Agent 仍须准备原项目依赖。
+4. 启动器恢复同一聊天。用原事件及相同数据读回，或 `host_git_status` 查询 `operation_id`。成功 `repositories` 是逐仓凭据；`branch_inspect` 再核对后整体提交 `attempt_finish.evidence.repositories`。部分失败保留已完成项，修复真实原因后新事件重试。
 
-1. 开发 Agent 在 `plan.md` 明确受影响的应用，并在计划成功的 `attempt_finish` 中提供 `evidence.applications`。例如只修改菜单时可用 `["shell-hub"]`。具体应用有查证困难时，先核对代码入口、构建清单和现有仓库说明。仍无法确定范围时，以计划不可重试失败登记实际证据。
-2. 工单主聊天启动账本返回的 `branch_check`，核对本机工具支持在本次尝试内完成或停止，使用返回的尝试编号和截止时间。运行 `record branch_inspect` 读取每个应用的实际 Git 根目录、当前分支及目标提交。检查严格匹配目标 refs，优先本地同名分支，然后查已有 `origin` 跟踪分支。
-3. 返回 `target_ref_missing` 时，先核对该仓库是否配置了 `origin`，通过已有凭据以非交互方式运行带时限的 `git ls-remote --exit-code --heads origin refs/heads/<branch>`。核实远端确有目标后，只抓取这一条分支到 `refs/remotes/origin/<branch>`，再运行 `branch_inspect`。对 fetch 和远端查询设置工具超时，继续沿用本次尝试的剩余时间。
-4. 所有目标都解析后，逐仓调用桌面的 `create_worktree`，传入实际 Git 根目录和锁定的 `base_commit`，保留操作编号并有界等待。成功时只在返回的工作树中建立工单分支。回执缺失时核对桌面附件和源仓库的 Git worktree 清单，优先复用能归属本单的已有结果。确认失败或仍无回执且旧请求只可能创建独立的 detached worktree 时，保留对账证据，调用 `record branch_prepare` 在账本目录创建固定路径的 Git worktree，读回后可尝试 `attach_worktree`。同一工单轮次重复调用会核对复用原路径。桌面注册未返回时，使用核验过的实际路径继续开发并记录注册状态。迟到的桌面回执只用于对账。
-5. 准备好所有工作树后，向 `branch_inspect` 传 `worktrees`，键为应用，值为返回的绝对工作树路径。每项应为 `verified`。把返回的 `repositories` 整体写入 `attempt_finish.evidence.repositories`。账本在进入编码前重新核对目标应用、仓库、工单分支和基线。启动编码或返工前读回该路径当前仍在已登记的工单分支，再把工作树交给 Agent，并记录后续候选提交。运行已启动服务的实际版本以及合回目标按现有 E2E 和合回要求核对。
+## 编码与候选提交
 
-## 阻断与继续
+编码 Agent 只在核验工作树编辑、构建、测试，返回每仓 `expected_head`、字面相对文件清单 `files`、`message` 和验证证据，不自行提交。主聊天仅在 coding 或返工 coding 分段调用 `record candidate_commit`，以 `commits` 按仓库键批量请求。不接受自由路径、远端 URL 或宿主命令；拒绝 Git 元数据、越界路径和清单外已跟踪/暂存改动。
 
-Windows 工单启动器中的 CLI 若没有桌面建树工具，先核对现有 Git worktree 和本工单证据，通过 `record branch_prepare` 使用已经核验的固定路径，传入 `desktop_reconciliation.status:"unavailable"` 及实际证据。续接时优先复用已登记的工作树。
+`host_git_worker_required` 时结束本轮；宿主按原截止时间提交并运行原 hooks。成功 `versions` 用作 coding 证据。`candidate_retest_required` 表示 hooks 改写候选或提交后检查失败：核对既有 SHA、清理并在沙箱重跑受影响检查，再以新事件、当前 `expected_head`、`files:[]` 和非空 `verification` 请求确认。失败原 post hook 必须在宿主实际重跑通过，不能靠文字跳过。仍需提交的 hook 改动先修复、测试，再请求新的 checked commit。相同事件只能读回原结果，不能换消息或文件清单。
 
-已证实应用映射缺失或无效、缺少实际 Git 仓库或本地及远端均无目标分支时，按不可重试失败记录应用、目标分支、路径和确认依据。仓库暂不可读、远端暂不可达或工具暂时异常时，按首次失败后最多三次重试处理。每次重试沿用账本中的工单和目标配置，先读回已有工作树再继续。
+unit_test 只能验证已登记候选。需要改代码或补测试时，以 failed 和 `repair_required:true` 登记，由账本返回同端 coding 修订再验证。普通单测得到 coding→verify 路线，已有返工中的单测回到前一个同端 coding。新候选重新执行单测、审查和后续验收，不沿用旧 SHA 证据。
 
-建树回执超时时，核对原操作是否已停止，或是否已限定在本工单独立的 detached worktree 内且没有任何编码 Agent 启动。能证明隔离时保存证据，按超时处理。迟到的工作树回执只进入原尝试对账。复验得到新的结论时使用新的完成事件编号。
+## 合回与恢复
 
-## 多仓合回和恢复
+主聊天在 integration（含返工分段）调用 `record integration_merge` 并结束本轮。宿主从成功 coding 证据读取候选，核对干净工作树与配置目标，仅快进或确认已包含。源仓库不在目标分支时使用本单拥有的短固定路径临时工作树，保留源分支。目标在另一个用户工作树检出或源/合回树有跟踪及暂存改动时保留现场。分叉需要单独授权的受控历史处理，不能在沙箱自行 rebase/cherry-pick，也不能用普通 coding 提交声称解决祖先关系。
 
-主工单会话按每个仓库登记候选 SHA，合回后从目标分支读回实际 SHA。某个仓库受阻时，阶段失败证据中的 `merged_versions` 只填已读回的仓库和提交，同时记录其余仓库的具体原因。恢复时逐仓核对上轮回执和 `git rev-parse refs/heads/<目标分支>`，用 `git merge-base --is-ancestor <候选SHA> <目标SHA>` 判断候选是否已包含。已包含的候选只需重新登记当前目标版本；继续处理其他仓库。有新增合并内容时检查其影响，树内容发生变化时补充 `merged_verification`。最终成功回执提交全部必需仓库的候选与合回版本。
+成功返回候选 `versions` 和实际 `merged_versions`；部分失败保留逐仓结果。`integration_retest_required` 先清理、复验实际 SHA，再以新事件和非空 `verification` 确认；失败原 post hook 会实际重跑。最终树与候选不同时，继续满足 `merged_verification` 和任务复验要求。
 
-用完重试或确认不可重试时，在 `blockers.md` 列出受阻应用和步骤、尝试结果及依赖关系。按账本进入编码。编码阶段核对是否有可用且已核验的工单工作树，缺少时记录具体阻断并继续单测等后续阶段。待写回项可按现有规则补发。整个过程按账本和工具回执推进，无需人工答复。
+宿主按 canonical common Git directory 串行化源仓库与 linked worktree。停止不明时保留占用，不启动另一种操作或另一个工单；恢复重新查询原命名 Job Object。稳定效果日志、提交标识及逐仓结果用于恢复 stdout/回执丢失、提交已生效和批次部分完成，不能重复提交或删除用户工作树。稳定结果只属于原绑定、尝试、分段和截止时间，不能推进新尝试。真实失败按原阶段重试规则登记，保留具体仓库、hooks 诊断路径和恢复条件。
+
+用户明确停跑的工单不自动恢复。确认原聊天空闲、受控进程全部停止并登记原活动尝试终态后，沿现有 `record stop` 规则收尾。
