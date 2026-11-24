@@ -88,12 +88,14 @@ def read_json(path):
 def recover_proof(folder, attempt, phase, deadline):
     receipt = read_json(folder / 'result.json')
     if receipt:
-        if (receipt.get('attempt_id') == attempt and receipt.get('phase') == phase
-                and receipt.get('deadline_at') == deadline.isoformat()
-                and receipt.get('stop_confirmed') is True
+        if (receipt.get('attempt_id'), receipt.get('phase'), receipt.get('deadline_at')) != (
+                attempt, phase, deadline.isoformat()):
+            return None
+        if (receipt.get('stop_confirmed') is True
                 and receipt.get('stop_evidence', {}).get('owned_processes_active_after_stop') == 0):
             return receipt
-        return None
+        # A prior inability to verify cleanup is not permanent: re-query the
+        # original named Job Object, without launching a second synchronization.
     launch = read_json(folder / 'launch.json')
     if not launch or (launch.get('attempt_id'), launch.get('phase'), launch.get('deadline_at')) != (
             attempt, phase, deadline.isoformat()):
@@ -104,8 +106,13 @@ def recover_proof(folder, attempt, phase, deadline):
     # A completed computation may precede a supervisor crash. Publication still
     # rechecks the live binding and checkout after this independently proven stop.
     computed = read_json(folder / 'stdout.log')
-    return {**launch, 'stop_confirmed': True, 'stop_evidence': stopped,
-            'outcome': 'success' if computed else 'failed'}
+    proof = {**launch, **(receipt or {}), 'stop_confirmed': True, 'stop_evidence': stopped,
+             'outcome': receipt['outcome'] if receipt else ('success' if computed else 'failed'),
+             'receipt_path': str(folder / 'result.json')}
+    if receipt:
+        proof['previous_stop_evidence'] = receipt.get('stop_evidence')
+    write_json(folder / 'result.json', proof)
+    return proof
 
 
 def run_material_sync(marker, database, config_path, project_root, *, recover=False):

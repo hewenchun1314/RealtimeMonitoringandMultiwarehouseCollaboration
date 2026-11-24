@@ -175,6 +175,35 @@ class HostSyncRunnerTests(WorkflowFixture):
         self.assertEqual(result['status'], 'material_synced')
         self.assertEqual(self.counts(), (1, 1))
 
+    def test_persisted_unverified_stop_can_be_reconciled_by_fresh_named_job_query(self):
+        item, data = self.admit()
+        pending = runner.pending_material_sync(item['marker'], self.database, self.config_path)
+        deadline = datetime.fromisoformat(pending['deadline_at'])
+        computed = compute_material_attempt(self.database, self.config, data, self.fixture)
+        folder = self.database.parent / 'items' / item['marker'] / 'material-sync' / data['attempt_id'] / 'host-sync'
+        folder.mkdir(parents=True)
+        (folder / 'stdout.log').write_text(json.dumps(computed))
+        launch = {'attempt_id': data['attempt_id'], 'phase': 'host-sync',
+                  'deadline_at': deadline.isoformat(), 'receipt_path': str(folder / 'result.json')}
+        (folder / 'launch.json').write_text(json.dumps(launch))
+        prior = {**launch, 'outcome': 'success', 'stop_confirmed': False,
+                 'stop_evidence': {'owned_processes_active_after_stop': 1}}
+        (folder / 'result.json').write_text(json.dumps(prior))
+        with patch.object(runner, 'recover_job_stop', return_value=None), patch.object(runner, 'run_stage') as stage:
+            result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture, recover=True)
+            self.assertEqual(result['status'], 'material_sync_stop_unverified')
+            stage.assert_not_called()
+        self.assertEqual(self.counts(), (0, 0))
+        with patch.object(runner, 'recover_job_stop', return_value={'owned_processes_active_after_stop': 0}), \
+                patch.object(runner, 'run_stage') as stage:
+            result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture, recover=True)
+            stage.assert_not_called()
+        self.assertEqual(result['status'], 'material_synced')
+        saved = json.loads((folder / 'result.json').read_text())
+        self.assertTrue(saved['stop_confirmed'])
+        self.assertEqual(saved['stop_evidence']['owned_processes_active_after_stop'], 0)
+        self.assertEqual(saved['previous_stop_evidence']['owned_processes_active_after_stop'], 1)
+
     def test_disabled_material_sync_and_bug_skip_story_preflight(self):
         config = {**self.config, 'runtime': {}}
         self.config_path.write_text(json.dumps(config))
