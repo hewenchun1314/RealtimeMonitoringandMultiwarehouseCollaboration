@@ -10,19 +10,23 @@
 
 ## Chunk1: Host operations
 
-- [ ] Add intended-failing tests for status-only batch preparation, candidate commit and integration APIs.
-- [ ] Implement bounded fixed host operations with current/snapshot/plan/worktree/HEAD/stage authorization, stable requests/results and no arbitrary host command.
-- [ ] Support missing exact origin branch fetch, deterministic worktree creation, explicit file staging/candidate commit and safe fast-forward integration. Keep actual hooks and filters.
-- [ ] Enforce canonical common-Git-directory ownership across linked worktrees, protect targets checked out elsewhere, and reject dirty hook-generated candidate results with regression coverage.
-- [ ] Add per-repo pending/cleanup/reconciliation for lost receipts, post-commit outcomes, crash recovery and concurrency without duplicate effects.
-- [ ] Restrict commits to coding/repair-coding and route normal/repair unit-test edits back through machine-derived coding revision; verify new SHA invalidates downstream evidence.
-- [ ] Wire launcher handoff/recovery and return candidate/merged SHAs usable by existing evidence validators.
-- [ ] Update phase-agent/main-worker instructions, Skill and branch/stage/worker/CLI references; preserve user-stopped items and prior material/push/deploy flows.
+- [x] Add intended-failing tests for status-only batch preparation, candidate commit and integration APIs.
+- [x] Implement bounded fixed host operations with current/snapshot/plan/worktree/HEAD/stage authorization, stable requests/results and no arbitrary host command.
+- [x] Support missing exact origin branch fetch, deterministic worktree creation, explicit file staging/candidate commit and safe fast-forward integration. Keep actual hooks and filters.
+- [x] Enforce canonical common-Git-directory ownership across linked worktrees, protect targets checked out elsewhere, and reject dirty hook-generated candidate results with regression coverage.
+- [x] Add per-repo pending/cleanup/reconciliation for lost receipts, post-commit outcomes, crash recovery and concurrency without duplicate effects.
+- [x] Restrict commits to coding/repair-coding and route normal/repair unit-test edits back through machine-derived coding revision; verify new SHA invalidates downstream evidence.
+- [x] Wire launcher handoff/recovery and return candidate/merged SHAs usable by existing evidence validators.
+- [x] Update phase-agent/main-worker instructions, Skill and branch/stage/worker/CLI references; preserve user-stopped items and prior material/push/deploy flows.
 
 ## Chunk2: Validation and rollout
 
-- [ ] Run focused local-Git and Windows process tests; verify hook failure is returned and fix/retry succeeds with checks enabled.
-- [ ] Independent spec review then quality review; fix/review all actionable findings.
-- [ ] Run actual MXC-host-MXC smoke only in cloned repositories/temporary ledgers, exercise representative real Husky configuration on four affected projects and prior40-repository paths where feasible.
-- [ ] Run complete suite, integrate into actual project checkout, verify actual entry points without business commits/ZenTao writes/#41 runs.
-- [ ] Record evidence, update automation memory and close isolated development worktree.
+- [x] Run focused local-Git and Windows process tests; verify hook failure is returned and fix/retry succeeds with checks enabled.
+- [x] Independent spec review then quality review; fix/review all actionable findings.
+- [x] Run actual MXC-host-MXC smoke only in cloned repositories/temporary ledgers, exercise representative real Husky configuration on four affected projects and prior40-repository paths where feasible.
+- [x] Run complete suite, integrate into actual project checkout, verify actual entry points without business commits/ZenTao writes/#41 runs.
+- [x] Record evidence, update automation memory and close isolated development worktree.
+
+## Final verification
+
+Integrated into the actual project checkout at `62bacd8`. Independent spec and quality reviews approved. All 295 tests passed in the actual root (433.889s), with production SQLite and source state unchanged. Actual MXC request → bounded host Git → MXC receipt passed on four real frontend clones with original Husky checks, partial-failure correction, product runtime bootstrap and source-user-branch preservation, plus a real smart-geo clone. Requirement Git authentication preflight passed. Story41 was not restarted. The isolated development worktree and merged local branch were removed. Evidence: `.local/zentao-delivery/verification/development-host-git-20261124/final-verification.json`.
