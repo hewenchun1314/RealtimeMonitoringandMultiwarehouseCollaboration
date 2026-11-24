@@ -219,15 +219,15 @@ def attempt_seed(store, item, routed):
     if last_result['phase'] == 'verify':
         return retries, last_result['repair_sequence'][0], []
     history = last_result['repair_phases']
+    if new_round:
+        for index, receipt in enumerate(history):
+            if validate_success(store, item, receipt['phase'], receipt['evidence']):
+                return retries, receipt['phase'], history[:index]
     if last_result.get('coding_revision_required'):
         revision = unit_test_revision(last_result['phase'], last_result['repair_sequence'], history)
         if revision is None:
             raise ValueError('Unit-test coding revision has no preceding coding receipt')
         return retries, *revision
-    if new_round:
-        for index, receipt in enumerate(history):
-            if validate_success(store, item, receipt['phase'], receipt['evidence']):
-                return retries, receipt['phase'], history[:index]
     return retries, last_result['phase'], history
 
 

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import sqlite3
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import test_route_drills as drills
 
@@ -152,6 +154,32 @@ class UnitTestRevisionTests(unittest.TestCase):
             history = json.loads(conn.execute('SELECT phase_history FROM attempts WHERE attempt_id=?',
                                               (retry['attempt_id'],)).fetchone()[0])
         self.assertEqual(history, expected)
+
+
+class UnitRevisionRecoveryTests(unittest.TestCase):
+    def test_new_round_revalidates_retained_prefix_before_same_side_rewind(self):
+        from execution import attempt_seed
+        with sqlite3.connect(':memory:') as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute('CREATE TABLE attempts(item_seq,stage,run_round,retry_number,result)')
+            backend = {'phase': 'backend.coding', 'evidence': {'versions': {'api': 'a' * 40}}}
+            frontend = {'phase': 'frontend.coding', 'evidence': {'versions': {'page': 'b' * 40}}}
+            result = {'repair_required': True, 'coding_revision_required': True,
+                      'phase': 'frontend.unit_test', 'repair_phases': [backend, frontend],
+                      'repair_sequence': ['backend.coding', 'frontend.coding', 'frontend.unit_test', 'verify']}
+            conn.execute('INSERT INTO attempts VALUES(?,?,?,?,?)',
+                         (1, 'frontend.e2e', 1, 2, json.dumps(result)))
+            store = SimpleNamespace(conn=conn)
+            item = {'seq': 1, 'stage': 'frontend.e2e', 'run_round': 1,
+                    'config_snapshot': json.dumps({'development': {'max_retries_per_step': 5}})}
+            with patch('execution.validate_success') as validate:
+                self.assertEqual(attempt_seed(store, item, True), (3, 'frontend.coding', [backend]))
+                validate.assert_not_called()
+            item['run_round'] = 2
+            with patch('execution.read_history', return_value=(None, {'frontend.e2e': {'outcome': 'failed'}})), patch(
+                    'execution.validate_success', return_value='Backend candidate is stale') as validate:
+                self.assertEqual(attempt_seed(store, item, True), (0, 'backend.coding', []))
+                validate.assert_called_once_with(store, item, 'backend.coding', backend['evidence'])
 
 
 if __name__ == '__main__':
