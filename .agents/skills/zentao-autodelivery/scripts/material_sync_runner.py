@@ -26,11 +26,15 @@ def load_config(path):
     return config
 
 
+def checkout_key(checkout):
+    return hashlib.sha256(str(checkout).casefold().encode()).hexdigest()
+
+
 @contextmanager
 def checkout_lock(directory, checkout):
     """Nonblocking lock shared by this project's sync and preflight operations."""
     directory.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256(str(checkout).casefold().encode()).hexdigest() + '.lock'
+    name = checkout_key(checkout) + '.lock'
     with (directory / name).open('a+b') as lock:
         lock.seek(0, 2)
         if lock.tell() == 0:
@@ -80,7 +84,8 @@ def pending_material_sync(marker, database, config_path):
 
 def read_json(path):
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
 
@@ -107,7 +112,7 @@ def recover_proof(folder, attempt, phase, deadline):
     # rechecks the live binding and checkout after this independently proven stop.
     computed = read_json(folder / 'stdout.log')
     proof = {**launch, **(receipt or {}), 'stop_confirmed': True, 'stop_evidence': stopped,
-             'outcome': receipt['outcome'] if receipt else ('success' if computed else 'failed'),
+             'outcome': receipt.get('outcome', 'failed') if receipt else ('success' if computed else 'failed'),
              'receipt_path': str(folder / 'result.json')}
     if receipt:
         proof['previous_stop_evidence'] = receipt.get('stop_evidence')
@@ -208,13 +213,37 @@ def run_git_preflight(config_path, database, project_root, item=None):
     with checkout_lock(database.parent / 'requirement-locks', checkout) as acquired:
         if not acquired:
             return message('git_preflight_busy', stop_confirmed=False)
-        run_id = uuid4().hex
         root = database.parent / 'worker-probes'
-        proof = run_stage(run_id, 'git-preflight', utc_now() + timedelta(seconds=30), project_root, root, None,
+        pending_path = database.parent / 'requirement-locks' / (checkout_key(checkout) + '-preflight.json')
+        if pending_path.exists():
+            previous = read_json(pending_path)
+            try:
+                if (not previous or previous.get('checkout') != str(checkout)
+                        or not re.fullmatch(r'[0-9a-f]{32}', previous.get('run_id', ''))):
+                    raise ValueError('invalid pending preflight')
+                old_deadline = datetime.fromisoformat(previous['deadline_at'])
+                if old_deadline.utcoffset() is None:
+                    raise ValueError('invalid pending deadline')
+                old_folder = root / previous['run_id'] / 'git-preflight'
+                # run_stage creates the phase directory before spawning. Absence
+                # proves this persisted request never reached a process launch.
+                if old_folder.exists() and not recover_proof(old_folder, previous['run_id'],
+                                                            'git-preflight', old_deadline):
+                    return message('git_preflight_busy', stop_confirmed=False,
+                                   receipt=str(old_folder / 'result.json'))
+            except (KeyError, TypeError, ValueError):
+                return message('git_preflight_busy', stop_confirmed=False)
+            pending_path.unlink()
+        run_id = uuid4().hex
+        deadline = utc_now() + timedelta(seconds=30)
+        write_json(pending_path, {'run_id': run_id, 'checkout': str(checkout), 'deadline_at': deadline.isoformat()})
+        proof = run_stage(run_id, 'git-preflight', deadline, project_root, root, None,
                           [sys.executable, '-B', __file__, 'preflight', '--config', str(config_path)], recoverable=True)
         checked = read_json(Path(proof['stdout_path'])) or {}
         stopped = (proof.get('stop_confirmed') is True
                    and proof.get('stop_evidence', {}).get('owned_processes_active_after_stop') == 0)
+        if stopped:
+            pending_path.unlink()
         passed = stopped and proof['outcome'] == 'success' and checked.get('status') == 'git_preflight_passed'
         return message('git_preflight_passed' if passed else 'git_preflight_failed',
                        **{k: checked[k] for k in ('branch', 'commit') if passed and k in checked},

@@ -204,6 +204,37 @@ class HostSyncRunnerTests(WorkflowFixture):
         self.assertEqual(saved['stop_evidence']['owned_processes_active_after_stop'], 0)
         self.assertEqual(saved['previous_stop_evidence']['owned_processes_active_after_stop'], 1)
 
+    def test_preflight_retry_waits_for_previous_named_job_stop(self):
+        launches = []
+        def stage(attempt, phase, deadline, cwd, root, *args, **kwargs):
+            launches.append(attempt)
+            folder = root / attempt / phase
+            folder.mkdir(parents=True)
+            stopped = len(launches) > 1
+            launch = {'attempt_id': attempt, 'phase': phase, 'deadline_at': deadline.isoformat(),
+                      'receipt_path': str(folder / 'result.json'), 'stdout_path': str(folder / 'stdout.log')}
+            (folder / 'launch.json').write_text(json.dumps(launch))
+            (folder / 'stdout.log').write_text(json.dumps({'status': 'git_preflight_passed'}))
+            proof = {**launch, 'outcome': 'success', 'stop_confirmed': stopped,
+                     'stop_evidence': {'owned_processes_active_after_stop': 0 if stopped else 1}}
+            (folder / 'result.json').write_text(json.dumps(proof))
+            return proof
+        with patch.object(runner, 'run_stage', side_effect=stage), \
+                patch.object(runner, 'recover_job_stop', return_value=None):
+            first = runner.run_git_preflight(self.config_path, self.database, self.fixture)
+            second = runner.run_git_preflight(self.config_path, self.database, self.fixture)
+        self.assertFalse(first['stop_confirmed'])
+        self.assertEqual(second['status'], 'git_preflight_busy')
+        self.assertFalse(second['stop_confirmed'])
+        self.assertEqual(len(launches), 1)
+        with patch.object(runner, 'run_stage', side_effect=stage), \
+                patch.object(runner, 'recover_job_stop', return_value={'owned_processes_active_after_stop': 0}):
+            third = runner.run_git_preflight(self.config_path, self.database, self.fixture)
+        self.assertEqual(third['status'], 'git_preflight_passed')
+        self.assertEqual(len(launches), 2)
+        old = self.database.parent / 'worker-probes' / launches[0] / 'git-preflight' / 'result.json'
+        self.assertEqual(json.loads(old.read_text())['previous_stop_evidence']['owned_processes_active_after_stop'], 1)
+
     def test_disabled_material_sync_and_bug_skip_story_preflight(self):
         config = {**self.config, 'runtime': {}}
         self.config_path.write_text(json.dumps(config))
