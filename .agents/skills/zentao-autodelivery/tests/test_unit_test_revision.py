@@ -1,7 +1,6 @@
 """A test fix must revise coding evidence before verification can accept its SHA."""
 from contextlib import closing
 import json
-from pathlib import Path
 import sqlite3
 import unittest
 from types import SimpleNamespace
@@ -18,20 +17,6 @@ class UnitTestRevisionTests(unittest.TestCase):
         self.d.setUp()
         self.addCleanup(self.d.doCleanups)
         self.d.begin_drill('fullstack', '前后端')
-        # This suite isolates revision routing. Host handoff/stop/hook behavior is
-        # exercised separately; its disposable baseline can use the local fixture helper.
-        self.d.prepare = self.prepare_fixture
-
-    def prepare_fixture(self, side, attempt):
-        from branch_check import branch_context, prepare_local_worktree
-        from ledger import Ledger, transaction
-        with transaction(self.d.database) as conn:
-            store = Ledger(conn, self.d.config, self.d.now)
-            context = branch_context(store, store.find_item(self.d.item))
-        proof = prepare_local_worktree(context, self.d.root, self.d.database, self.d.key, 30)
-        self.assertEqual(proof['status'], 'verified', proof)
-        self.d.worktrees[side] = Path(proof['worktree'])
-        return {'repositories': {self.d.key: proof}}
 
     def advance_to(self, destination):
         stage = 'material_check'
@@ -159,7 +144,7 @@ class UnitTestRevisionTests(unittest.TestCase):
 class UnitRevisionRecoveryTests(unittest.TestCase):
     def test_new_round_revalidates_retained_prefix_before_same_side_rewind(self):
         from execution import attempt_seed
-        with sqlite3.connect(':memory:') as conn:
+        with closing(sqlite3.connect(':memory:')) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute('CREATE TABLE attempts(item_seq,stage,run_round,retry_number,result)')
             backend = {'phase': 'backend.coding', 'evidence': {'versions': {'api': 'a' * 40}}}
