@@ -1,9 +1,9 @@
 """Resolve one registered ZenTao credential inside redirected Windows profiles."""
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -20,8 +20,8 @@ class CredentialPathTests(unittest.TestCase):
         self.profile = self.root / 'user'
         self.real_local = self.profile / 'AppData' / 'Local'
         self.cfg = {'base_url': 'http://localhost:8088', 'credential_ref': 'windows-dpapi:dotflow/zentao'}
-        self.env = patch.dict(os.environ, {'LOCALAPPDATA': str(self.redirected),
-                                          'USERPROFILE': str(self.profile)})
+        self.environment = {'LOCALAPPDATA': str(self.redirected), 'USERPROFILE': str(self.profile)}
+        self.env = patch.object(task_remote, 'os', SimpleNamespace(environ=self.environment))
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -59,13 +59,12 @@ class CredentialPathTests(unittest.TestCase):
 
     def test_absent_localappdata_can_still_resolve_same_profile(self):
         self.credential(self.real_local)
-        with patch.dict(os.environ):
-            os.environ.pop('LOCALAPPDATA', None)
-            try:
-                actual = self.resolve()
-            except (FileNotFoundError, KeyError) as error:
-                self.fail('Current-user fallback was not used: ' + type(error).__name__)
-            self.assertEqual(actual[0], 'fixture-user')
+        self.environment.pop('LOCALAPPDATA', None)
+        try:
+            actual = self.resolve()
+        except (FileNotFoundError, KeyError) as error:
+            self.fail('Current-user fallback was not used: ' + type(error).__name__)
+        self.assertEqual(actual[0], 'fixture-user')
 
     def test_missing_registered_file_does_not_scan_other_user_profiles(self):
         self.credential(self.root / 'another-user' / 'AppData' / 'Local')

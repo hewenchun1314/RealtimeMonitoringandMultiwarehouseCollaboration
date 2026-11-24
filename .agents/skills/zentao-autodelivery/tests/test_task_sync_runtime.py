@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -114,7 +115,8 @@ class SyncRuntimeTests(unittest.TestCase):
             else:
                 self.assertTrue(entered.wait(2))
             return {'stop_confirmed': True, 'receipt_path': phase, 'outcome': 'success'}
-        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ), \
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+             worker, 'os', SimpleNamespace(environ=dict(os.environ))), \
              patch.object(worker, 'DATABASE_PATH', Path(folder) / 'db'), \
              patch.object(worker, 'read_item', return_value=item), patch.object(worker, 'run_stage', side_effect=stage):
             result = worker.run('run', marker, Path('codex.exe'))

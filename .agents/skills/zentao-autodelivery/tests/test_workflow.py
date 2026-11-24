@@ -8,6 +8,7 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -161,7 +162,7 @@ class WorkflowTests(WorkflowFixture):
         first = self.reserve(2)
         self.record('bind', request_id=first['request_id'], chat_id=chat_id, desktop_project_id='desktop-1')
 
-        with patch.dict('os.environ', {'CODEX_HOME': str(self.fixture)}):
+        with patch('desktop_runtime.os', SimpleNamespace(environ={'CODEX_HOME': str(self.fixture)})):
             self.assertEqual(self.record('runtime_check', chat_id=chat_id)['status'], 'runtime_unverified')
             with transcript.open('w', encoding='utf-8') as log:
                 for policy in ('never', 'on-request'):
