@@ -15,7 +15,8 @@ from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_
 from material_sync import requirement_checkout, verify_requirement_intent
 from route_evidence import delivery_summary, validate_partial_merge, validate_success
 from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
-                             stage_evidence, stage_role, stage_task_ids, stages_for, task_scope, v2_repair)
+                             stage_evidence, stage_role, stage_task_ids, stages_for, task_scope,
+                             unit_test_revision, v2_repair)
 import task_evidence
 
 
@@ -218,6 +219,11 @@ def attempt_seed(store, item, routed):
     if last_result['phase'] == 'verify':
         return retries, last_result['repair_sequence'][0], []
     history = last_result['repair_phases']
+    if last_result.get('coding_revision_required'):
+        revision = unit_test_revision(last_result['phase'], last_result['repair_sequence'], history)
+        if revision is None:
+            raise ValueError('Unit-test coding revision has no preceding coding receipt')
+        return retries, *revision
     if new_round:
         for index, receipt in enumerate(history):
             if validate_success(store, item, receipt['phase'], receipt['evidence']):
@@ -414,13 +420,22 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     routed = is_routed(item)
     stage = item['stage']
     leaf = stage.rsplit('.', 1)[-1]
+    nested_unit_revision = None
+    if routed and repair_required is True and phase.endswith('.unit_test'):
+        nested_unit_revision = unit_test_revision(phase, prior_repair_sequence(store, item), completed_phases)
+        # An inner test can only return to its own coding phase. A new contract
+        # or cross-side itinerary must be raised at its outer verification.
+        if (nested_unit_revision is None or data.get('repair_side', phase.split('.')[0]) != phase.split('.')[0]
+                or data.get('contract_changed', False) is not False
+                or data.get('frontend_changed', False) is not False):
+            raise ValueError('Nested unit-test revision must return to its preceding same-side coding phase')
     if routed:
-        can_repair = leaf in ('code_review', 'e2e', 'acceptance', 'integration') or (
+        can_repair = leaf in ('unit_test', 'code_review', 'e2e', 'acceptance', 'integration') or (
             leaf in ('plan', 'design') and data.get('contract_changed') is True)
     else:
         can_repair = stage in REPAIR_PHASES
     if type(repair_required) is not bool or (repair_required and (
-            outcome != 'failed' or not can_repair or phase != 'verify')):
+            outcome != 'failed' or not can_repair or (phase != 'verify' and nested_unit_revision is None))):
         raise ValueError('repair_required needs a failed verification, merge conflict, or design/plan contract change')
     deadline = trial['deadline_at']
     if outcome == 'timed_out' and deadline and store.time < deadline:
@@ -583,8 +598,10 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     if route:
         result['route'] = route
     if routed and result['repair_required']:
-        result['repair_sequence'] = (v2_repair(stage, data, get_split(store, item)) if repair_required
+        result['repair_sequence'] = (v2_repair(stage, data, get_split(store, item)) if repair_required and not nested_unit_revision
                                      else prior_repair_sequence(store, item))
+        if nested_unit_revision:
+            result['coding_revision_required'] = True
     if not finished and not retry:
         result['completion'] = '待补材料' if missing_file or clarification else data.get('completion', '阻断')
         if result['completion'] not in ('待补材料', '待验证', '阻断'):

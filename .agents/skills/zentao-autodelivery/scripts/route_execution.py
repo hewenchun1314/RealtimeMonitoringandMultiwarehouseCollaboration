@@ -176,6 +176,10 @@ def v2_repair(stage, data, route):
     phases = ['split'] if data.get('contract_changed') else []
     if name in ('plan', 'design'):
         return ['split', 'verify']
+    if name == 'unit_test':
+        # The original unit-test stage is the final verifier. Publish a coding
+        # revision first so its immutable candidate receipt names the new SHA.
+        return [*phases, owner + '.coding', 'verify']
     phases.extend((owner + '.coding', owner + '.unit_test'))
     if name != 'code_review':
         phases.append(owner + '.code_review')
@@ -193,6 +197,20 @@ def v2_repair(stage, data, route):
         if data.get('frontend_changed') or data.get('contract_changed'):
             phases.extend(('frontend.coding', 'frontend.unit_test', 'frontend.code_review'))
     return [*phases, 'verify']
+
+
+def unit_test_revision(phase, sequence, history):
+    """Derive the preceding same-side coding phase without trusting caller routes."""
+    if not phase.endswith('.unit_test') or phase not in sequence:
+        return None
+    position = sequence.index(phase)
+    coding = phase.rsplit('.', 1)[0] + '.coding'
+    if position == 0 or sequence[position - 1] != coding:
+        return None
+    for index in range(len(history) - 1, -1, -1):
+        if history[index]['phase'] == coding:
+            return coding, history[:index]
+    return None
 
 
 def stage_role(stage):
