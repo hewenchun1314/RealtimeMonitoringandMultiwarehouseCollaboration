@@ -24,7 +24,7 @@
 | `<端>.design`、`<端>.plan` | 本端开发 Agent | 按拆分清单在本轮的 `frontend/` 或 `backend/` 写 `design.md`、`plan.md`。设计附文件证据，计划登记非空且唯一的应用键数组 `applications` 或服务键数组 `services`。 |
 | `<端>.branch_check` | 主会话 | 按[分支核验](branches.md)准备并实地核对每个目标仓库的 worktree，提交完整 `repositories`。 |
 | `<端>.coding`、`<端>.unit_test` | 本端开发 Agent | 在已核验工作树实施并创建候选提交。`versions` 映射本端配置键到候选 SHA；单测额外用 `verification` 记录实际命令、运行结果与证据。后端开发 Agent 还运行配置的构建命令，跨端时编写联调文档。 |
-| `<端>.code_review` | 本端测试 Agent | 审查本端计划与候选改动，提交 `versions` 和 `verification`，记录位置、结论和严重度。 |
+| `<端>.code_review` | 本端测试 Agent | 按[代码审查](#代码审查)逐仓准备 OCR 文件清单和评审规则，审查本端计划及候选改动。提交 `versions` 和 `verification`，记录位置、结论和严重度。 |
 | `backend.acceptance`、`frontend.e2e` | 本端测试 Agent | 按[后端服务验收](backend.md)或[前端页面验收](e2e.md)实际运行用例。提交 `versions`、`verification` 和逐项验证的本端任务编号数组 `verified_tasks`，覆盖当前有效清单。联合验收加 `backend_versions`，核对已交接服务版本。 |
 | `<端>.integration` | 主会话 | 在配置目标分支逐仓合回并读回，保存 `versions`（候选提交）及 `merged_versions`（实际合回提交）。合回树与候选树内容有差异时，用 `merged_verification` 写明最终版本的复验结果。部分合回或冲突时记录已完成仓库及失败原因；恢复先核对现状。需要改业务逻辑的冲突交本端开发和测试 Agent 处理。 |
 | `backend.push`、`frontend.push` | Windows 工单启动器和 Git 推送执行器 | 工单快照启用 `runtime.git_push_enabled` 时，逐仓推送验收并合回的 SHA，即使该端没有镜像部署。部分交付依赖逐任务验收、实际合回及最终内容复验证据。核对快照、当前配置和分支核验回执，向配置分支普通推送并读回远端。已包含该 SHA 时登记已有远端版本。遇到分叉、权限或目标错误时记录该仓失败，保留其他仓结果。 |
@@ -35,6 +35,20 @@
 端内返工依次完成修复、单测、复审或重验。联合验收发现后端缺陷时注明责任端，按同一尝试中账本返回的分段修复并再次交接，使用新版本跑受影响的联合验收。涉及任务或接口约定变化时，由拆分 Agent 更新任务并说明依据。主会话收尾以有效版本、实际验收和所有必需任务为准；安全合回成功的事实与未解决的验收项分别记账。
 
 编码、单测、审查和验收提交成功时，账本会读回本端工单 worktree 的 HEAD、已跟踪文件和暂存区。运行命令前先确认实现与测试所需的文件已进入候选提交；若测试工具改写了已跟踪文件，核对改动，按实际提交重新运行受影响的测试。主工作区中用户已有的改动由主会话在合回时独立核对。
+
+## 代码审查
+
+Windows 工单运行账号使用固定的 Open Code Review v1.14.2。默认路径为 `%LOCALAPPDATA%\Programs\ocr\1.14.2\ocr.exe`。安装时从 [GitHub Release](https://github.com/alibaba/open-code-review/releases/tag/v1.14.2) 取对应架构的二进制并对照发布摘要核验 SHA-256。在工单环境执行该二进制的 `version` 检查可用性。委托模式复用阶段 Codex 的模型。
+
+1. 主会话按当前有效任务和阶段派发测试 Agent。初审、代码审查失败后的 `verify` 复审，以及其他阶段返工进入的 `<端>.code_review` 分段，都使用这个流程。按仓库键读回本端 `branch_check` 的 `repositories` 和有效的 `coding` 候选 `versions`。返工读取新候选，评审前核对对应单测回执和工作树版本。
+2. 测试 Agent 在现有受控阶段内逐仓运行以下命令。`$ocrScript` 是项目根目录下 `.agents/skills/zentao-autodelivery/scripts/ocr_review.py` 的绝对路径。`$worktree` 和 `$baseSha` 分别取仓库核验回执的 `worktree`、`base_commit`。`$ocrEvidence` 是本次工单轮次内按尝试、分段、仓库键和候选 SHA 区分的 JSON 路径，位于工作树外。
+
+   ```powershell
+   python -B $ocrScript --repo $worktree --base $baseSha --candidate $candidateSha --output $ocrEvidence
+   ```
+
+3. 报告为 `prepared` 时，按 `preview.reviewable_files` 和 `rules` 审查固定提交区间，逐项注明已审查或跳过原因。看 `preview.excluded_files` 的排除理由，对确实影响本单的接口、测试和配置改动补审，遵守敏感路径保护。结合本单计划、拆分任务和验收条件确认发现及严重度。OCR 目录权限、命令失败、超时或输出异常时记录实际原因，在本阶段剩余时间内用原独立审查方式核对候选版本。
+4. 逐仓保存文件覆盖、补审范围、缺陷位置、受影响任务及结论，回执登记实际审查的 `versions` 和引用证据的 `verification`。确认确需改代码的严重问题按现有 `repair_required:true` 流程交开发 Agent 修复并复审。OCR 报告保存在工单证据目录，禅道回写使用审查结论及受影响任务摘要。
 
 ## 公司知识库查询
 

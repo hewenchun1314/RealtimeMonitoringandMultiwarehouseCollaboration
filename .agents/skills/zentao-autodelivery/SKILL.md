@@ -39,6 +39,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 
 1. 核对当前聊天 ID、工单唯一键、派发请求和执行名额，通过 `record start` 领取执行权。若返回 `dispatch_runtime_blocked`，本轮结束。对已领取过的工单，每个续接轮次先用 `record runtime_check` 核对本轮权限，无法满足时在当前权限内逐步核对、记录各步实际阻断并推进。重复启动、旧凭证和旧尝试按账本结果处理。已有有效尝试时沿该尝试核对进度，禁止重复启动 Agent 或受控进程。
 2. 按 [步骤指引](references/stages.md) 执行当前步骤。确认执行环境可以按截止时间停止本次 Agent 和受控进程，登记本次尝试后立即执行。当前环境缺少可用的停止能力时，登记该步骤及阻断，以不可重试失败结束本次尝试并按账本结果推进。本次未启动 Agent 或进程时一并记录。E2E 读取 [环境准备](references/e2e.md)。提前完成就保存结果并立即进入下一步。
+   派发 `backend.code_review` 或 `frontend.code_review`（含返工复审分段）时，在测试 Agent 的阶段提示中传入各仓的工作树、基线、当前候选 SHA 和证据目录，并要求按 [代码审查](references/stages.md#代码审查) 逐仓准备 OCR 评审材料。
    后端阶段把回执里的 `backend_dependencies` 交给对应 Agent。先看业务服务自己的接口、实现与调用链，只有本单实际涉及上游时才按[依赖配置](references/backend.md#上游依赖与修改权限)查契约或登记修改目标。前端仍从已配置业务后端和联调交接获取接口契约。
    当账本进入 `backend.push`、`frontend.push`、`backend.deploy` 或 `frontend.deploy`（含返工分段）时，结束本轮并把执行权交还 Windows 工单启动器。受控执行器认领、执行和登记结果，启动器恢复原工单聊天。遇到 `deployment_worker_required` 也走同一交接。Git 推送见[步骤指引](references/stages.md)，镜像发布见[前端镜像发布](references/frontend-release.md)。
    Story 的材料评审尝试返回 `material_sync_required:true` 时，先用阶段运行器执行 `record material_sync`。取得 `material_synced` 后才派发评审 Agent。同步失败按本次尝试的普通失败处理。命令和回执见[步骤指引](references/stages.md#需求材料同步)。
