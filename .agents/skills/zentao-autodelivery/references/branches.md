@@ -4,6 +4,8 @@
 
 前端计划用 `evidence.applications`，后端用 `evidence.services` 登记本端配置键。后端 `writable` 依赖可按依赖键列入计划，路径和目标来自 `source_path` 和 `delivery`。当前配置与领取快照必须仍授权同一个仓库、分支。任一配置声明 `runtime.worker_git_write_repositories` 时，两者都必须包含对应 `frontend:<键>` 或 `backend:<键>`；删除或清空既有登记视为撤销。两者从未声明登记的旧配置沿用计划与仓库配置授权。
 
+跨轮恢复若仍保留有效的成功分支核验回执，提交和合回继续使用该回执登记的工单分支及工作树；不能仅因轮次增加另造分支或丢弃原候选。只有账本重新进入 branch_check 时才准备对应的新工作树。
+
 ## 准备工作树
 
 1. 主聊天领取 `<端>.branch_check`（旧单为 `branch_check`），保存原尝试、分段和绝对截止时间。`branch_inspect` 仅作只读诊断，不能用缺少目标 ref 推断远端无分支。
