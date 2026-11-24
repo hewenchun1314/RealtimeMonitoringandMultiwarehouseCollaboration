@@ -43,6 +43,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
    当账本进入 `backend.push`、`frontend.push`、`backend.deploy` 或 `frontend.deploy`（含返工分段）时，结束本轮并把执行权交还 Windows 工单启动器。受控执行器认领、执行和登记结果，启动器恢复原工单聊天。遇到 `deployment_worker_required` 也走同一交接。Git 推送见[步骤指引](references/stages.md)，镜像发布见[前端镜像发布](references/frontend-release.md)。
    Story 的材料评审尝试返回 `material_sync_required:true` 时，先用阶段运行器执行 `record material_sync`。取得 `material_synced` 后才派发评审 Agent。同步失败按本次尝试的普通失败处理。命令和回执见[步骤指引](references/stages.md#需求材料同步)。
    返回 `story_review_required:true` 时按[禅道正式评审](references/stages.md#禅道正式评审)核实评审目标。需求评审 Agent 负责材料结论及理由。`attempt_finish` 返回 `disposition:review_wait` 时结束当前轮次，由 Windows 启动器提交、回读并决定续接。
+   材料评审通过后，把[知识库查询规则](references/stages.md#公司知识库查询)交给拆分和设计 Agent。设计 Agent 读取本轮 `split.md` 中已有的知识引用。
 3. 使用 `record` 保存步骤、尝试、工单和聊天绑定、实际起止时间、结果、证据与失败原因。阶段结果与待回写记录一起提交。确认失败可重试时按配置执行，默认首次执行后最多重试三次，每次独立计时。
 4. 确认无法继续或用尽重试次数时，登记本步骤失败，按 `next_stage` 继续。下一步缺少必要输入时，记录该步自己的阻断原因并继续推进。写 `blockers.md` 记录工单、受阻步骤、失败证据和尝试、影响的后续步骤及最终结果。账本进入收尾状态后，汇总各步结果，保存「已交付」「待补材料」「待验证」或「阻断」的收尾结果，释放已安全停止的执行名额。
 

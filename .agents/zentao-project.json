@@ -27,7 +27,30 @@
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true,
     "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"],
-    "worker_git_write_repositories": ["backend:smart-geo", "frontend:tet-smart-log"]
+    "worker_git_write_repositories": [
+      "backend:smart-geo",
+      "backend:model-manage-srv",
+      "backend:task-manage-grpc",
+      "backend:tet-task-manager",
+      "backend:model-python",
+      "frontend:aggregation-platform",
+      "frontend:simba",
+      "frontend:micro-data-pool",
+      "frontend:shell-hub",
+      "frontend:sso",
+      "frontend:cooperation",
+      "frontend:fracturing-design",
+      "frontend:micro-dp-load-page",
+      "frontend:micro-double-sweet-spot",
+      "frontend:tet-smart-log",
+      "frontend:micro-pure-model-page",
+      "frontend:llm-web",
+      "frontend:SmartLogging-SPARK",
+      "frontend:TetDMSWeb",
+      "frontend:micro-drilling-track",
+      "frontend:digital-twin",
+      "frontend:simulation-tracking"
+    ]
   },
   "notifications": {
     "dingtalk": {"enabled": true}
