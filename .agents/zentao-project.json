@@ -19,6 +19,8 @@
     "interval_minutes": 60
   },
   "runtime": {
+    "codex_model": "gpt-6.1-sol",
+    "codex_reasoning_effort": "xhigh",
     "sync_requirement_before_review": true,
     "story_review_sync": true,
     "split_task_sync": true,

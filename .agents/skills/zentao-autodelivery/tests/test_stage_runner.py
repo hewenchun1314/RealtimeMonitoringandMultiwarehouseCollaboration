@@ -8,6 +8,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 RUNNER = Path(__file__).resolve().parents[1] / 'scripts' / 'stage_runner.py'
@@ -32,6 +33,31 @@ class StageRunnerTests(unittest.TestCase):
                                   phase='backend.coding')
             self.assertEqual(receipt['outcome'], 'success')
             self.assertEqual(Path(receipt['receipt_path']), folder / 'joint' / 'backend.coding' / 'result.json')
+
+    def test_codex_exec_receives_project_model_settings_in_the_worktree(self):
+        from stage_runner import run_stage
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            worktree = folder / 'worktree'
+            worktree.mkdir()
+            config_path = folder / 'zentao-project.json'
+            config_path.write_text(json.dumps({'runtime': {
+                'codex_model': 'gpt-6.1-sol', 'codex_reasoning_effort': 'xhigh',
+            }}), encoding='utf-8')
+            deadline = datetime.now(timezone.utc) + timedelta(seconds=10)
+            with patch('workflow.CONFIG_PATH', config_path), patch(
+                'stage_runner.subprocess.Popen', side_effect=OSError('stop before launching Codex')
+            ) as spawn:
+                with self.assertRaisesRegex(OSError, 'stop before launching Codex'):
+                    run_stage('model-probe', 'backend.design', deadline, worktree, folder, None,
+                              ['codex.exe', 'exec', '--ephemeral', '-'])
+
+            self.assertEqual(spawn.call_args.kwargs['cwd'], worktree)
+            self.assertEqual(spawn.call_args.args[0][5:], [
+                'codex.exe', '-c', 'model="gpt-6.1-sol"', '-c', 'model_reasoning_effort="xhigh"',
+                'exec', '--ephemeral', '-',
+            ])
 
     def test_deadline_stops_worker_and_grandchild_without_touching_external_process(self):
         payload = (

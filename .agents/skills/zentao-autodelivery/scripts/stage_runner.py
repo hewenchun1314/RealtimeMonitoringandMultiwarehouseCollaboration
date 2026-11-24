@@ -215,6 +215,17 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
         write_json(receipt_path, result)
         return result
 
+    if hosted_agent:
+        from workflow import CONFIG_PATH
+
+        runtime = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig')).get('runtime', {})
+        overrides = []
+        for key, setting in (('codex_model', 'model'), ('codex_reasoning_effort', 'model_reasoning_effort')):
+            value = runtime.get(key)
+            if value is not None:
+                overrides.extend(['-c', f'{setting}={json.dumps(value)}'])
+        command = [command[0], *overrides, *command[1:]]
+
     job_name = 'Global\\ZentaoDeploy-' + uuid4().hex if recoverable else None
     if job_name is not None:
         evidence.update(job_name=job_name, job_host=gethostname())
