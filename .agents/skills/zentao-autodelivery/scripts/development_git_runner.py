@@ -20,7 +20,10 @@ def pending_development_git(marker, database, config_path):
     if not database.is_file():
         return message('host_git_not_pending')
     config = load_config(config_path)
-    with transaction(database) as conn:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='development_git_operations'").fetchone():
+            return message('host_git_not_pending')
         store = Ledger(conn, config, utc_now())
         rows = conn.execute('SELECT g.* FROM development_git_operations g JOIN work_items w ON w.seq=g.item_seq WHERE w.marker=? AND g.result IS NULL ORDER BY g.created_at,g.rowid', (marker,)).fetchall()
         for row in rows:

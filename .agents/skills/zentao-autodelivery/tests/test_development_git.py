@@ -550,3 +550,12 @@ class DevelopmentGitTests(unittest.TestCase):
         self.assertEqual(failed['status'], 'host_git_failed', failed)
         self.assertIn('runtime', failed['repositories'][self.d.key]['reason'].lower())
         self.assertFalse((self.d.database.parent / 'worktrees').exists())
+
+    def test_launcher_queue_poll_does_not_migrate_a_legacy_ledger(self):
+        from development_git_runner import pending_development_git
+        with closing(sqlite3.connect(self.d.database)) as conn, conn:
+            marker = conn.execute('SELECT marker FROM work_items WHERE item_id=17').fetchone()[0]
+            conn.execute('DROP TABLE development_git_operations')
+        self.assertEqual(pending_development_git(marker, self.d.database, self.config_path)['status'], 'host_git_not_pending')
+        with closing(sqlite3.connect(self.d.database)) as conn:
+            self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE name='development_git_operations'").fetchone())
