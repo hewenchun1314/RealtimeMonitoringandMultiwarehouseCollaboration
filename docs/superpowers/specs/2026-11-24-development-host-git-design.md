@@ -1,0 +1,28 @@
+# Frontend/backend host Git execution
+
+## Authorized scope and evidence
+
+User explicitly requests implementing the previously analyzed frontend/backend fixes. Story41 remains explicitly stopped: no prepare/run/recover, production ticket-ledger changes or ZenTao writes for testing. Existing requirement-sync fix at main5f6fcd3 stays intact. Actual audit found23 configured repositories with target refs and metadata registrations; four frontend repos (simba, micro-data-pool, micro-pure-model-page, llm-web) have Husky shell hooks. An isolated no-op hook succeeded on host and failed in MXC with MSYS named-object0xC0000022. branches.md still instructs sandbox remote fetch on missing target. Do not infer historical40 failed: it changed smart-geo and SmartLogging-SPARK under older config.
+
+## Design
+
+Keep code edits/build/tests in worker sandbox with never approvals. Move fixed Git operations requiring authentication or invoking hooks to the Windows launcher: (1) remote target-branch fetch and worktree preparation, (2) candidate commit, (3) integration/checkout/merge. Existing push/deploy remain host controlled. Preserve actual hooks and filters; do not disable Husky, use no-verify or overwrite global Git config. Repository physical paths remain unchanged.
+
+Public workflow commands enqueue/read stable operation requests and return a host-worker-required status; they never perform these mutations in the sandbox. The original main chat ends its turn (stage Agents must return prepared file information instead of trying a commit). Launcher verifies main CLI, stage children and Task synchronizer stopped, dispatches only validated fixed host operations, then resumes same chat. Support multiple repositories in a batch to avoid repeated CLI resumes consuming branch-check deadlines.
+
+Host authorization must derive repository/worktree/branch/baseline from current stage, successful plan/branch-check evidence and matching current/snapshot project configuration. Only active item/request/chat/attempt/phase may act, using original absolute deadline. No caller-supplied arbitrary command, remote URL or arbitrary checkout path. Commit requests may provide literal relative file lists, expected HEAD and message as data; reject escaping metadata/foreign staged changes and stale HEAD. Only item-owned registered worktrees may be committed, including allowed coding/unit-test repair phases. Return verified candidate SHAs for existing versions evidence.
+
+Preparation: validate configured target ref; if missing locally query/fetch only origin's exact branch noninteractively, lock base SHA, prepare deterministic item worktrees on their ledger branch, preserve hooks, reread full repository proof. Integration: use verified candidate SHA and configured target, preserve user worktree edits/current branch, allow safe fast-forward/already-contained result; report divergence/conflict for resolution instead of force/reset or altering unrelated branches. Return actual merged SHA and retain existing merged-verification requirements. A failed hook is a genuine check failure to fix, not a reason to skip checks. Check the complete Git worktree inventory: a target checked out in another user worktree must never be updated behind that worktree. Hook-created tracked/index changes require a clean, retested candidate and cannot be reported as successful versions automatically.
+
+Reuse stable IDs, SQLite outcomes, original deadlines, Job Objects and per-repository pending-operation journals/locks. Key repository locks/journals by the canonical common Git directory so the source checkout and linked item worktrees share ownership. Both network and local Git work must wait for prior cleanup. Child computes/journals effects; outer publisher validates stopped proof and live binding before final result. Git operations may already have taken effect when stdout is lost or a post-commit hook fails: reconcile HEAD/parent/tree/stable commit marker and worktree inventory before retry, never blindly duplicate commit/merge or repurpose another item's worktree. Successful prior operations must be reusable, partial per-repo results retained. Late results cannot advance new attempts. Old requirement/push/review paths must keep working.
+
+## Acceptance
+
+- TDD regression: missing-branch sandbox API requests host rather than running network Git; worktree creation and commit/merge hooks run in host.
+- Temporary remote + registered fixture worktrees cover fetch, preparation, candidate commit and safe integration for both sides and multi-repo batches.
+- Real failing and passing shell hooks retain checks; failure returns to Agent, no bypass flags/config/env. Preserve commit-msg checks and source modifications made by hooks.
+- Wrong item/repo/branch/path/attempt, expired deadline, read-only dependencies, revoked mapping, dirty source/foreign staged files and stale HEAD rejected safely.
+- Unknown process stop, concurrent operation, crash after commit/before receipt, lost stdout and post-commit failure do not cause duplicate effects. Fresh stop proof permits safe reconciliation.
+- Existing requirement-sync and full test suites pass. Actual MXC request -> host operation -> sandbox reread smoke uses only cloned repos and temporary ledgers; use actual Husky configuration/representative checks from the four affected repos without changing originals or disabling hooks. Include SmartLogging-SPARK/smart-geo baseline regressions where feasible.
+- Independent spec and quality reviews before local integration. Update Skill, stage/branch/worker/CLI references and prompts so future scheduled tickets use the new path; do not restart41 or publish actual business commits.
+
