@@ -76,6 +76,14 @@ class WorkflowFixture(unittest.TestCase):
         self.record('start', request_id=request_id, chat_id='chat-2')
         return {'request_id': request_id, 'chat_id': 'chat-2'}
 
+    def host_git(self, item_id=2):
+        from development_git_runner import run_development_git
+        config_file = self.fixture / 'host-project.json'
+        config_file.write_text(json.dumps(self.config), encoding='utf-8')
+        with closing(sqlite3.connect(self.database)) as conn:
+            marker = conn.execute('SELECT marker FROM work_items WHERE item_id=?', (str(item_id),)).fetchone()[0]
+        return run_development_git(marker, self.database, config_file, self.fixture, recover=True)
+
 
 class WorkflowTests(WorkflowFixture):
     """Admitted legacy items continue to use their original configuration snapshot."""
@@ -307,7 +315,8 @@ class WorkflowTests(WorkflowFixture):
                          ['M tracked.txt', '?? existing-edit.txt'])
         self.assertEqual((worktree / 'tracked.txt').read_text(encoding='utf-8'), 'release baseline')
 
-    def test_local_worktree_fallback_recovers_same_checkout_without_switching_source(self):
+    def test_host_worktree_preparation_recovers_same_checkout_without_switching_source(self):
+        self.time = datetime.now(timezone.utc)
         context, attempt = self.start_branch_check(['Example'])
         repo = self.fixture / 'fixture' / 'children' / 'example'
         repo.mkdir(parents=True)
@@ -320,14 +329,17 @@ class WorkflowTests(WorkflowFixture):
         base = git('rev-parse', 'HEAD')
         git('branch', 'release')
         git('commit', '--allow-empty', '-m', 'Another branch')
-        args = dict(context, attempt_id=attempt['attempt_id'], application='Example')
-        self.assertEqual(self.record('branch_prepare', **args)['status'], 'desktop_reconciliation_required')
-        args['desktop_reconciliation'] = {'status': 'no_receipt', 'evidence': 'No attached or linked tree'}
-        first = self.record('branch_prepare', **args)
-        self.assertEqual(first['status'], 'branch_prepared')
-        self.assertEqual(first['repository']['base_commit'], base)
+        args = dict(context, attempt_id=attempt['attempt_id'], application='Example', event_id='host-prepare-fixture')
+        with patch('workflow.prepare_local_worktree') as sandbox_mutation:
+            requested = self.record('branch_prepare', **args)
+        self.assertEqual(requested['status'], 'host_git_worker_required')
+        sandbox_mutation.assert_not_called()
+        self.assertFalse((self.database.parent / 'worktrees').exists())
+        first = self.host_git()
+        self.assertEqual(first['status'], 'host_git_completed', first)
+        self.assertEqual(first['repositories']['Example']['base_commit'], base)
         again = self.record('branch_prepare', **args)
-        self.assertEqual(again['repository'], first['repository'])
+        self.assertEqual(again, first)
         self.assertEqual(git('branch', '--show-current'), 'wrong')
 
     def test_branch_blocker_advances_and_releases_queue_only_after_integration(self):

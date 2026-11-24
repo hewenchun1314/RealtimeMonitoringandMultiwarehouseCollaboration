@@ -147,8 +147,10 @@ class RouteExecutionTests(WorkflowFixture):
             self.record('runtime_check', chat_id='chat-2')
 
     def test_writable_dependency_uses_its_own_target_branch_and_worktree(self):
+        from datetime import datetime, timezone
         from test_route_drills import git
 
+        self.time = datetime.now(timezone.utc)
         self.configure_backend_dependencies()
         self.config['development']['allowed_requirement_types'] = ['backend_only']
         self.material.write_text('研发范围：纯后端', encoding='utf-8')
@@ -175,11 +177,15 @@ class RouteExecutionTests(WorkflowFixture):
                    'desktop_reconciliation': {'status': 'unavailable', 'evidence': 'Local drill'}}
         upstream['access'] = 'read_only'
         blocked = self.record('branch_prepare', **prepare)
-        self.assertEqual(blocked.get('repository', {}).get('status'), 'dependency_write_revoked', blocked)
+        self.assertEqual(blocked['status'], 'host_git_rejected', blocked)
+        with closing(sqlite3.connect(self.database)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM development_git_operations').fetchone()[0], 0)
         upstream['access'] = 'writable'
-        prepared = self.record('branch_prepare', **prepare)
-        self.assertEqual(prepared.get('status'), 'branch_prepared', prepared)
-        proof = prepared['repository']
+        requested = self.record('branch_prepare', **prepare)
+        self.assertEqual(requested['status'], 'host_git_worker_required', requested)
+        prepared = self.host_git()
+        self.assertEqual(prepared['status'], 'host_git_completed', prepared)
+        proof = prepared['repositories']['upstream']
         self.assertEqual(proof['source_root'], str(repo))
         self.assertEqual(proof['target_branch'], 'provider-dev')
         self.assertNotEqual(proof['worktree'], str(repo))
