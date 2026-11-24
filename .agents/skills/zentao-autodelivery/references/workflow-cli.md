@@ -85,7 +85,7 @@
 | `branch_inspect` | `request_id`、`chat_id`、有效分支核验 `attempt_id`。可传 `worktrees`（应用配置键对应的工作树绝对路径）。首次调用解析分支，准备好工作树后再次调用验证真实提交和工单分支。参照 [分支核验与工作树](branches.md) 处理每项状态。 |
 | `branch_prepare` | 当前绑定、分支核验 `attempt_id`、实际 `phase`、稳定 `event_id`。只登记整个成功计划的宿主准备请求，缺 ref 时只补取 origin 的配置目标；成功后以 `repositories` 继续只读核验，不自行切换源分支。 |
 | `candidate_commit` | 当前 coding 绑定、尝试、分段、稳定事件和 `commits`。每仓提供 `expected_head`、字面 `files`、`message`、可选验证说明；具体格式及复验规则见上文。成功 `versions` 供 coding 结果使用。 |
-| `integration_merge` | 当前 integration 绑定、尝试、分段和稳定事件；复验时加非空 `verification`。候选和目标由账本及配置确定。返回逐仓合回结果及版本；安全快进以外的历史处理另行授权。 |
+| `integration_merge` | 当前 integration 绑定、尝试、分段和稳定事件；复验时加非空 `verification`。候选和目标由账本及配置确定。返回逐仓合回结果及版本；安全快进以外的历史处理需要单独的受控实现路径，本固定操作集不执行。 |
 | `host_git_status` | 当前绑定、`attempt_id`、`phase`、`operation_id`，仅查询原操作，不启动 Git；不能用旧尝试结果推进新阶段。 |
 | `repair_advance` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`summary` 和本分段的成功 `evidence`。获得新的 `repair_advanced` 后，使用同一 `attempt_id` 执行返回的下一分段及其新截止时间。重放返回 `phase_already_advanced`，需对账当前分段。 |
 | `attempt_finish` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`outcome`、`summary`、`evidence`。`outcome` 为 `success`、`failed` 或 `timed_out`。单测需要候选修订，或 Code Review、验收、E2E、integration 有确需修复的代码缺陷时，失败结果提供 `repair_required:true`，按账本返回的 coding 分段修订并重验。既有返工中的单测可用同一标记回到紧邻的同端 coding；环境失败仍重试原验证。分叉的历史处理不在本固定操作集内。环境问题按普通失败处理。分段失败也由本操作记录，超时须提供 `stop_confirmed:true` 和 `stop_evidence`。确定无法重试时提供 `retryable:false`，可用 `completion` 指定「待补材料」「待验证」或「阻断」。`disposition:next` 时即使本步失败也立即执行 `next_stage`。`retry` 续跑本步，收到 `close` 或 `blocked` 后执行收尾。需求的 `material_check` 确认缺少需求文件时，提交 `outcome:"failed"` 和 `evidence.material_file_status:"missing"` 并附核对依据。账本跳过重试，返回 `blocked`，后续步骤记为跳过，结论为「待补材料」。 |

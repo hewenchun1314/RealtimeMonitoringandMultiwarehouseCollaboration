@@ -25,7 +25,7 @@ unit_test 只能验证已登记候选。需要改代码或补测试时，以 fai
 
 ## 合回与恢复
 
-主聊天在 integration（含返工分段）调用 `record integration_merge` 并结束本轮。宿主从成功 coding 证据读取候选，核对干净工作树与配置目标，仅快进或确认已包含。源仓库不在目标分支时使用本单拥有的短固定路径临时工作树，保留源分支。目标在另一个用户工作树检出或源/合回树有跟踪及暂存改动时保留现场。分叉需要单独授权的受控历史处理，不能在沙箱自行 rebase/cherry-pick，也不能用普通 coding 提交声称解决祖先关系。
+主聊天在 integration（含返工分段）调用 `record integration_merge` 并结束本轮。宿主从成功 coding 证据读取候选，核对干净工作树与配置目标，仅快进或确认已包含。源仓库不在目标分支时使用本单拥有的短固定路径临时工作树，保留源分支。目标在另一个用户工作树检出或源/合回树有跟踪及暂存改动时保留现场。分叉需要单独的受控历史处理路径，当前固定操作集不执行该处理；不能在沙箱自行 rebase/cherry-pick，也不能用普通 coding 提交声称解决祖先关系。
 
 成功返回候选 `versions` 和实际 `merged_versions`；部分失败保留逐仓结果。`integration_retest_required` 先清理、复验实际 SHA，再以新事件和非空 `verification` 确认；失败原 post hook 会实际重跑。最终树与候选不同时，继续满足 `merged_verification` 和任务复验要求。
 
