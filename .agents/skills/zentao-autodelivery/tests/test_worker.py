@@ -12,6 +12,47 @@ from worker import command, worker_roots
 
 
 class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        pending = patch.object(worker, 'pending_development_git', return_value={'status': 'host_git_not_pending'}, create=True)
+        pending.start()
+        self.addCleanup(pending.stop)
+
+    def test_development_git_handoff_stops_host_and_resumes_same_chat(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'backend.coding'}
+        required = False
+        calls = []
+        def pending(*args):
+            return {'status': 'host_git_pending' if required else 'host_git_not_pending'}
+        def chat(current):
+            nonlocal required
+            self.assertIs(current, item)
+            required = not calls
+            calls.append('chat')
+            return {'receipt_path': 'chat', 'stop_confirmed': True, 'outcome': 'success'}, None
+        def host(*args, **kwargs):
+            nonlocal required
+            calls.append('host')
+            required = False
+            return {'status': 'host_git_failed', 'repositories': {'fixture': {'reason': 'hook rejected'}}}
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}), \
+                patch.object(worker, 'pending_development_git', side_effect=pending), \
+                patch.object(worker, 'run_development_git', side_effect=host, create=True), \
+                patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}):
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, chat)
+        self.assertEqual(calls, ['chat', 'host', 'chat'])
+        self.assertEqual(result['development_git']['status'], 'host_git_failed')
+
+    def test_development_git_cannot_launch_until_prior_worker_stop_proven(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'frontend.branch_check'}
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}), \
+                patch.object(worker, 'pending_development_git', return_value={'status': 'host_git_pending'}), \
+                patch.object(worker, 'run_development_git', create=True) as host:
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, lambda item: self.fail('must not resume'))
+        self.assertEqual(result['status'], 'worker_host_git_stop_unverified')
+        host.assert_not_called()
+
     def deployment_route(self, peek, deployments, chat_outcomes):
         item = {'state': 'running', 'chat_id': '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'}
         calls = []

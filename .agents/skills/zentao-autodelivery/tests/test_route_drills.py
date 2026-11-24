@@ -161,13 +161,21 @@ class RouteDrills(unittest.TestCase):
         field = 'service' if side == 'backend' else 'application'
         args = {field: key, **identity, 'desktop_reconciliation': {
             'status': 'unavailable', 'evidence': 'Isolated CLI test repository'}}
+        args['event_id'] = 'prepare-' + side + '-' + key + '-' + attempt['attempt_id']
         prepared = self.record('branch_prepare', **args)
-        self.assertEqual(prepared['status'], 'branch_prepared', prepared)
-        proof = prepared['repository']
+        self.assertEqual(prepared['status'], 'host_git_worker_required', prepared)
+        from development_git_runner import run_development_git
+        config_file = self.root / 'host-project.json'
+        config_file.write_text(json.dumps(self.config), encoding='utf-8')
+        with closing(sqlite3.connect(self.database)) as connection:
+            marker = connection.execute('SELECT marker FROM work_items WHERE item_id=17').fetchone()[0]
+        prepared = run_development_git(marker, self.database, config_file, self.root, recover=True)
+        self.assertEqual(prepared['status'], 'host_git_completed', prepared)
+        proof = prepared['repositories'][key]
         if key == self.key:
             self.worktrees[side] = Path(proof['worktree'])
         again = self.record('branch_prepare', **args)
-        self.assertEqual(again['repository'], proof)
+        self.assertEqual(again['repositories'][key], proof)
         inspected = self.record('branch_inspect', worktrees={key: proof['worktree']}, **identity)
         self.assertEqual(inspected['repositories'][key]['status'], 'verified')
         return {'repositories': {key: inspected['repositories'][key]}}

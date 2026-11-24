@@ -22,6 +22,7 @@ from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_e
 from ledger import Ledger, encode, item_identity, transaction, validate_config
 from frontend_release_runner import run_frontend_release
 from git_delivery_runner import run_git_delivery
+from development_git_runner import pending_development_git, run_development_git
 from stage_runner import recover_job_stop, run_stage, utc_now
 from status_board import publish_status
 from story_review_remote import StoryReviewRemote
@@ -88,6 +89,10 @@ def worker_prompt(operation, item):
         '若返回 material_sync_worker_required，立即结束本轮，交 Windows 启动器在宿主同步；'
         '禁止在沙箱里自行 fetch、探测或转存 Git 凭据。恢复同一会话后读取原尝试结果，'
         '取得 material_synced 回执后才派发需求评审；同步失败按原尝试登记。'
+        '前后端 branch_prepare、candidate_commit、integration_merge 只登记固定宿主 Git 请求。'
+        '返回 host_git_worker_required 时立即结束当前轮次；Windows 启动器确认主进程及任务同步进程均已停止后执行，'
+        '随后续接原聊天。恢复后用相同 event_id 和原提交数据读回，或用 host_git_status 按 operation_id 查询。'
+        '沙箱内只编辑、构建、测试及只读 Git 核验；禁止自行 fetch、worktree add、commit、checkout 或 merge，禁止跳过原有 hooks。'
         '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
         '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
         '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
@@ -126,9 +131,9 @@ def launch_turn(cli, operation, item, output, deadline):
     prompt_file = output / f'{run_id}.txt'
     prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
     launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
-    options = {'recoverable': True} if (operation == 'run' and
-               any(json.loads(item['config_snapshot']).get('runtime', {}).get(flag) for flag in
-                   ('story_review_sync', 'sync_requirement_before_review'))) else {}
+    # Any development phase can hand off fixed Git work, regardless of optional
+    # material/review integration flags. Persist both owned Job identities.
+    options = {'recoverable': True} if operation == 'run' else {}
     if operation != 'run' or not task_sync_enabled(item):
         return run_stage(*launch, **options), None
     stop = Event()
@@ -172,7 +177,7 @@ def review_handoff_stopped(output, item):
 
 
 def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False, recover_review=None,
-                       recover_material=None):
+                       recover_material=None, recover_git=None):
     deadline = deadline or utc_now() + timedelta(hours=72)
 
     def peek():
@@ -182,12 +187,24 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     last_turn = {}
     last_deployment = None
     last_material = None
+    last_git = None
     release_key = 'backend_deployment'
     while utc_now() < deadline:
         state = pending['status']
         item = read_item(marker)
         if not item or item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready'):
             return last_turn or {'status': 'worker_released'}
+        development_git = pending_development_git(marker, DATABASE_PATH, CONFIG_PATH)
+        if development_git['status'] == 'host_git_pending':
+            if last_turn.get('status') != 'worker_stopped' and not (recover_git and recover_git(item)):
+                return {**last_turn, 'status': 'worker_host_git_stop_unverified'}
+            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
+                return {**last_turn, 'status': 'worker_host_git_blocked',
+                        'development_git': {'status': 'host_git_runtime_blocked'}}
+            last_git = run_development_git(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT, recover=True)
+            if last_git['status'] not in ('host_git_completed', 'host_git_failed', 'host_git_inactive', 'host_git_not_pending'):
+                return {**last_turn, 'status': 'worker_host_git_blocked', 'development_git': last_git}
+            continue
         material = pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)
         if material['status'] == 'material_sync_pending':
             if last_turn.get('status') != 'worker_stopped' and not (recover_material and recover_material(item)):
@@ -253,6 +270,8 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             last_turn[release_key] = last_deployment
         if last_material is not None:
             last_turn['material_sync'] = last_material
+        if last_git is not None:
+            last_turn['development_git'] = last_git
         if last_turn['status'] != 'worker_stopped':
             return last_turn
         current = read_item(marker)
@@ -260,6 +279,8 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             continue
         pending = peek()
         if pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'material_sync_pending':
+            continue
+        if pending_development_git(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'host_git_pending':
             continue
         if pending['status'] == 'deployment_not_pending':
             return last_turn
@@ -321,7 +342,8 @@ def run(operation, marker, cli):
             return dispatch_work_item(
                 marker, lambda current: launch_turn(cli, operation, current, output, deadline), deadline,
                 recover_deployment=True, recover_review=lambda current: review_handoff_stopped(output, current),
-                recover_material=lambda current: review_handoff_stopped(output, current))
+                recover_material=lambda current: review_handoff_stopped(output, current),
+                recover_git=lambda current: review_handoff_stopped(output, current))
         receipt, _ = launch_turn(cli, operation, item, output, deadline)
         if operation == 'prepare':
             return prepared_result(receipt)
@@ -523,7 +545,8 @@ def main():
     return int(result['status'] in ('worker_error', 'worker_deployment_blocked', 'probe_failed', 'task_sync_incomplete',
                                     'e2e_preflight_blocked', 'e2e_preflight_busy', 'worker_review_stop_unverified',
                                     'worker_git_preflight_blocked', 'git_preflight_failed', 'git_preflight_busy',
-                                    'worker_material_stop_unverified', 'worker_material_blocked'))
+                                    'worker_material_stop_unverified', 'worker_material_blocked',
+                                    'worker_host_git_stop_unverified', 'worker_host_git_blocked'))
 
 
 if __name__ == '__main__':

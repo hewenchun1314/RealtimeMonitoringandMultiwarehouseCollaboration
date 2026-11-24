@@ -23,6 +23,7 @@ from material_sync import requirement_checkout, sync_requirement
 from route_execution import snapshot
 from status_board import publish_status
 from task_sync import reconcile_missing
+from development_git import ACTIONS as HOST_GIT_ACTIONS, request_host_git, host_git_status
 from writeback import authorize_writeback, claim_writeback, confirm_writeback, find_entry, reconcile_writeback
 
 
@@ -195,6 +196,10 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
     action = require_text(data.get('action'), 'action')
     if command == 'record' and action == 'runtime_check':
         return runtime_check(require_text(data.get('chat_id'), 'chat_id'))
+    if command == 'record' and action == 'host_git_status':
+        return host_git_status(database, config, data, now, config_directory)
+    if command == 'record' and action in HOST_GIT_ACTIONS:
+        return request_host_git(database, config, data, now, config_directory)
     if command == 'record' and action == 'material_sync':
         return sync_material_attempt(database, config, data, now, config_directory)
     check_time = now or datetime.now(timezone.utc)

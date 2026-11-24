@@ -159,6 +159,9 @@ class RouteExecutionTests(WorkflowFixture):
             'branch': 'provider-dev', 'build_command': 'build', 'test_command': 'test',
             'acceptance_command': 'check', 'service_url': 'http://127.0.0.1:1',
         })
+        # Regular bundle Git metadata grants are separate from the explicit
+        # writable dependency authorization; this registry deliberately omits it.
+        self.config['runtime']['worker_git_write_repositories'] = ['backend:business-api']
         repo = (self.fixture / upstream['source_path']).resolve()
         repo.mkdir(parents=True)
         git(repo, 'init', '-b', 'provider-dev')

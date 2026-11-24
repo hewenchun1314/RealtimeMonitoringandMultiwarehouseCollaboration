@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS requirement_sync_results (
     attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
     result TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS development_git_operations (
+    operation_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
+    attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id), phase TEXT NOT NULL, kind TEXT NOT NULL,
+    request TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS deployment_claims (
     attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
     item_seq INTEGER NOT NULL REFERENCES work_items(seq)
