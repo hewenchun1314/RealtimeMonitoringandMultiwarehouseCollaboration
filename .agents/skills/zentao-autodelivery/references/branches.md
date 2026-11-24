@@ -2,7 +2,9 @@
 
 前后端编辑、构建和测试留在 `never` 的 MXC 工单环境。认证、建树和调用 Git hooks 的固定操作交 Windows 宿主启动器。主聊天和阶段 Agent 禁止在沙箱自行 fetch、worktree add、commit、checkout、merge、rebase 或 cherry-pick，也不能用 `HUSKY=0`、`--no-verify` 或修改 hooks 配置绕过检查。
 
-前端计划用 `evidence.applications`，后端用 `evidence.services` 登记本端配置键。后端 `writable` 依赖可按依赖键列入计划，路径和目标来自 `source_path` 和 `delivery`。当前配置与领取快照必须仍授权同一个仓库、分支。任一配置声明 `runtime.worker_git_write_repositories` 时，两者都必须包含对应 `frontend:<键>` 或 `backend:<键>`；删除或清空既有登记视为撤销。两者从未声明登记的旧配置沿用计划与仓库配置授权。
+前端计划用 `evidence.applications`，后端用 `evidence.services` 登记本端配置键。当前配置与领取快照必须仍授权同一个仓库、分支。普通服务与应用在任一配置声明 `runtime.worker_git_write_repositories` 时，两者都必须包含对应 `frontend:<键>` 或 `backend:<键>`；删除或清空既有登记视为撤销。两者从未声明登记的旧配置沿用计划与仓库配置授权。
+
+后端依赖沿既有独立授权：当前配置与快照都须为 `access:writable`，且 `source_path`、`delivery.branch` 等目标仍匹配，才可按依赖键列入计划。它不依赖只用于普通 bundle 仓库的上述登记；删除依赖或改为只读会撤销写权限。
 
 跨轮恢复若仍保留有效的成功分支核验回执，提交和合回继续使用该回执登记的工单分支及工作树；不能仅因轮次增加另造分支或丢弃原候选。只有账本重新进入 branch_check 时才准备对应的新工作树。
 

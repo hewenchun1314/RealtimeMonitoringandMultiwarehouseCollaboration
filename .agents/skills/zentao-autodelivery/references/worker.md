@@ -4,7 +4,7 @@
 
 从项目根目录运行。启动器使用本机已安装并登录的 Codex App Server 发行版 CLI。每次 CLI 开工或恢复都显式传入 `--ask-for-approval never`。启动器持有工单锁，阶段运行器保留 stdout、stderr、终态和 Windows 进程清理证据。
 
-Windows MXC 在可写工作区内仍会保护 Git 元数据。用 `runtime.worker_git_write_repositories` 按 `backend:服务键`、`frontend:应用键` 登记允许写入的开发仓库。启动器仅对当前配置和快照中位置一致的本仓 `.git` 或对应子模块目录授权，不扩大只读依赖及父仓库其他 Git 路径。宿主固定 Git 操作也尊重这项登记：任一配置曾声明时，两者都须保留对应键，删除或清空会撤销授权；两者均从未声明的旧配置沿用计划与仓库配置授权。
+Windows MXC 在可写工作区内仍会保护 Git 元数据。用 `runtime.worker_git_write_repositories` 按 `backend:服务键`、`frontend:应用键` 登记普通业务服务和前端应用。启动器仅对当前配置和快照中位置一致的本仓 `.git` 或对应子模块目录授权，不扩大只读依赖及父仓库其他 Git 路径。宿主对这些普通仓库也尊重登记：任一配置曾声明时，两者都须保留对应键，删除或清空会撤销授权；两者均从未声明的旧配置沿用计划与仓库配置授权。后端依赖使用现有独立规则，由两份配置中相同的 `access:writable`、路径和交付目标授权，不要求出现在普通 bundle 仓库登记内；改为只读或删除即撤销。
 
 Git 认证和 hooks 在本机普通 Windows 宿主进程运行，仓库物理位置不变；代码编辑、构建、测试仍在 MXC。主聊天通过 `branch_prepare`、`candidate_commit`、`integration_merge` 请求固定操作，不能从沙箱直接提交、检出、合并或补取分支。阶段 Agent 返回准备好的修改信息，主聊天登记请求并结束本轮，启动器确认原 CLI、阶段子进程和 Task 同步器全部停止后执行，再恢复同一聊天。完整请求和状态见[账本命令](workflow-cli.md)与[分支流程](branches.md)。
 
