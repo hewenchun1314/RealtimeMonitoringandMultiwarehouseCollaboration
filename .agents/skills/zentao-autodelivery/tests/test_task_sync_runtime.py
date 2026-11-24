@@ -108,7 +108,8 @@ class SyncRuntimeTests(unittest.TestCase):
                 'project_id': '2', 'item_id': '55', 'chat_id': '00000000-0000-4000-a000-000000000123',
                 'config_snapshot': json.dumps({'workflow_version': 2, 'runtime': {'split_task_sync': True}})}
         entered = threading.Event()
-        def stage(run_id, phase, *args, stop_event=None):
+        def stage(run_id, phase, *args, stop_event=None, recoverable=False):
+            self.assertTrue(recoverable, 'Both ordinary development and Task jobs must be recoverable')
             if phase == 'task-sync':
                 entered.set()
                 self.assertTrue(stop_event.wait(2))

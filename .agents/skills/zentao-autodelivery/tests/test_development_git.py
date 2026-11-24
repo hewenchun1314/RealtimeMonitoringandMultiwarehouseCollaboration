@@ -412,6 +412,7 @@ class DevelopmentGitTests(unittest.TestCase):
         git(source, 'remote', 'add', 'origin', str(remote))
         git(source, 'switch', '-c', 'user-working-branch')
         git(source, 'branch', '-D', 'AI-development')
+        git(source, 'branch', 'AI-development/local-child')
         requested = self.request('branch_prepare')
         self.assertEqual(requested['status'], 'host_git_worker_required')
         refs = git(source, 'for-each-ref', '--format=%(refname)')
@@ -466,3 +467,39 @@ class DevelopmentGitTests(unittest.TestCase):
                 self.start_side('frontend', key=key)
                 requested = self.request('branch_prepare')
                 self.assertEqual(requested['status'], 'host_git_rejected', requested)
+
+    def test_integration_preserves_user_ignored_file_in_source_checkout(self):
+        source = self.d.repositories['frontend']
+        (source / '.gitignore').write_text('notes.txt\n')
+        git(source, 'add', '--', '.gitignore')
+        git(source, 'commit', '-m', 'Fixture ignore user notes')
+        (source / 'notes.txt').write_text('USER LOCAL NOTES\n')
+        before = git(source, 'rev-parse', 'HEAD')
+        root = self.begin_coding()
+        (root / '.gitignore').write_text('')
+        (root / 'notes.txt').write_text('DELIVERY NOTES\n')
+        (root / 'index.html').write_text('<output>approved</output>\n')
+        self.candidate(root, files=['.gitignore', 'notes.txt', 'index.html'])
+        self.integration_phase(self.host())
+        self.request('integration_merge')
+        result = self.host()
+        self.assertEqual(result['status'], 'host_git_failed', result)
+        self.assertEqual((source / 'notes.txt').read_text(), 'USER LOCAL NOTES\n')
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
+
+    def test_missing_generated_husky_runtime_cannot_silently_skip_tracked_check(self):
+        source = self.d.repositories['frontend']
+        checks = source / '.husky'
+        checks.mkdir()
+        (checks / 'pre-commit').write_text('exit 1\n')
+        git(source, 'config', 'core.hooksPath', '.husky/_')
+        git(source, 'add', '--', '.husky/pre-commit')
+        git(source, 'commit', '-m', 'Fixture original Husky check without installed runtime')
+        root = self.begin_coding()
+        (root / 'index.html').write_text('<output>approved</output>\n')
+        before = git(root, 'rev-parse', 'HEAD')
+        self.candidate(root)
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        self.assertIn('runtime', failed['repositories'][self.d.key]['reason'].lower())
+        self.assertEqual(git(root, 'rev-parse', 'HEAD'), before)

@@ -150,6 +150,9 @@ def ensure_hooks(source, root, deadline):
             raise ValueError('Install the registered repository hooks in this item worktree before host Git work')
     if source_hooks.name == '_' and source_hooks.parent.name == '.husky':
         for name in names:
+            if ((source_hooks.parent / name).is_file()
+                    and (not (item_hooks / name).is_file() or not os.access(item_hooks / name, os.X_OK))):
+                raise ValueError('Install the original generated Husky runtime before running the tracked checks')
             if (source_hooks.parent / name).is_file() and not (item_hooks.parent / name).is_file():
                 raise ValueError('The original Husky check disappeared from the item worktree')
 
@@ -187,7 +190,7 @@ def prepare(proof, context, key, database, journal, payload=None):
     branch = proof['target_branch']
     git(source, 'check-ref-format', 'refs/heads/' + branch, deadline=deadline)
     refs = source_refs(branch)
-    available = set(git(source, 'for-each-ref', '--format=%(refname)', *refs, deadline=deadline).splitlines())
+    available = set(git(source, 'for-each-ref', '--format=%(refname)', *refs, deadline=deadline).splitlines()).intersection(refs)
     if not available:
         # Exact configured origin branch only; the model supplies neither URL nor
         # refspec. Do not fetch every branch or replace a present local target.
@@ -359,7 +362,7 @@ def integrate(proof, context, operation, key, journal, database, payload):
             git(source, 'worktree', 'remove', '--', str(merge_root), deadline=deadline)
         return {'status': 'verified', 'candidate': candidate, 'merged': tip}
     if git(source, 'merge-base', '--is-ancestor', tip, candidate, deadline=deadline, allowed=(0, 1)) is None:
-        raise ValueError('The target diverged; separately authorized controlled history resolution is required')
+        raise ValueError('This fixed operation supports only fast-forward/already-contained results; resolve divergence through a separate controlled path')
     if merge_root == temporary and not temporary.exists():
         temporary.parent.mkdir(parents=True, exist_ok=True)
         write_json(ownership_path, identity)
@@ -371,7 +374,7 @@ def integrate(proof, context, operation, key, journal, database, payload):
     ensure_hooks(source, merge_root, deadline)
     try:
         with hooks(merge_root, journal, deadline) as (opts, env):
-            git(merge_root, *opts, 'merge', '--ff-only', '--no-autostash', candidate, deadline=deadline, env=env)
+            git(merge_root, *opts, 'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', candidate, deadline=deadline, env=env)
     except ValueError:
         merged = git(source, 'rev-parse', branch, deadline=deadline)
         if git(source, 'merge-base', '--is-ancestor', candidate, merged, deadline=deadline, allowed=(0, 1)) is not None:
