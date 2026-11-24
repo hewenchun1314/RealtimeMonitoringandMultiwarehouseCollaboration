@@ -292,7 +292,16 @@ class TaskRemote:
 def _credentials(cfg):
     if cfg.get('credential_ref') != 'windows-dpapi:dotflow/zentao':
         raise RemoteRejected('不支持的禅道凭据引用')
-    local = Path(os.environ['LOCALAPPDATA']) / 'DotFlow' / 'credentials' / 'zentao.json'
+    # MXC redirects LOCALAPPDATA, while the registered DPAPI file remains in
+    # the same user's profile. Resolve only these two explicit locations.
+    roots = [Path(os.environ['LOCALAPPDATA'])] if os.environ.get('LOCALAPPDATA') else []
+    if os.environ.get('USERPROFILE'):
+        roots.append(Path(os.environ['USERPROFILE']) / 'AppData' / 'Local')
+    candidates = [root / 'DotFlow' / 'credentials' / 'zentao.json'
+                  for root in roots if root.is_absolute()]
+    local = next((path for path in candidates if path.is_file()), None)
+    if local is None:
+        raise RemoteRejected('禅道凭据文件不可用')
     record = json.loads(local.read_text(encoding='utf-8-sig'))
     formats = ('windows-dpapi-current-user', 'CurrentUser', 'DPAPI-CurrentUser', 'windows-dpapi:CurrentUser')
     if (record.get('schema_version') != 1 or record.get('protection') not in formats

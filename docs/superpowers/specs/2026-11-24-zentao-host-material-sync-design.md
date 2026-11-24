@@ -16,6 +16,10 @@ Serialize synchronization/preflight against the requirement checkout. Persist st
 
 Add `worker.py git-preflight`: a bounded host read-only `git ls-remote --exit-code` against the configured requirement checkout's actual tracking branch, with interactive credential prompts disabled. Store only safe identity, commit and result information; never print credentials or raw authentication responses. Run this before `prepare` creates a chat and before the first `run` starts ticket business, including when page E2E is disabled. Expose the same result during monitor `sync-tasks` so the scheduled monitor sees environment failures and keeps candidates queued; document running preflight before reserve. A genuine credential expiry or server failure must produce an environment/preflight result, not start and then terminally fail a new Story for an MXC-only error. When prepare/initial-run preflight definitively fails and its owned processes are stopped, atomically release only the same never-started reserved/bound dispatch to the queue, preserving its existing chat. Unknown stop or an already-started item cannot release occupancy. This avoids stranding an uncreated chat in dispatch_uncertain.
 
+## Related observed profile-path defect
+
+The same original worker also failed to locate the registered ZenTao DPAPI file because MXC redirects LOCALAPPDATA. A real controlled probe confirmed USERPROFILE remains the current real user and the identical registered file decrypts successfully at USERPROFILE/AppData/Local. Resolve only the existing LOCALAPPDATA path and that explicit same-user DotFlow/credentials/zentao.json fallback. Preserve first-file priority and instance/schema validation; never scan unrelated profiles, change global environment, or reveal credential values. This does not bridge Windows Credential Manager APIs or alter E2E credential handling.
+
 ## Alternatives
 
 - Recommended: host handoff. Reuses existing launcher authority and bounded-process pattern; retains worker isolation and adds no credentials to prompts/config.
