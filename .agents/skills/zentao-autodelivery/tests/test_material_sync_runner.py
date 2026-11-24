@@ -259,6 +259,54 @@ class HostSyncRunnerTests(WorkflowFixture):
             result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture)
         self.assertEqual(result['status'], 'material_synced')
 
+    def test_unverified_material_sync_blocks_preflight_and_other_item_sync(self):
+        item, data = self.admit()
+        phases = []
+        def stage(attempt, phase, deadline, cwd, root, *args, **kwargs):
+            phases.append(phase)
+            folder = root / attempt / phase
+            folder.mkdir(parents=True)
+            computed = (compute_material_attempt(self.database, self.config, data, self.fixture)
+                        if phase == 'host-sync' else {'status': 'git_preflight_passed'})
+            launch = {'attempt_id': attempt, 'phase': phase, 'deadline_at': deadline.isoformat(),
+                      'receipt_path': str(folder / 'result.json'), 'stdout_path': str(folder / 'stdout.log')}
+            (folder / 'launch.json').write_text(json.dumps(launch))
+            (folder / 'stdout.log').write_text(json.dumps(computed))
+            stopped = phase != 'host-sync'
+            proof = {**launch, 'outcome': 'success', 'stop_confirmed': stopped,
+                     'stop_evidence': {'owned_processes_active_after_stop': 0 if stopped else 1}}
+            (folder / 'result.json').write_text(json.dumps(proof))
+            return proof
+        with patch.object(runner, 'run_stage', side_effect=stage), \
+                patch.object(runner, 'recover_job_stop', return_value=None):
+            result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture)
+            self.assertEqual(result['status'], 'material_sync_stop_unverified')
+            probe = runner.run_git_preflight(self.config_path, self.database, self.fixture)
+            self.assertEqual(probe['status'], 'git_preflight_busy')
+        self.assertEqual(phases, ['host-sync'])
+        # A different admitted item using the same checkout must respect the
+        # original operation too, not merely its own attempt evidence folder.
+        self.config['development']['max_concurrent_items'] = 2
+        self.config_path.write_text(json.dumps(self.config))
+        second = self.reserve(3)
+        binding = {'request_id': second['request_id'], 'chat_id': 'chat-3'}
+        self.record('bind', item_id=3, **binding, desktop_project_id='desktop-1')
+        self.record('start', item_id=3, **binding)
+        self.record('attempt_start', item_id=3, **binding, stage='material_check')
+        with patch.object(runner, 'run_stage') as launch, patch.object(runner, 'recover_job_stop', return_value=None):
+            blocked = runner.run_material_sync(second['marker'], self.database, self.config_path, self.fixture)
+            self.assertEqual(blocked['status'], 'material_sync_busy')
+            launch.assert_not_called()
+        with patch.object(runner, 'run_stage') as launch, \
+                patch.object(runner, 'recover_job_stop', return_value={'owned_processes_active_after_stop': 0}):
+            result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture, recover=True)
+            self.assertEqual(result['status'], 'material_synced')
+            launch.assert_not_called()
+        with patch.object(runner, 'run_stage', side_effect=stage):
+            self.assertEqual(runner.run_git_preflight(self.config_path, self.database,
+                                                    self.fixture)['status'], 'git_preflight_passed')
+        self.assertEqual(phases, ['host-sync', 'git-preflight'])
+
     def test_disabled_material_sync_and_bug_skip_story_preflight(self):
         config = {**self.config, 'runtime': {}}
         self.config_path.write_text(json.dumps(config))

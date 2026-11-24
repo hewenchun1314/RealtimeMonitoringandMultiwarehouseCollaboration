@@ -120,28 +120,61 @@ def recover_proof(folder, attempt, phase, deadline):
     return proof
 
 
-def reconcile_pending_preflight(database, checkout):
-    """Called under the checkout lock before starting any host Git process."""
-    pending_path = database.parent / 'requirement-locks' / (checkout_key(checkout) + '-preflight.json')
-    if pending_path.exists():
-        previous = read_json(pending_path)
+def pending_git_path(database, checkout):
+    return database.parent / 'requirement-locks' / (checkout_key(checkout) + '-host-git.json')
+
+
+def mark_pending_git(database, checkout, operation, run_id, deadline, *, marker=None):
+    value = {'operation': operation, 'run_id': run_id, 'checkout': str(checkout),
+             'deadline_at': deadline.isoformat()}
+    if marker is not None:
+        value['marker'] = marker
+    write_json(pending_git_path(database, checkout), value)
+
+
+def clear_stopped_git(database, checkout, run_id, proof):
+    if (proof.get('stop_confirmed') is True
+            and proof.get('stop_evidence', {}).get('owned_processes_active_after_stop') == 0):
+        path = pending_git_path(database, checkout)
+        value = read_json(path)
+        if value and value.get('run_id') == run_id:
+            path.unlink()
+
+
+def reconcile_pending_git(database, checkout):
+    """Called under the checkout lock before either kind of host Git work."""
+    # Also reconcile the original preflight-only journal if upgrading an
+    # interrupted launcher. New operations share one checkout-level journal.
+    legacy = database.parent / 'requirement-locks' / (checkout_key(checkout) + '-preflight.json')
+    for path in (legacy, pending_git_path(database, checkout)):
+        if not path.exists():
+            continue
+        previous = read_json(path)
         try:
             if (not previous or previous.get('checkout') != str(checkout)
                     or not re.fullmatch(r'[0-9a-f]{32}', previous.get('run_id', ''))):
-                raise ValueError('invalid pending preflight')
-            old_deadline = datetime.fromisoformat(previous['deadline_at'])
-            if old_deadline.utcoffset() is None:
+                raise ValueError('invalid pending host Git operation')
+            deadline = datetime.fromisoformat(previous['deadline_at'])
+            if deadline.utcoffset() is None:
                 raise ValueError('invalid pending deadline')
-            old_folder = (database.parent / 'worker-probes') / previous['run_id'] / 'git-preflight'
-            # run_stage creates the phase directory before spawning. Absence
+            operation = previous.get('operation', 'preflight')
+            if operation == 'preflight':
+                phase = 'git-preflight'
+                folder = database.parent / 'worker-probes' / previous['run_id'] / phase
+            elif operation == 'material-sync' and re.fullmatch(r'HNF-[0-9a-f]{20}', previous.get('marker', '')):
+                phase = 'host-sync'
+                folder = (database.parent / 'items' / previous['marker'] / 'material-sync'
+                          / previous['run_id'] / phase)
+            else:
+                raise ValueError('invalid pending operation identity')
+            # run_stage creates its phase directory before spawning. Absence
             # proves this persisted request never reached a process launch.
-            if old_folder.exists() and not recover_proof(old_folder, previous['run_id'],
-                                                        'git-preflight', old_deadline):
-                return message('git_preflight_busy', stop_confirmed=False,
-                               receipt=str(old_folder / 'result.json'))
+            if folder.exists() and not recover_proof(folder, previous['run_id'], phase, deadline):
+                return message('host_git_busy', stop_confirmed=False, operation=operation,
+                               run_id=previous['run_id'], receipt=str(folder / 'result.json'))
         except (KeyError, TypeError, ValueError):
-            return message('git_preflight_busy', stop_confirmed=False)
-        pending_path.unlink()
+            return message('host_git_busy', stop_confirmed=False)
+        path.unlink()
     return None
 
 
@@ -174,8 +207,11 @@ def run_material_sync(marker, database, config_path, project_root, *, recover=Fa
     with checkout_lock(database.parent / 'requirement-locks', checkout) as acquired:
         if not acquired:
             return message('material_sync_busy', attempt_id=data['attempt_id'])
-        if reconcile_pending_preflight(database, checkout):
-            return message('material_sync_busy', attempt_id=data['attempt_id'])
+        blocked = reconcile_pending_git(database, checkout)
+        if blocked:
+            own_uncertain = blocked.get('operation') == 'material-sync' and blocked.get('run_id') == data['attempt_id']
+            return message('material_sync_stop_unverified' if own_uncertain else 'material_sync_busy',
+                           attempt_id=data['attempt_id'])
         current = pending_material_sync(marker, database, config_path)
         if current.get('data') != data:
             return message('material_sync_inactive')
@@ -187,9 +223,11 @@ def run_material_sync(marker, database, config_path, project_root, *, recover=Fa
             root.mkdir(parents=True, exist_ok=True)
             request = root / (data['attempt_id'] + '-request.json')
             write_json(request, data)
+            mark_pending_git(database, checkout, 'material-sync', data['attempt_id'], deadline, marker=marker)
             proof = run_stage(data['attempt_id'], phase, deadline, project_root, root, None,
                               [sys.executable, '-B', __file__, 'execute', '--config', str(config_path),
                                '--database', str(database), '--request', str(request)], recoverable=True)
+        clear_stopped_git(database, checkout, data['attempt_id'], proof)
         computed = read_json(folder / 'stdout.log') or {}
         # Reload current configuration after execution; revoked/changed paths
         # cannot be grandfathered by the snapshot captured before launch.
@@ -241,20 +279,18 @@ def run_git_preflight(config_path, database, project_root, item=None):
         if not acquired:
             return message('git_preflight_busy', stop_confirmed=False)
         root = database.parent / 'worker-probes'
-        blocked = reconcile_pending_preflight(database, checkout)
+        blocked = reconcile_pending_git(database, checkout)
         if blocked:
-            return blocked
-        pending_path = database.parent / 'requirement-locks' / (checkout_key(checkout) + '-preflight.json')
+            return {**blocked, 'status': 'git_preflight_busy'}
         run_id = uuid4().hex
         deadline = utc_now() + timedelta(seconds=30)
-        write_json(pending_path, {'run_id': run_id, 'checkout': str(checkout), 'deadline_at': deadline.isoformat()})
+        mark_pending_git(database, checkout, 'preflight', run_id, deadline)
         proof = run_stage(run_id, 'git-preflight', deadline, project_root, root, None,
                           [sys.executable, '-B', __file__, 'preflight', '--config', str(config_path)], recoverable=True)
         checked = read_json(Path(proof['stdout_path'])) or {}
         stopped = (proof.get('stop_confirmed') is True
                    and proof.get('stop_evidence', {}).get('owned_processes_active_after_stop') == 0)
-        if stopped:
-            pending_path.unlink()
+        clear_stopped_git(database, checkout, run_id, proof)
         passed = stopped and proof['outcome'] == 'success' and checked.get('status') == 'git_preflight_passed'
         return message('git_preflight_passed' if passed else 'git_preflight_failed',
                        **{k: checked[k] for k in ('branch', 'commit') if passed and k in checked},
