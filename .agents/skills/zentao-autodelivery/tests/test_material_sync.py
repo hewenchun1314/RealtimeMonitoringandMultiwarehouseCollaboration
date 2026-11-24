@@ -149,6 +149,47 @@ class MaterialSyncTests(WorkflowFixture):
         self.assertNotIn(self.checkout / '.git', allowed)
         self.assertNotIn(self.remote / '.git', allowed)
 
+    def test_readonly_verification_does_not_change_directory_into_checkout(self):
+        from material_sync import verify_requirement_intent
+        intent = 'requirements/REQ-001/intent.md'
+        (self.remote / intent).parent.mkdir(parents=True)
+        (self.remote / intent).write_text('published requirement\n', encoding='utf-8')
+        self.commit_remote('publish requirement')
+        attempt = self.start_review()
+        synced = self.run_sync(attempt)
+        actual_run = subprocess.run
+        def readonly_process(argv, **kwargs):
+            if '-C' in argv and Path(argv[argv.index('-C') + 1]) == self.checkout:
+                raise subprocess.CalledProcessError(128, argv, stderr='fatal: cannot change directory: Permission denied')
+            return actual_run(argv, **kwargs)
+        with patch('material_sync.subprocess.run', side_effect=readonly_process):
+            try:
+                verify_requirement_intent(self.checkout, synced['commit'], intent)
+            except ValueError as error:
+                self.fail('Read-only verification required directory traversal: ' + str(error))
+
+    def test_readonly_verification_resolves_linked_worktree_gitfile(self):
+        from material_sync import verify_requirement_intent
+        intent = 'intent.md'
+        (self.checkout / intent).write_text('published material\n', encoding='utf-8')
+        git(self.checkout, 'add', intent)
+        git(self.checkout, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-m', 'material')
+        commit = git(self.checkout, 'rev-parse', 'HEAD')
+        linked = self.fixture / 'linked'
+        git(self.checkout, 'worktree', 'add', '--detach', str(linked), commit)
+        self.assertTrue((linked / '.git').is_file())
+        actual_run = subprocess.run
+        def readonly_process(argv, **kwargs):
+            if '-C' in argv:
+                raise subprocess.CalledProcessError(128, argv, stderr='fatal: cannot change directory: Permission denied')
+            return actual_run(argv, **kwargs)
+        with patch('material_sync.subprocess.run', side_effect=readonly_process):
+            try:
+                verify_requirement_intent(linked, commit, intent)
+            except ValueError as error:
+                self.fail('Read-only linked worktree verification failed: ' + str(error))
+
     def test_compute_does_not_publish_before_cleanup(self):
         from workflow import compute_material_attempt, publish_material_result
         import sqlite3

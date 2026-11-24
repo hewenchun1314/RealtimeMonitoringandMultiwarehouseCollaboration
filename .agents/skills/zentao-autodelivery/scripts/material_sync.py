@@ -16,8 +16,24 @@ def requirement_checkout(config, config_directory):
     return None
 
 
-def git_until(checkout, deadline):
+def readonly_git_directory(checkout):
+    """Resolve a normal .git directory or Git's one-line linked-worktree pointer."""
+    metadata = checkout / '.git'
+    if metadata.is_file():
+        lines = metadata.read_text(encoding='utf-8').splitlines()
+        if len(lines) != 1 or not lines[0].startswith('gitdir: '):
+            raise ValueError('The requirement Git metadata pointer is invalid')
+        metadata = (checkout / lines[0][8:]).resolve()
+    if not metadata.is_dir():
+        raise ValueError('The requirement Git metadata is not readable')
+    return metadata
+
+
+def git_until(checkout, deadline, *, read_only=False):
     env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'never', 'GCM_GUI_PROMPT': 'false', 'LC_ALL': 'C'}
+
+    prefix = (['git', '--git-dir=' + str(readonly_git_directory(checkout)), '--work-tree=' + str(checkout)]
+              if read_only else ['git', '-C', str(checkout)])
 
     def git(operation, *args):
         remaining = deadline - monotonic()
@@ -25,7 +41,7 @@ def git_until(checkout, deadline):
             raise ValueError('Requirement repository sync timed out')
         try:
             result = subprocess.run(
-                ['git', '-C', str(checkout), '-c', 'credential.interactive=never', '--literal-pathspecs', *args],
+                [*prefix, '-c', 'credential.interactive=never', '--literal-pathspecs', *args],
                 env=env, stdin=subprocess.DEVNULL, capture_output=True, encoding='utf-8',
                 errors='replace', timeout=remaining, check=True)
         except subprocess.TimeoutExpired:
@@ -68,7 +84,9 @@ def sync_requirement(checkout, budget):
 
 
 def verify_requirement_intent(checkout, commit, path, *, missing=False):
-    git = git_until(checkout, monotonic() + 5)
+    # MXC permits reading protected material but denies chdir into a read-only
+    # checkout. Explicit metadata/worktree paths preserve read-only verification.
+    git = git_until(checkout, monotonic() + 5, read_only=True)
     if git('verify the reviewed HEAD', 'rev-parse', 'HEAD') != commit:
         raise ValueError('The requirement repository changed since sync')
     if not path:
@@ -78,6 +96,6 @@ def verify_requirement_intent(checkout, commit, path, *, missing=False):
             raise ValueError('The intent exists in the synchronized commit')
         return
     expected = git('find the intent in the synchronized commit', 'rev-parse', '--verify', f'{commit}:{path}')
-    actual = git('verify the reviewed intent', 'hash-object', f'--path={path}', '--', path)
+    actual = git('verify the reviewed intent', 'hash-object', f'--path={path}', '--', str(checkout / path))
     if actual != expected:
         raise ValueError('The local intent differs from the synchronized commit')

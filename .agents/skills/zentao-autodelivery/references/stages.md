@@ -94,7 +94,7 @@ Windows 工单运行账号使用固定的 Open Code Review v1.14.2。默认路�
 
 宿主成功或确定失败后恢复同一聊天，再次查询原尝试的 `record material_sync`。取得 `material_synced` 后，把回执里的提交交给评审 Agent，用原分段 `verify` 继续。`material_sync_failed` 使用原尝试登记实际失败和运行回执，再按账本重试；不能以认证故障推断缺材料。停止不明时保留原名额和证据，不重复同步、不发布成功回执。启动器恢复先对账稳定目录及命名 Job Object。评审开始前的认证预检由 `worker.py git-preflight` 在宿主完成；页面 E2E 关闭时同样执行。
 
-账本取得该尝试的同步成功回执后才接受评审成功或「待补材料」。评审成功时账本核对本地 `intent.md` 与该提交一致。若已知材料目录但文件缺失，随 `material_file_status:"missing"` 提供预期 `evidence.path`，账本在同步提交中核对该路径。
+账本取得该尝试的同步成功回执后才接受评审成功或「待补材料」。评审成功时账本核对本地 `intent.md` 与该提交一致。只读核验显式使用需求仓库的 Git 元数据与工作树路径，不用 `git -C` 或切换进只读目录；文件哈希保持相对 `--path` 的清理规则，并用绝对文件路径读取材料。普通 `.git` 目录和关联 worktree 的 `.git` 指针均按固定路径解析。若已知材料目录但文件缺失，随 `material_file_status:"missing"` 提供预期 `evidence.path`，账本在同步提交中核对该路径。
 
 
 ## 禅道正式评审
