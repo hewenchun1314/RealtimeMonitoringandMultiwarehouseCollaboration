@@ -15,6 +15,7 @@
 - [ ] Support missing exact origin branch fetch, deterministic worktree creation, explicit file staging/candidate commit and safe fast-forward integration. Keep actual hooks and filters.
 - [ ] Enforce canonical common-Git-directory ownership across linked worktrees, protect targets checked out elsewhere, and reject dirty hook-generated candidate results with regression coverage.
 - [ ] Add per-repo pending/cleanup/reconciliation for lost receipts, post-commit outcomes, crash recovery and concurrency without duplicate effects.
+- [ ] Restrict commits to coding/repair-coding and route normal/repair unit-test edits back through machine-derived coding revision; verify new SHA invalidates downstream evidence.
 - [ ] Wire launcher handoff/recovery and return candidate/merged SHAs usable by existing evidence validators.
 - [ ] Update phase-agent/main-worker instructions, Skill and branch/stage/worker/CLI references; preserve user-stopped items and prior material/push/deploy flows.
 
@@ -25,4 +26,5 @@
 - [ ] Run actual MXC-host-MXC smoke only in cloned repositories/temporary ledgers, exercise representative real Husky configuration on four affected projects and prior40-repository paths where feasible.
 - [ ] Run complete suite, integrate into actual project checkout, verify actual entry points without business commits/ZenTao writes/#41 runs.
 - [ ] Record evidence, update automation memory and close isolated development worktree.
+
 
