@@ -51,7 +51,7 @@
 | `expire_dispatch` | `request_id`。核对未领取执行权的过期派发。 |
 | `resolve_dispatch` | `request_id`、`not_created:true` 和非空 `evidence`。有明确证据证明旧请求未创建聊天时，用于释放待建状态。 |
 | `attempt_start` | `request_id`、`chat_id`、`stage`。保存返回的 `attempt_id`、`started_at`、`phase_started_at`、`deadline_at`、`retry_number` 和 `phase`。新单的 `phase` 为 `verify` 或返工的实际分段名。旧单沿用 `repair_coding` 等原分段。按回执的角色和截止时间执行，`attempt_active` 表示原尝试仍存在。 |
-| `material_sync` | `item`、`request_id`、`chat_id`、有效的 Story 材料评审 `attempt_id`。返回 `material_synced` 及快进后核对的 `branch`、`upstream`、`commit`。`material_sync_failed` 包含失败原因。`material_sync_inactive` 表示尝试过期或绑定无效。 |
+| `material_sync` | `item`、`request_id`、`chat_id`、有效的 Story 材料评审 `attempt_id`。这是状态查询，不在工单沙箱运行 Git。首次返回 `material_sync_worker_required` 和原截止时间，立即结束本轮交宿主启动器执行，禁止自行 fetch 或读取 Git 凭据。恢复原会话后读同一尝试：`material_synced` 含核验后的 `branch`、`upstream`、`commit` 及宿主回执；`material_sync_failed` 供原尝试登记失败和重试；`material_sync_inactive` 表示尝试过期或绑定无效。成功回执仅在宿主进程停止且绑定及提交复核后发布。 |
 | `branch_inspect` | `request_id`、`chat_id`、有效分支核验 `attempt_id`。可传 `worktrees`（应用配置键对应的工作树绝对路径）。首次调用解析分支，准备好工作树后再次调用验证真实提交和工单分支。参照 [分支核验与工作树](branches.md) 处理每项状态。 |
 | `branch_prepare` | `request_id`、`chat_id`、有效分支核验 `attempt_id`、目标 `application`（前端）或 `service`（后端），以及 `desktop_reconciliation` 对象，含 `status`（`no_receipt`、`failed` 或 `unavailable`）和非空 `evidence`。对账后按固定路径创建或恢复核验过的 Git worktree，以实际路径继续。此操作不改变 SQLite 阶段。 |
 | `repair_advance` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`summary` 和本分段的成功 `evidence`。获得新的 `repair_advanced` 后，使用同一 `attempt_id` 执行返回的下一分段及其新截止时间。重放返回 `phase_already_advanced`，需对账当前分段。 |

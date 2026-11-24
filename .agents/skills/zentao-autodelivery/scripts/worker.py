@@ -29,6 +29,8 @@ from story_review_sync import rearm_uncertain, release_handoff, resume_ready, sy
 from task_remote import RemoteRejected
 from task_sync import enabled as task_sync_enabled
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
+from material_sync_runner import (pending_material_sync, run_material_sync, run_git_preflight,
+                                  release_preflight_reservation)
 
 
 def codex_directory():
@@ -83,6 +85,8 @@ def worker_prompt(operation, item):
         '禁止申请临时权限、弹审批、提问或等待人工确认，也不要开启新的桌面聊天。'
         '每次阶段尝试使用账本截止时间及阶段运行器。'
         '材料评审返回 material_sync_required 时，先按步骤指引运行 record material_sync，'
+        '若返回 material_sync_worker_required，立即结束本轮，交 Windows 启动器在宿主同步；'
+        '禁止在沙箱里自行 fetch、探测或转存 Git 凭据。恢复同一会话后读取原尝试结果，'
         '取得 material_synced 回执后才派发需求评审；同步失败按原尝试登记。'
         '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
         '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
@@ -123,7 +127,8 @@ def launch_turn(cli, operation, item, output, deadline):
     prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
     launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
     options = {'recoverable': True} if (operation == 'run' and
-               json.loads(item['config_snapshot']).get('runtime', {}).get('story_review_sync')) else {}
+               any(json.loads(item['config_snapshot']).get('runtime', {}).get(flag) for flag in
+                   ('story_review_sync', 'sync_requirement_before_review'))) else {}
     if operation != 'run' or not task_sync_enabled(item):
         return run_stage(*launch, **options), None
     stop = Event()
@@ -166,7 +171,8 @@ def review_handoff_stopped(output, item):
         return False
 
 
-def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False, recover_review=None):
+def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False, recover_review=None,
+                       recover_material=None):
     deadline = deadline or utc_now() + timedelta(hours=72)
 
     def peek():
@@ -175,12 +181,24 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     pending = peek()
     last_turn = {}
     last_deployment = None
+    last_material = None
     release_key = 'backend_deployment'
     while utc_now() < deadline:
         state = pending['status']
         item = read_item(marker)
         if not item or item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready'):
             return last_turn or {'status': 'worker_released'}
+        material = pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)
+        if material['status'] == 'material_sync_pending':
+            if last_turn.get('status') != 'worker_stopped' and not (recover_material and recover_material(item)):
+                return {**last_turn, 'status': 'worker_material_stop_unverified'}
+            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
+                return {**last_turn, 'status': 'worker_material_blocked',
+                        'material_sync': {'status': 'material_runtime_blocked'}}
+            last_material = run_material_sync(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT, recover=True)
+            if last_material['status'] not in ('material_synced', 'material_sync_failed', 'material_sync_inactive'):
+                return {**last_turn, 'status': 'worker_material_blocked', 'material_sync': last_material}
+            continue
         if item['state'] == 'review_handoff':
             if last_turn.get('status') != 'worker_stopped' and not (recover_review and recover_review(item)):
                 return {**last_turn, 'status': 'worker_review_stop_unverified'}
@@ -233,12 +251,16 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
         last_turn = worker_result(*launch_chat(item))
         if last_deployment is not None:
             last_turn[release_key] = last_deployment
+        if last_material is not None:
+            last_turn['material_sync'] = last_material
         if last_turn['status'] != 'worker_stopped':
             return last_turn
         current = read_item(marker)
         if current and current['state'] in ('review_handoff', 'review_wait', 'review_ready'):
             continue
         pending = peek()
+        if pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'material_sync_pending':
+            continue
         if pending['status'] == 'deployment_not_pending':
             return last_turn
     return {**last_turn, 'status': 'worker_deployment_blocked',
@@ -285,12 +307,21 @@ def run(operation, marker, cli):
                 existing = prepared_result(proof)
                 if existing['chat_id'] or not proof['stop_confirmed'] or directory.parent.name == run_id:
                     return existing
+        if item is not None and (operation == 'prepare' or (operation == 'run'
+                and item['state'] == 'bound' and not item['stage'])):
+            preflight = run_git_preflight(CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT, item)
+            if preflight['status'] not in ('git_preflight_passed', 'git_preflight_skipped'):
+                config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+                released = release_preflight_reservation(DATABASE_PATH, config, item, preflight)
+                return {'status': 'worker_git_preflight_blocked', 'git_preflight': preflight,
+                        'reservation': released}
         os.environ.pop('CODEX_THREAD_ID', None)
         deadline = utc_now() + (timedelta(hours=72) if operation == 'run' else timedelta(minutes=4))
         if operation == 'run':
             return dispatch_work_item(
                 marker, lambda current: launch_turn(cli, operation, current, output, deadline), deadline,
-                recover_deployment=True, recover_review=lambda current: review_handoff_stopped(output, current))
+                recover_deployment=True, recover_review=lambda current: review_handoff_stopped(output, current),
+                recover_material=lambda current: review_handoff_stopped(output, current))
         receipt, _ = launch_turn(cli, operation, item, output, deadline)
         if operation == 'prepare':
             return prepared_result(receipt)
@@ -408,6 +439,7 @@ def run_monitor_sync():
               'receipt': receipt['receipt_path']}
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        result['git_preflight'] = run_git_preflight(CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT)
         result['story_reviews'] = sync_monitor_reviews(config)
         if dingtalk_enabled(config):
             result['dingtalk'] = dispatch_dingtalk()
@@ -462,7 +494,7 @@ def run_e2e_preflight(profile):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks', 'e2e-preflight',
-                                             'review-target', 'review-reconcile'))
+                                             'review-target', 'review-reconcile', 'git-preflight'))
     parser.add_argument('--marker')
     parser.add_argument('--profile', type=Path)
     parser.add_argument('--prior-ended', action='store_true')
@@ -473,7 +505,9 @@ def main():
         parser.error('--prior-ended is only supported for review-reconcile')
     cli = codex_directory() / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
     try:
-        if args.operation == 'e2e-preflight':
+        if args.operation == 'git-preflight':
+            result = run_git_preflight(CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT)
+        elif args.operation == 'e2e-preflight':
             result = run_e2e_preflight(args.profile)
         elif args.operation == 'sync-tasks':
             result = run_monitor_sync()
@@ -487,7 +521,9 @@ def main():
         result = {'status': 'worker_error', 'reason': str(error)}
     print(json.dumps(result, ensure_ascii=True))
     return int(result['status'] in ('worker_error', 'worker_deployment_blocked', 'probe_failed', 'task_sync_incomplete',
-                                    'e2e_preflight_blocked', 'e2e_preflight_busy', 'worker_review_stop_unverified'))
+                                    'e2e_preflight_blocked', 'e2e_preflight_busy', 'worker_review_stop_unverified',
+                                    'worker_git_preflight_blocked', 'git_preflight_failed', 'git_preflight_busy',
+                                    'worker_material_stop_unverified', 'worker_material_blocked'))
 
 
 if __name__ == '__main__':

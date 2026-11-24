@@ -24,11 +24,11 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 ## 监测入口
 
 1. 对账已有工单、派发不明的请求、超时尝试及待写回事项。使用 `record runtime_check` 核对监测聊天的实际权限。只有返回 `runtime_unattended` 才执行需要外部访问的监测或写回。关闭 `monitor.enabled` 或指派白名单为空时，跳过新单扫描和领取。仅在当前请求授权范围内处理已有工单和回写。
-   在正式监测会话中执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py sync-tasks`，由受控同步进程按工单快照补办本项目 Task，覆盖已收尾工单。每轮核对回执，保留未完成项供续接。扫描和领取原 Story 备注及附件时，只处理 `comment`、`attachment` 两类操作。
+   在正式监测会话中执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py sync-tasks`，由受控同步进程按工单快照补办本项目 Task，覆盖已收尾工单。每轮核对回执，保留未完成项供续接。回执中的 `git_preflight` 是宿主需求仓库认证检查；失败或运行忙时保留新单队列，不领取或启动新单。扫描和领取原 Story 备注及附件时，只处理 `comment`、`attachment` 两类操作。
    `sync-tasks` 也返回 `story_reviews`。按 `ready` 的标识用原 `worker.py run --marker` 续接，遇到 `review_capacity_wait` 留到下一轮。等待禅道评审的工单无需重复扫描领取或重启聊天。
 2. 根据 `zentao.accepted_statuses` 只扫描状态列表非空的工单类型。使用经验证的禅道只读接口分页查询，参考 `zentao-query` 和项目内 `zentao-cron-dashboard`。完整扫描须证明目标项目唯一匹配、工单归属明确、所有启用类型的分页结束且权限有效。只向账本传递指派账号和状态符合配置的工单，指派账号区分大小写。接口失败、权限缺失或分页不完整时，以 `complete:false` 登记部分扫描并保留已有队列。
-3. 调用 `claim` 登记完整扫描，首次记录历史基线，随后按优先级和发现顺序返回待复核队首。项目开启页面 E2E 并配置 `e2e.playwright.preflight_checks` 时，在领取适用工单前运行 `worker.py e2e-preflight`。默认预检使用项目配置，确认本地前端可用、自动登录、工区已选和页面控件可见。凭本轮 `e2e_preflight_passed` 回执推进，失败或运行忙时保留排队状态并记录结果。然后重新读取工单归属、状态和指派人，再调用 `claim` 领取。若返回队首变化，复核新的队首。以事务返回的领取结果确认名额。
-4. 首次派发和后续续接统一使用 [工单启动器](references/worker.md)。首次 `prepare` 用 `never` 创建只回复就绪的工单聊天，读回实际聊天 ID，核对或挂载桌面项目后登记 `record bind`。正式执行调用 `run`，它用 `never` 恢复同一聊天。禁止通过桌面建聊或发送消息工具启动业务轮次。启动器回执不明时，按原派发标记及其证据目录核对，确认停止后才能重试；执行权仍以账本为准。
+3. 调用 `claim` 登记完整扫描，首次记录历史基线，随后按优先级和发现顺序返回待复核队首。领取需要材料同步的 Story 前运行 `worker.py git-preflight`，取得本轮 `git_preflight_passed`；禁用材料同步时允许 `git_preflight_skipped`。预检在宿主以禁止交互的 Git 只读查询核对实际上游，失败或忙时不预占名额，不把新单记为材料失败。项目开启页面 E2E 并配置 `e2e.playwright.preflight_checks` 时，在领取适用工单前运行 `worker.py e2e-preflight`。默认预检使用项目配置，确认本地前端可用、自动登录、工区已选和页面控件可见。凭本轮 `e2e_preflight_passed` 回执推进，失败或运行忙时保留排队状态并记录结果。然后重新读取工单归属、状态和指派人，再调用 `claim` 领取。若返回队首变化，复核新的队首。以事务返回的领取结果确认名额。
+4. 首次派发和后续续接统一使用 [工单启动器](references/worker.md)。首次 `prepare` 用 `never` 创建只回复就绪的工单聊天，读回实际聊天 ID，核对或挂载桌面项目后登记 `record bind`。正式执行调用 `run`，它用 `never` 恢复同一聊天。首次 `prepare` 和尚未开工的 `run` 也强制执行 Git 预检；确定失败且受控进程已停止时，启动器只把同一尚未开工的预占退回队列，保留已有聊天，读回 `reservation` 确认。停止不明或已正式开工时保留名额对账。禁止通过桌面建聊或发送消息工具启动业务轮次。启动器回执不明时，按原派发标记及其证据目录核对，确认停止后才能重试；执行权仍以账本为准。
 5. 按账本结果回收过期且从未取得执行权的名额。执行权已被领取的名额须等相关 Agent 和进程停止，或确认已被有效隔离。恢复工单时保存与阻断直接相关的新证据，同一份证据只触发一次，并继续使用原聊天。
 
 执行权仍在原聊天时，`running` 且无活动尝试要续接账本的当前步骤，`closing` 要沿原聊天完成 `blockers.md` 和 `record complete`。已有活动尝试时核对执行状态与截止时间。遇到旧工单仍等待批准，禁止批准请求或并行启动同一工单，先确认旧尝试已经停止或隔离，再按原尝试登记并执行账本返回的后续动作。针对启动后或收尾前中断的工单继续原动作，通过 `record` 的返回值核对同一动作已经登记还是需要执行。
@@ -42,7 +42,7 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
    派发 `backend.code_review` 或 `frontend.code_review`（含返工复审分段）时，在测试 Agent 的阶段提示中传入各仓的工作树、基线、当前候选 SHA 和证据目录，并要求按 [代码审查](references/stages.md#代码审查) 逐仓准备 OCR 评审材料。
    后端阶段把回执里的 `backend_dependencies` 交给对应 Agent。先看业务服务自己的接口、实现与调用链，只有本单实际涉及上游时才按[依赖配置](references/backend.md#上游依赖与修改权限)查契约或登记修改目标。前端仍从已配置业务后端和联调交接获取接口契约。
    当账本进入 `backend.push`、`frontend.push`、`backend.deploy` 或 `frontend.deploy`（含返工分段）时，结束本轮并把执行权交还 Windows 工单启动器。受控执行器认领、执行和登记结果，启动器恢复原工单聊天。遇到 `deployment_worker_required` 也走同一交接。Git 推送见[步骤指引](references/stages.md)，镜像发布见[前端镜像发布](references/frontend-release.md)。
-   Story 的材料评审尝试返回 `material_sync_required:true` 时，先用阶段运行器执行 `record material_sync`。取得 `material_synced` 后才派发评审 Agent。同步失败按本次尝试的普通失败处理。命令和回执见[步骤指引](references/stages.md#需求材料同步)。
+   Story 的材料评审尝试返回 `material_sync_required:true` 时，调用只读状态命令 `record material_sync`。返回 `material_sync_worker_required` 时立即结束当前轮次，由 Windows 启动器确认原 CLI 和 Task 进程停止后，在宿主按原尝试截止时间同步需求仓库，再恢复原会话。禁止在编码沙箱内自行执行需求仓库 fetch、读取或转存 Git 凭据。恢复后用同一命令读回；只有 `material_synced` 才派发评审 Agent。`material_sync_failed` 按原尝试的普通失败处理，停止不明时不重启、不发布成功回执。命令和回执见[步骤指引](references/stages.md#需求材料同步)。
    返回 `story_review_required:true` 时按[禅道正式评审](references/stages.md#禅道正式评审)核实评审目标。需求评审 Agent 负责材料结论及理由。`attempt_finish` 返回 `disposition:review_wait` 时结束当前轮次，由 Windows 启动器提交、回读并决定续接。
    材料评审通过后，把[知识库查询规则](references/stages.md#公司知识库查询)交给拆分和设计 Agent。设计 Agent 读取本轮 `split.md` 中已有的知识引用。
 3. 使用 `record` 保存步骤、尝试、工单和聊天绑定、实际起止时间、结果、证据与失败原因。阶段结果与待回写记录一起提交。确认失败可重试时按配置执行，默认首次执行后最多重试三次，每次独立计时。

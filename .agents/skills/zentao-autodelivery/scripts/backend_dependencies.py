@@ -59,9 +59,6 @@ def dependency_context(config, config_directory, services):
 
 
 def git_checkout(config, config_directory, key):
-    if key == 'requirement':
-        checkout = requirement_checkout(config, config_directory)
-        return (checkout, checkout) if checkout is not None else None
     side, _, name = key.partition(':')
     workspace = config.get('workspaces', {}).get(side)
     bundle = config.get('development', {}).get(f'{side}_bundle', {})
@@ -78,8 +75,6 @@ def git_checkout(config, config_directory, key):
 
 def git_metadata_roots(configs, config_directory):
     keys = configs[0].get('runtime', {}).get('worker_git_write_repositories', ())
-    if configs[0].get('runtime', {}).get('sync_requirement_before_review'):
-        keys = (*keys, 'requirement')
     for key in keys:
         locations = {git_checkout(config, config_directory, key) for config in configs}
         if len(locations) != 1 or None in locations:
@@ -120,14 +115,12 @@ def worker_roots(configs, config_directory, project_root, codex_directory):
         for path in config.get('runtime', {}).get('worker_cache_paths', []):
             writable.add((config_directory / Path(expandvars(path)).expanduser()).resolve())
     git_roots = set(git_metadata_roots(configs, config_directory))
-    if not roots and not git_roots:
+    requirements = {requirement_checkout(config, config_directory) for config in configs
+                    if config.get('runtime', {}).get('sync_requirement_before_review')} - {None}
+    if not roots and not git_roots and not requirements:
         return [], []
     granted = {root for _, root in set.intersection(*dependency_writes)}
-    protected = roots - granted
-    if configs[0].get('runtime', {}).get('sync_requirement_before_review'):
-        requirement = requirement_checkout(configs[0], config_directory)
-        if requirement is not None and requirement / '.git' in git_roots:
-            git_roots.add(requirement)
+    protected = (roots - granted) | requirements
     writable.update(root for root in granted | git_roots if not any(
         root.is_relative_to(path) or path.is_relative_to(root) for path in protected))
     return sorted(protected), sorted(writable)

@@ -17,7 +17,7 @@ def requirement_checkout(config, config_directory):
 
 
 def git_until(checkout, deadline):
-    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C'}
+    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'never', 'GCM_GUI_PROMPT': 'false', 'LC_ALL': 'C'}
 
     def git(operation, *args):
         remaining = deadline - monotonic()

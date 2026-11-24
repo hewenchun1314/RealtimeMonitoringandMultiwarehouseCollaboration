@@ -88,9 +88,14 @@ Windows 工单运行账号使用固定的 Open Code Review v1.14.2。默认路�
 
 项目启用 `runtime.sync_requirement_before_review` 时，Story 的每次材料评审尝试（含重试和重新评审）先同步。领取快照和当前配置须指向同一个独立 Git 需求仓库。仓库沿用当前分支已有的远端上游，只允许快进，Git 遇到会覆盖的本地编辑时会拒绝更新。
 
-主会话将 `action:"material_sync"`、工单键 `item`、原 `request_id`、`chat_id` 和 `attempt_id` 写到本次尝试的 JSON 输入文件。在项目根目录用[阶段运行器](stage-runner.md)执行 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`，指定 `--phase material-sync`、原尝试的截止时间及 `--stdin-file`。从该阶段的 `stdout.log` 读回 `material_synced`、分支和提交，再将实际提交交给评审 Agent，继续用原账本分段 `verify` 检查材料。
+主会话调用 `record material_sync`，提供 `item`、原 `request_id`、`chat_id` 和 `attempt_id`。该命令仅查状态，不在沙箱中执行 Git。返回 `material_sync_worker_required` 时立即结束当前 CLI 轮次，把执行权交还 Windows 工单启动器，不另起聊天、不请求权限、不尝试在沙箱读取或转存 Git 凭据。
 
-同步失败时，使用原尝试登记实际原因和运行回执，再按账本重试。重试耗尽则收尾为「阻断」。账本取得该尝试的同步成功回执后才接受评审成功或「待补材料」。评审成功时账本核对本地 `intent.md` 与该提交一致。若已知材料目录但文件缺失，随 `material_file_status:"missing"` 提供预期 `evidence.path`，账本在同步提交中核对该路径。
+启动器确认原 CLI 和 Task 同步进程已停止，再以同一尝试的绝对截止时间和 Windows Job Object 在宿主执行固定的需求仓库同步。凭据仍由宿主 Git Credential Manager 解析，不进入提示、参数、账本或交付文件。执行器只能使用已核对相同的当前配置和快照仓库及其已有上游，不接受自由仓库或命令。子进程先计算结果；外层确认进程全部停止、原绑定仍有效且 HEAD/分支/上游与结果一致后，才原子写入同步成功回执和本次终态。
+
+宿主成功或确定失败后恢复同一聊天，再次查询原尝试的 `record material_sync`。取得 `material_synced` 后，把回执里的提交交给评审 Agent，用原分段 `verify` 继续。`material_sync_failed` 使用原尝试登记实际失败和运行回执，再按账本重试；不能以认证故障推断缺材料。停止不明时保留原名额和证据，不重复同步、不发布成功回执。启动器恢复先对账稳定目录及命名 Job Object。评审开始前的认证预检由 `worker.py git-preflight` 在宿主完成；页面 E2E 关闭时同样执行。
+
+账本取得该尝试的同步成功回执后才接受评审成功或「待补材料」。评审成功时账本核对本地 `intent.md` 与该提交一致。若已知材料目录但文件缺失，随 `material_file_status:"missing"` 提供预期 `evidence.path`，账本在同步提交中核对该路径。
+
 
 ## 禅道正式评审
 

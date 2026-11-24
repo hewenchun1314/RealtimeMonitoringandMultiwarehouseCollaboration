@@ -64,6 +64,64 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(calls, expected_calls)
                 self.assertEqual(result['status'], expected_status)
 
+    def test_material_handoff_uses_host_then_resumes_same_chat(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'material_check'}
+        required = False
+        calls = []
+        def pending(*args):
+            return {'status': 'material_sync_pending' if required else 'material_sync_not_pending'}
+        def chat(current):
+            nonlocal required
+            self.assertIs(current, item)
+            required = not calls
+            calls.append('chat')
+            return {'receipt_path': 'chat', 'stop_confirmed': True, 'outcome': 'success'}, None
+        def host(*args, **kwargs):
+            nonlocal required
+            calls.append('host')
+            required = False
+            return {'status': 'material_sync_failed'}
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}), \
+                patch.object(worker, 'pending_material_sync', side_effect=pending, create=True), \
+                patch.object(worker, 'run_material_sync', side_effect=host, create=True), \
+                patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}):
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, chat)
+        self.assertEqual(calls, ['chat', 'host', 'chat'])
+        self.assertEqual(result['material_sync']['status'], 'material_sync_failed')
+
+    def test_interrupted_material_handoff_requires_prior_stop_before_host(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'material_check'}
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}), \
+                patch.object(worker, 'pending_material_sync', return_value={'status': 'material_sync_pending'}, create=True), \
+                patch.object(worker, 'run_material_sync', create=True) as host:
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, lambda item: self.fail('must not resume'))
+        self.assertEqual(result['status'], 'worker_material_stop_unverified')
+        host.assert_not_called()
+
+    def test_material_only_turn_and_task_jobs_are_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = root / 'config.json'
+            config = {'workflow_version': 2,
+                      'runtime': {'sync_requirement_before_review': True, 'split_task_sync': True},
+                      'zentao': {'base_url': 'http://localhost:8088', 'project_name': 'Sample',
+                                 'assigned_to_accounts': [], 'accepted_statuses': {'story': [], 'bug': []}},
+                      'monitor': {'enabled': False},
+                      'development': {'max_concurrent_items': 1, 'max_retries_per_step': 0,
+                                      'step_timeout_minutes': {}}}
+            cfg.write_text(json.dumps(config), encoding='utf-8')
+            item = {'config_snapshot': json.dumps(config), 'chat_id': '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a',
+                    'request_id': '1' * 32, 'marker': 'HNF-' + '1' * 20,
+                    'instance': 'http://localhost:8088', 'project_id': '1', 'kind': 'story', 'item_id': '2'}
+            with patch.object(worker, 'CONFIG_PATH', cfg), patch.object(worker, 'validate_config'), \
+                    patch.object(worker, 'worker_roots', return_value=([], [])), \
+                    patch.object(worker, 'run_stage', return_value={}) as run_stage:
+                worker.launch_turn(root / 'codex.exe', 'run', item, root, worker.utc_now())
+            self.assertEqual(run_stage.call_count, 2)
+            self.assertTrue(all(call.kwargs.get('recoverable') for call in run_stage.call_args_list))
+
     def test_worker_uses_never_for_new_and_resumed_chats(self):
         cli = Path('codex.exe')
         chat = '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'

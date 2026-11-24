@@ -81,48 +81,111 @@ def read_branch_attempt(database, config, data, now, config_directory):
         return {**context, 'deadline_at': trial['deadline_at']}
 
 
+def active_material_trial(store, data, config_directory):
+    item = store.find_item(data.get('item'))
+    if not (item['state'] == 'running' and execution_matches(store, item, data)
+            and material_sync_required(store, item)):
+        return None, None, None
+    trial = active_attempt(store, item)
+    if not trial or trial['attempt_id'] != data.get('attempt_id') or store.time >= trial['deadline_at']:
+        return None, None, None
+    checkout = requirement_checkout(snapshot(item), config_directory)
+    if checkout is None or checkout != requirement_checkout(store.config, config_directory):
+        return item, trial, None
+    return item, trial, checkout
+
+
 def sync_material_attempt(database, config, data, now, config_directory):
+    """Sandbox-facing status only. Git authentication belongs to the host runner."""
     if not Path(database).is_file():
         return message('material_sync_inactive')
-
-    def active_trial(store):
-        item = store.find_item(data.get('item'))
-        if not (item['state'] == 'running' and execution_matches(store, item, data)
-                and material_sync_required(store, item)):
-            return None, None
-        trial = active_attempt(store, item)
-        if not trial or trial['attempt_id'] != data.get('attempt_id') or store.time >= trial['deadline_at']:
-            return None, None
-        return item, trial
-
     with transaction(database) as conn:
-        store = Ledger(conn, config, now or datetime.now(timezone.utc))
-        item, trial = active_trial(store)
+        item, trial, checkout = active_material_trial(
+            Ledger(conn, config, now or datetime.now(timezone.utc)), data, config_directory)
         if trial is None:
             return message('material_sync_inactive')
+        if checkout is None:
+            return message('material_sync_failed', reason='The configured requirement checkout changed or is invalid')
+        result = conn.execute('SELECT result FROM requirement_sync_results WHERE attempt_id=?',
+                              (trial['attempt_id'],)).fetchone()
+        if result:
+            return json.loads(result['result'])
         previous = conn.execute('SELECT receipt FROM requirement_sync_receipts WHERE attempt_id=?',
                                 (trial['attempt_id'],)).fetchone()
         if previous:
             return message('material_synced', **json.loads(previous['receipt']))
-        checkout = requirement_checkout(snapshot(item), config_directory)
-        if checkout is None or checkout != requirement_checkout(config, config_directory):
-            return message('material_sync_failed', reason='The configured requirement checkout changed or is invalid')
-        budget = (datetime.fromisoformat(trial['deadline_at']) - store.now).total_seconds()
+        return message('material_sync_worker_required', attempt_id=trial['attempt_id'],
+                       deadline_at=trial['deadline_at'])
 
-    try:
-        receipt = sync_requirement(checkout, budget)
-    except (OSError, ValueError) as error:
-        return message('material_sync_failed', reason=str(error))
 
+def compute_material_attempt(database, config, data, config_directory):
+    """Private host child: compute a result, never publish a success receipt."""
     with transaction(database) as conn:
-        _, trial = active_trial(Ledger(conn, config, now or datetime.now(timezone.utc)))
+        store = Ledger(conn, config, datetime.now(timezone.utc))
+        _, trial, checkout = active_material_trial(store, data, config_directory)
         if trial is None:
             return message('material_sync_inactive')
-        conn.execute('INSERT OR IGNORE INTO requirement_sync_receipts(attempt_id, receipt) VALUES (?, ?)',
-                     (trial['attempt_id'], encode(receipt)))
-        saved = conn.execute('SELECT receipt FROM requirement_sync_receipts WHERE attempt_id=?',
-                             (trial['attempt_id'],)).fetchone()
-    return message('material_synced', **json.loads(saved['receipt']))
+        if checkout is None:
+            return message('material_sync_failed', reason='The configured requirement checkout changed or is invalid')
+        budget = (datetime.fromisoformat(trial['deadline_at']) - store.now).total_seconds()
+    try:
+        return message('material_synced', **sync_requirement(checkout, budget))
+    except ValueError as error:
+        # sync_requirement replaces raw Git diagnostics with safe operation or
+        # conflict reasons, so preserve those useful distinctions.
+        return message('material_sync_failed', reason=str(error))
+    except OSError:
+        return message('material_sync_failed', reason='Host requirement synchronization could not start')
+
+
+def publish_material_result(database, config, data, computed, proof, config_directory):
+    """Publish only after the host process tree stopped and the binding is still valid."""
+    if (proof.get('attempt_id') != data.get('attempt_id') or proof.get('stop_confirmed') is not True
+            or proof.get('stop_evidence', {}).get('owned_processes_active_after_stop') != 0):
+        return message('material_sync_stop_unverified')
+    with transaction(database) as conn:
+        store = Ledger(conn, config, datetime.now(timezone.utc))
+        _, trial, checkout = active_material_trial(store, data, config_directory)
+        if trial is None:
+            return message('material_sync_inactive')
+        if proof.get('deadline_at') != datetime.fromisoformat(trial['deadline_at']).isoformat():
+            return message('material_sync_stop_unverified')
+        previous = conn.execute('SELECT result FROM requirement_sync_results WHERE attempt_id=?',
+                                (trial['attempt_id'],)).fetchone()
+        if previous:
+            return json.loads(previous['result'])
+        result = message('material_sync_failed', reason='Host requirement synchronization failed',
+                         runner_receipt=proof['receipt_path'])
+        if checkout is None:
+            result['reason'] = 'The configured requirement checkout changed or is invalid'
+        elif proof.get('outcome') == 'timed_out':
+            result['reason'] = 'Host requirement synchronization reached its deadline'
+        elif proof.get('outcome') == 'success' and computed.get('status') == 'material_sync_failed':
+            result['reason'] = computed.get('reason', result['reason'])
+        elif proof.get('outcome') == 'success' and computed.get('status') == 'material_synced':
+            from material_sync import git_until
+            from time import monotonic
+            try:
+                git = git_until(checkout, monotonic() + min(5, (datetime.fromisoformat(
+                    trial['deadline_at']) - store.now).total_seconds()))
+                valid = (git('verify host synced HEAD', 'rev-parse', 'HEAD') == computed['commit']
+                         and git('verify host synced branch', 'symbolic-ref', '--short', 'HEAD') == computed['branch']
+                         and git('verify host synced upstream', 'rev-parse', '--symbolic-full-name', '@{upstream}')
+                         == computed['upstream'])
+            except (KeyError, OSError, ValueError):
+                valid = False
+            if valid:
+                receipt = {key: computed[key] for key in ('branch', 'upstream', 'commit')}
+                if datetime.now(timezone.utc) >= datetime.fromisoformat(trial['deadline_at']):
+                    return message('material_sync_inactive')
+                conn.execute('INSERT OR IGNORE INTO requirement_sync_receipts(attempt_id,receipt) VALUES (?,?)',
+                             (trial['attempt_id'], encode(receipt)))
+                result = message('material_synced', **receipt, runner_receipt=proof['receipt_path'])
+            else:
+                result['reason'] = 'The requirement checkout changed before host receipt publication'
+        conn.execute('INSERT INTO requirement_sync_results(attempt_id,result) VALUES (?,?)',
+                     (trial['attempt_id'], encode(result)))
+        return result
 
 
 def run(command, data, config, database, *, now=None, config_directory=CONFIG_PATH.parent):

@@ -1,9 +1,12 @@
+from contextlib import closing
+import sqlite3
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from test_workflow import WorkflowFixture
 from worker import worker_roots
@@ -28,6 +31,7 @@ class MaterialSyncTests(WorkflowFixture):
         (self.remote / 'README.md').write_text('requirements\n', encoding='utf-8')
         self.commit_remote('initial requirements')
         git(self.fixture, 'clone', str(self.remote), str(self.checkout))
+        self.time = datetime.now(timezone.utc)
 
     def commit_remote(self, message):
         git(self.remote, 'add', '--all')
@@ -41,27 +45,21 @@ class MaterialSyncTests(WorkflowFixture):
         self.assertIs(review['material_sync_required'], True)
         return {**context, 'attempt_id': review['attempt_id']}
 
-    def run_sync(self, attempt):
-        if os.name != 'nt':
-            return self.record('material_sync', **attempt)
+    def test_public_sync_requests_host_without_running_git(self):
+        attempt = self.start_review()
+        with patch('workflow.sync_requirement', return_value={'branch': 'welllog/dev',
+                   'upstream': 'origin/welllog/dev', 'commit': 'a' * 40}) as sync:
+            result = self.record('material_sync', **attempt)
+        self.assertEqual(result['status'], 'material_sync_worker_required')
+        sync.assert_not_called()
 
+    def run_sync(self, attempt):
+        from material_sync_runner import run_material_sync
         config_file = self.fixture / 'project.json'
         config_file.write_text(json.dumps(self.config), encoding='utf-8')
-        input_file = self.fixture / 'sync.json'
-        input_file.write_text(json.dumps({'action': 'material_sync', 'item': self.item(2), **attempt}),
-                              encoding='utf-8')
-        review = self.record('attempt_start', chat_id=attempt['chat_id'], request_id=attempt['request_id'],
-                             stage='material_check')
-        result = subprocess.run(
-            [sys.executable, '-B', str(SCRIPTS / 'stage_runner.py'), '--attempt-id', attempt['attempt_id'],
-             '--phase', 'material-sync', '--deadline-at', review['deadline_at'], '--cwd', str(self.fixture),
-             '--evidence-dir', str(self.fixture / 'evidence'), '--stdin-file', str(input_file),
-             '--', sys.executable, '-B', str(SCRIPTS / 'workflow.py'), 'record',
-             '--config', str(config_file), '--database', str(self.database)],
-            check=True, capture_output=True, encoding='utf-8', timeout=25)
-        receipt = json.loads(result.stdout)
-        self.assertTrue(receipt['stop_confirmed'], receipt)
-        return json.loads(Path(receipt['stdout_path']).read_text(encoding='utf-8'))
+        with closing(sqlite3.connect(self.database)) as conn:
+            marker = conn.execute('SELECT marker FROM work_items WHERE item_id=2').fetchone()[0]
+        return run_material_sync(marker, self.database, config_file, self.fixture, recover=True)
 
     def test_story_review_requires_fresh_sync_and_reads_new_requirement(self):
         self.time = datetime.now(timezone.utc)
@@ -90,7 +88,9 @@ class MaterialSyncTests(WorkflowFixture):
         attempt = self.start_review()
         old_head = git(self.checkout, 'rev-parse', 'HEAD')
 
-        self.assertEqual(self.record('material_sync', **attempt)['status'], 'material_sync_failed')
+        sync_failure = self.run_sync(attempt)
+        self.assertEqual(sync_failure['status'], 'material_sync_failed')
+        self.assertIn('Local requirement edits', sync_failure['reason'])
         missing = self.record('attempt_finish', **attempt, outcome='failed', summary='missing',
                               evidence={'material_file_status': 'missing'})
         self.assertEqual(missing['status'], 'material_sync_required')
@@ -101,7 +101,7 @@ class MaterialSyncTests(WorkflowFixture):
         retry = self.record('attempt_start', chat_id=attempt['chat_id'], request_id=attempt['request_id'],
                             stage='material_check')
         attempt['attempt_id'] = retry['attempt_id']
-        self.assertEqual(self.record('material_sync', **attempt)['status'], 'material_sync_failed')
+        self.assertEqual(self.run_sync(attempt)['status'], 'material_sync_failed')
         final = self.record('attempt_finish', **attempt, outcome='failed', summary='sync failed')
         self.assertEqual(final['disposition'], 'blocked')
         self.assertIsNone(final['next_stage'])
@@ -112,7 +112,7 @@ class MaterialSyncTests(WorkflowFixture):
         (self.remote / intent).write_text('published requirement\n', encoding='utf-8')
         self.commit_remote('publish requirement')
         attempt = self.start_review()
-        self.assertEqual(self.record('material_sync', **attempt)['status'], 'material_synced')
+        self.assertEqual(self.run_sync(attempt)['status'], 'material_synced')
 
         (self.checkout / intent).write_text('draft requirement\n', encoding='utf-8')
         review = self.record('attempt_finish', **attempt, outcome='success', summary='reviewed',
@@ -132,17 +132,34 @@ class MaterialSyncTests(WorkflowFixture):
         self.commit_remote('publish file')
 
         attempt = self.start_review()
-        self.assertEqual(self.record('material_sync', **attempt)['status'], 'material_sync_failed')
+        self.assertEqual(self.run_sync(attempt)['status'], 'material_sync_failed')
         self.assertEqual((self.checkout / name).read_text(encoding='utf-8'), 'local draft\n')
 
     def test_worker_only_grants_matching_requirement_checkout(self):
         codex_root = self.fixture / 'codex'
         config = self.config
         _, allowed = worker_roots([config, config], self.fixture, self.fixture, codex_root)
-        self.assertIn(self.checkout / '.git', allowed)
+        self.assertNotIn(self.checkout / '.git', allowed)
+        protected, _ = worker_roots([config, config], self.fixture, self.fixture, codex_root)
+        self.assertIn(self.checkout, protected)
         self.assertNotIn(self.remote / '.git', allowed)
 
         old_config = {**config, 'workspaces': {'requirement': 'remote'}}
         _, allowed = worker_roots([config, old_config], self.fixture, self.fixture, codex_root)
         self.assertNotIn(self.checkout / '.git', allowed)
         self.assertNotIn(self.remote / '.git', allowed)
+
+    def test_compute_does_not_publish_before_cleanup(self):
+        from workflow import compute_material_attempt, publish_material_result
+        import sqlite3
+        attempt = self.start_review()
+        data = {'item': self.item(2), **attempt}
+        computed = compute_material_attempt(self.database, self.config, data, self.fixture)
+        self.assertEqual(computed['status'], 'material_synced')
+        with closing(sqlite3.connect(self.database)) as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM requirement_sync_receipts').fetchone()[0], 0)
+        result = publish_material_result(self.database, self.config, data, computed,
+                                        {'attempt_id': attempt['attempt_id'], 'stop_confirmed': False}, self.fixture)
+        self.assertEqual(result['status'], 'material_sync_stop_unverified')
+        finish = self.record('attempt_finish', **attempt, outcome='success', summary='reviewed', evidence={})
+        self.assertEqual(finish['status'], 'material_sync_required')

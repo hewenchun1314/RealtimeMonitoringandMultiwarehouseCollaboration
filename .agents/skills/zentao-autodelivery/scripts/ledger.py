@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS requirement_sync_receipts (
     attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
     receipt TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requirement_sync_results (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+    result TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS deployment_claims (
     attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id) ON DELETE CASCADE,
     item_seq INTEGER NOT NULL REFERENCES work_items(seq)
