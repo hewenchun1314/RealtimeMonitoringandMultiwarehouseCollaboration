@@ -120,6 +120,31 @@ def recover_proof(folder, attempt, phase, deadline):
     return proof
 
 
+def reconcile_pending_preflight(database, checkout):
+    """Called under the checkout lock before starting any host Git process."""
+    pending_path = database.parent / 'requirement-locks' / (checkout_key(checkout) + '-preflight.json')
+    if pending_path.exists():
+        previous = read_json(pending_path)
+        try:
+            if (not previous or previous.get('checkout') != str(checkout)
+                    or not re.fullmatch(r'[0-9a-f]{32}', previous.get('run_id', ''))):
+                raise ValueError('invalid pending preflight')
+            old_deadline = datetime.fromisoformat(previous['deadline_at'])
+            if old_deadline.utcoffset() is None:
+                raise ValueError('invalid pending deadline')
+            old_folder = (database.parent / 'worker-probes') / previous['run_id'] / 'git-preflight'
+            # run_stage creates the phase directory before spawning. Absence
+            # proves this persisted request never reached a process launch.
+            if old_folder.exists() and not recover_proof(old_folder, previous['run_id'],
+                                                        'git-preflight', old_deadline):
+                return message('git_preflight_busy', stop_confirmed=False,
+                               receipt=str(old_folder / 'result.json'))
+        except (KeyError, TypeError, ValueError):
+            return message('git_preflight_busy', stop_confirmed=False)
+        pending_path.unlink()
+    return None
+
+
 def run_material_sync(marker, database, config_path, project_root, *, recover=False):
     if not database.is_file():
         return message('material_sync_not_pending')
@@ -148,6 +173,8 @@ def run_material_sync(marker, database, config_path, project_root, *, recover=Fa
     deadline = datetime.fromisoformat(pending['deadline_at'])
     with checkout_lock(database.parent / 'requirement-locks', checkout) as acquired:
         if not acquired:
+            return message('material_sync_busy', attempt_id=data['attempt_id'])
+        if reconcile_pending_preflight(database, checkout):
             return message('material_sync_busy', attempt_id=data['attempt_id'])
         current = pending_material_sync(marker, database, config_path)
         if current.get('data') != data:
@@ -214,26 +241,10 @@ def run_git_preflight(config_path, database, project_root, item=None):
         if not acquired:
             return message('git_preflight_busy', stop_confirmed=False)
         root = database.parent / 'worker-probes'
+        blocked = reconcile_pending_preflight(database, checkout)
+        if blocked:
+            return blocked
         pending_path = database.parent / 'requirement-locks' / (checkout_key(checkout) + '-preflight.json')
-        if pending_path.exists():
-            previous = read_json(pending_path)
-            try:
-                if (not previous or previous.get('checkout') != str(checkout)
-                        or not re.fullmatch(r'[0-9a-f]{32}', previous.get('run_id', ''))):
-                    raise ValueError('invalid pending preflight')
-                old_deadline = datetime.fromisoformat(previous['deadline_at'])
-                if old_deadline.utcoffset() is None:
-                    raise ValueError('invalid pending deadline')
-                old_folder = root / previous['run_id'] / 'git-preflight'
-                # run_stage creates the phase directory before spawning. Absence
-                # proves this persisted request never reached a process launch.
-                if old_folder.exists() and not recover_proof(old_folder, previous['run_id'],
-                                                            'git-preflight', old_deadline):
-                    return message('git_preflight_busy', stop_confirmed=False,
-                                   receipt=str(old_folder / 'result.json'))
-            except (KeyError, TypeError, ValueError):
-                return message('git_preflight_busy', stop_confirmed=False)
-            pending_path.unlink()
         run_id = uuid4().hex
         deadline = utc_now() + timedelta(seconds=30)
         write_json(pending_path, {'run_id': run_id, 'checkout': str(checkout), 'deadline_at': deadline.isoformat()})

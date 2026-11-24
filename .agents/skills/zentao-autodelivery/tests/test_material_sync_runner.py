@@ -235,6 +235,30 @@ class HostSyncRunnerTests(WorkflowFixture):
         old = self.database.parent / 'worker-probes' / launches[0] / 'git-preflight' / 'result.json'
         self.assertEqual(json.loads(old.read_text())['previous_stop_evidence']['owned_processes_active_after_stop'], 1)
 
+    def test_material_sync_waits_for_previous_preflight_named_job_stop(self):
+        item, _ = self.admit()
+        def uncertain_probe(attempt, phase, deadline, cwd, root, *args, **kwargs):
+            folder = root / attempt / phase
+            folder.mkdir(parents=True)
+            launch = {'attempt_id': attempt, 'phase': phase, 'deadline_at': deadline.isoformat(),
+                      'receipt_path': str(folder / 'result.json'), 'stdout_path': str(folder / 'stdout.log')}
+            (folder / 'launch.json').write_text(json.dumps(launch))
+            (folder / 'stdout.log').write_text(json.dumps({'status': 'git_preflight_passed'}))
+            proof = {**launch, 'outcome': 'success', 'stop_confirmed': False,
+                     'stop_evidence': {'owned_processes_active_after_stop': 1}}
+            (folder / 'result.json').write_text(json.dumps(proof))
+            return proof
+        with patch.object(runner, 'run_stage', side_effect=uncertain_probe):
+            self.assertFalse(runner.run_git_preflight(self.config_path, self.database, self.fixture)['stop_confirmed'])
+        with patch.object(runner, 'recover_job_stop', return_value=None), patch.object(runner, 'run_stage') as stage:
+            result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture)
+            self.assertEqual(result['status'], 'material_sync_busy')
+            stage.assert_not_called()
+        self.assertEqual(self.counts(), (0, 0))
+        with patch.object(runner, 'recover_job_stop', return_value={'owned_processes_active_after_stop': 0}):
+            result = runner.run_material_sync(item['marker'], self.database, self.config_path, self.fixture)
+        self.assertEqual(result['status'], 'material_synced')
+
     def test_disabled_material_sync_and_bug_skip_story_preflight(self):
         config = {**self.config, 'runtime': {}}
         self.config_path.write_text(json.dumps(config))
