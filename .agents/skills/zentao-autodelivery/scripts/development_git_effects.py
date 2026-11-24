@@ -174,7 +174,7 @@ def failed_hook_args(journal):
             for name in failed_hooks(journal) if (journal / 'hook-results' / (name + '.args')).exists()}
 
 
-def rerun_post_hooks(root, names, journal, deadline, arguments=None):
+def rerun_post_hooks(root, names, journal, deadline, arguments=None, *, checkout_source=None):
     for name in names:
         args = (arguments or {}).get(name, ['0'] if name == 'post-merge' else [])
         if args == ['']:
@@ -185,9 +185,17 @@ def rerun_post_hooks(root, names, journal, deadline, arguments=None):
                 or name == 'post-checkout' and (len(args) != 3 or args[2] not in ('0', '1')
                     or any(not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value) for value in args[:2]))):
             raise ValueError('A failed original hook requires a new checked Git operation')
-        # Unlike ordinary commit/merge, explicit hook run propagates a post-hook
-        # failure. It runs the effective original hook, never a model command.
-        git(root, 'hook', 'run', name, *(['--', *args] if args else []), deadline=deadline)
+        # Worktree add resolves the SOURCE hook but runs it in the NEW checkout.
+        # Reuse that dispatch on recovery; resolving a target Husky wrapper here
+        # would run a different tracked script and could hide the source failure.
+        if name == 'post-checkout':
+            if checkout_source is None:
+                raise ValueError('The original source checkout hook context is required')
+            with hooks(checkout_source, journal, deadline) as (opts, env):
+                git(root, *opts, 'hook', 'run', name, '--', *args, deadline=deadline, env=env)
+        else:
+            # Explicit hook run propagates failures Git commit/merge may ignore.
+            git(root, 'hook', 'run', name, *(['--', *args] if args else []), deadline=deadline)
 
 
 def prepare(proof, context, key, database, journal, payload=None):
@@ -233,7 +241,7 @@ def prepare(proof, context, key, database, journal, payload=None):
     elif (payload and payload.get('failed_hooks')) or failed_hooks(journal):
         ensure_hooks(source, worktree, deadline)
         rerun_post_hooks(worktree, (payload or {}).get('failed_hooks') or failed_hooks(journal), journal, deadline,
-                         (payload or {}).get('failed_hook_args') or failed_hook_args(journal))
+                         (payload or {}).get('failed_hook_args') or failed_hook_args(journal), checkout_source=source)
     target = {'branch': branch, 'repository': '.'}
     inspected = inspect_repository(source, target, proof['worktree_branch'], str(worktree))
     if inspected['status'] != 'verified' or tracked_dirty(worktree, deadline):
@@ -357,7 +365,7 @@ def integrate(proof, context, operation, key, journal, database, payload):
             raise ValueError('The original integration hook checkout is unavailable for recheck')
         ensure_hooks(source, merge_root, deadline)
         rerun_post_hooks(merge_root, prior_failed, journal, deadline,
-                         payload.get('failed_hook_args', {}).get(key) or failed_hook_args(journal))
+                         payload.get('failed_hook_args', {}).get(key) or failed_hook_args(journal), checkout_source=source)
         if tracked_dirty(merge_root, deadline):
             return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
                     'worktree': str(merge_root), 'reason': 'The rechecked original integration hook modified tracked files'}

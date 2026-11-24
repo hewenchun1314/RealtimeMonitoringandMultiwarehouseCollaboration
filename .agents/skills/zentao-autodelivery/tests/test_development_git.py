@@ -3,6 +3,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import unittest
@@ -559,3 +560,78 @@ class DevelopmentGitTests(unittest.TestCase):
         self.assertEqual(pending_development_git(marker, self.d.database, self.config_path)['status'], 'host_git_not_pending')
         with closing(sqlite3.connect(self.d.database)) as conn:
             self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE name='development_git_operations'").fetchone())
+
+    def source_checkout_versions(self, source_exit):
+        """Tracked SOURCE/TARGET scripts with a real argv0-relative wrapper."""
+        source = self.d.repositories['frontend']
+        folder = source / '.husky'
+        folder.mkdir()
+        events = self.d.root / 'checkout-events.log'
+        def script(tag, status):
+            return ("printf '%s|%s|%s\\n' " + tag + ' "$PWD" "$*" >> '
+                    + shlex.quote(events.as_posix()) + '\nexit ' + str(status) + '\n')
+        original = folder / 'post-checkout'
+        original.write_text(script('TARGET', 0), encoding='utf-8', newline='\n')
+        (source / '.gitignore').write_text('.husky/_/\n')
+        git(source, 'add', '--', '.gitignore', '.husky/post-checkout')
+        git(source, 'commit', '-m', 'Fixture target checkout check')
+        git(source, 'switch', '-c', 'user-source-hook-context')
+        original.write_text(script('SOURCE', source_exit), encoding='utf-8', newline='\n')
+        git(source, 'add', '--', '.husky/post-checkout')
+        git(source, 'commit', '-m', 'Fixture distinct source checkout check')
+        runtime = folder / '_'
+        runtime.mkdir()
+        wrapper = runtime / 'post-checkout'
+        wrapper.write_text('#!/bin/sh\nexec sh "$(dirname "$(dirname "$0")")/post-checkout" "$@"\n',
+                           encoding='utf-8', newline='\n')
+        wrapper.chmod(0o755)
+        git(source, 'config', 'core.hooksPath', '.husky/_')
+        def fix():
+            original.write_text(script('SOURCE', 0), encoding='utf-8', newline='\n')
+            git(source, 'add', '--', '.husky/post-checkout')
+            git(source, 'commit', '-m', 'Fixture fix original source checkout check')
+        return events, fix
+
+    def test_preparation_retry_retains_failed_source_hook_executable_cwd_and_args(self):
+        events, fix_source = self.source_checkout_versions(source_exit=1)
+        self.request('branch_prepare')
+        self.assertEqual(self.host()['status'], 'host_git_failed')
+        self.request('branch_prepare')
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        lines = events.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], lines[1])
+        self.assertTrue(lines[0].startswith('SOURCE|'), lines)
+        fix_source()
+        self.request('branch_prepare')
+        self.assertEqual(self.host()['status'], 'host_git_completed')
+        self.assertTrue(all(line.startswith('SOURCE|') for line in events.read_text().splitlines()))
+
+    def test_temp_integration_retry_retains_failed_source_checkout_dispatch(self):
+        events, fix_source = self.source_checkout_versions(source_exit=0)
+        root = self.begin_coding()
+        (root / 'index.html').write_text('<output>approved</output>\n')
+        self.candidate(root)
+        candidate = self.host()
+        self.integration_phase(candidate)
+        source = self.d.repositories['frontend']
+        original = source / '.husky/post-checkout'
+        original.write_text(original.read_text().replace('exit 0', 'exit 1'), encoding='utf-8', newline='\n')
+        git(source, 'add', '--', '.husky/post-checkout')
+        git(source, 'commit', '-m', 'Fixture source checkout check fails before integration')
+        events.write_text('')
+        self.request('integration_merge')
+        self.assertEqual(self.host()['status'], 'host_git_failed')
+        self.request('integration_merge')
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        lines = events.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], lines[1])
+        self.assertTrue(lines[0].startswith('SOURCE|'), lines)
+        fix_source()
+        self.request('integration_merge')
+        result = self.host()
+        self.assertEqual(result['status'], 'host_git_completed', result)
+        self.assertTrue(all(line.startswith('SOURCE|') for line in events.read_text().splitlines()))
