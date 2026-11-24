@@ -26,5 +26,3 @@
 - [ ] Run actual MXC-host-MXC smoke only in cloned repositories/temporary ledgers, exercise representative real Husky configuration on four affected projects and prior40-repository paths where feasible.
 - [ ] Run complete suite, integrate into actual project checkout, verify actual entry points without business commits/ZenTao writes/#41 runs.
 - [ ] Record evidence, update automation memory and close isolated development worktree.
-
-

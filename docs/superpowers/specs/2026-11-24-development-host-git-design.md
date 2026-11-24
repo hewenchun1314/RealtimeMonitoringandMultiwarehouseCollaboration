@@ -25,5 +25,3 @@ Reuse stable IDs, SQLite outcomes, original deadlines, Job Objects and per-repos
 - Unknown process stop, concurrent operation, crash after commit/before receipt, lost stdout and post-commit failure do not cause duplicate effects. Fresh stop proof permits safe reconciliation.
 - Existing requirement-sync and full test suites pass. Actual MXC request -> host operation -> sandbox reread smoke uses only cloned repos and temporary ledgers; use actual Husky configuration/representative checks from the four affected repos without changing originals or disabling hooks. Include SmartLogging-SPARK/smart-geo baseline regressions where feasible.
 - Independent spec and quality reviews before local integration. Update Skill, stage/branch/worker/CLI references and prompts so future scheduled tickets use the new path; do not restart41 or publish actual business commits.
-
-
