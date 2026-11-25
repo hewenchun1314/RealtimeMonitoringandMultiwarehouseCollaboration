@@ -4,6 +4,8 @@
 
 工单键 `item` 包含 `instance`、`project_id`、`kind`、`id`。项目 ID 来自经实际查询确认的禅道项目，项目和工单 ID 用正整数或相应数字字符串，`kind` 为 `story` 或 `bug`。桌面项目 ID 从当前可用的桌面项目接口确认，使用独立字段 `desktop_project_id`。配置可通过 `runtime.desktop_project_id` 额外固定桌面项目 ID。
 
+启用 `zentao.scope_mode:"project_or_product"` 时，`item.project_id` 保留本自动化的队列项目，原单可以没有项目或关联其他项目。`scan.items[]` 和 `reserve` 须提供 `source:{"project_id":"0","product_id":"2"}` 等实际归属。未报告单一项目的 Story 使用 `project_id:null`；与明确的零值区分。账本校验项目或产品匹配并写入 `work_item_sources`，缺少证据返回 `source_verification_required`，均不匹配返回 `scope_mismatch`（扫描）或 `not_eligible`（领取）。扫描入口为 `scripts/monitor.py`；详情复核为 `monitor.py --recheck bug 2 --project-id 2`。归属字段须来自本轮详情，禁止把队列项目抄作原单项目。
+
 ## `claim` 接单
 
 | `action` | 请求字段 | 如何处理结果 |

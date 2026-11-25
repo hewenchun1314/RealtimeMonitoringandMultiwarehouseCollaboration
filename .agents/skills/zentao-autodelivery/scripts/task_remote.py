@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, build_opener
+from intake_scope import product_scope
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'zentao-dev-task-flow' / 'scripts'))
 from zentao_dev_task import ZenTaoError, ZenTaoSession, _dpapi
@@ -99,6 +100,7 @@ def _marker(marker):
 class TaskRemote:
     def __init__(self, session):
         self.session = session
+        self.product_id = None
 
     def _pages(self, path, key):
         seen = set()
@@ -138,6 +140,11 @@ class TaskRemote:
             if not isinstance(members, list):
                 raise RemoteRejected('原需求迭代关联无法核实')
             matches = {_id(link['id']) for link in members if _id(link['project']) == project_id}
+            # Under product admission the queue project need not be the Story's
+            # project. Prefer its original queue-project execution when present;
+            # otherwise require exactly one authoritative execution on the Story.
+            if not matches and self.product_id is not None and str(story.get('product')) == self.product_id:
+                matches = {_id(link['id']) for link in members if _id(link['project'])}
             if len(matches) != 1:
                 raise RemoteRejected('原需求迭代未关联或不唯一，待建单')
             return {'execution': matches.pop(), 'assignee': _account(story['assignedTo'])}
@@ -321,4 +328,7 @@ def get_remote(config_snapshot):
     session = _TaskSession(cfg['base_url'])
     username, password = _credentials(cfg)
     session.login(username, password)
-    return TaskRemote(session)
+    remote = TaskRemote(session)
+    if product_scope(cfg):
+        remote.product_id = str(cfg['product_id'])
+    return remote

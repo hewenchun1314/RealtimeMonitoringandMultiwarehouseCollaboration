@@ -4,6 +4,13 @@ import hashlib
 from uuid import uuid4
 
 from ledger import encode, item_identity, item_key, message, observed, require_mapping, require_text, source_id, source_kind
+from intake_scope import matches_source, normalize_source, product_scope
+
+
+def save_source(store, item, source):
+    store.conn.execute('INSERT INTO work_item_sources(item_seq,source) VALUES (?,?) '
+                       'ON CONFLICT(item_seq) DO UPDATE SET source=excluded.source',
+                       (item['seq'], encode(source)))
 
 
 def candidate(conn, instance, project_id):
@@ -53,12 +60,22 @@ def save_scan(store, data):
     if not isinstance(items, list):
         raise ValueError('items must be an array')
     normalized = {}
+    sources = {}
     for value in items:
         row = scan_item(value)
         key = row[:2]
         if key in normalized and normalized[key] != row:
             raise ValueError('Scan contains conflicting copies of a work item')
         normalized[key] = row
+        if product_scope(zentao) or 'source' in value:
+            if 'source' not in value:
+                return message('source_verification_required', candidate=None)
+            source = normalize_source(value['source'])
+            if not matches_source(zentao, project_id, source):
+                return message('scope_mismatch', candidate=None)
+            if key in sources and sources[key] != source:
+                raise ValueError('Scan contains conflicting source ownership')
+            sources[key] = source
 
     for (kind, item_id), (_, _, title, assigned, status, priority) in normalized.items():
         current_eligibility = int(eligible(zentao, kind, assigned, status))
@@ -75,6 +92,11 @@ def save_scan(store, data):
                            ELSE work_items.state END
             WHERE work_items.observed_at <= excluded.observed_at
         ''', (*scope, kind, item_id, title, assigned, status, priority, current_eligibility, received_at, state, marker))
+        if (kind, item_id) in sources:
+            saved = store.conn.execute('SELECT seq,observed_at FROM work_items WHERE instance=? AND project_id=? '
+                                       'AND kind=? AND item_id=?', (*scope, kind, item_id)).fetchone()
+            if saved['observed_at'] == received_at:
+                save_source(store, saved, sources[(kind, item_id)])
 
     # A complete scoped scan is evidence of absence. Newer individual rechecks take priority.
     store.conn.execute('''
@@ -116,9 +138,22 @@ def reserve(store, data):
     if not isinstance(assigned, str):
         raise ValueError('assigned_to must be a string')
     status = require_text(data.get('status'), 'status')
+    source = None
+    saved_source = store.conn.execute('SELECT source FROM work_item_sources WHERE item_seq=?',
+                                      (head['seq'],)).fetchone()
+    if product_scope(zentao) or saved_source is not None or 'source' in data:
+        if 'source' not in data:
+            return message('source_verification_required')
+        source = normalize_source(data['source'])
+        if not matches_source(zentao, requested[1], source):
+            store.update_item(head, state='ineligible', eligible=0, observed_at=check_time)
+            save_source(store, head, source)
+            return message('not_eligible')
     if not eligible(zentao, head['kind'], assigned, status):
         store.update_item(head, state='ineligible', eligible=0, assigned_to=assigned,
                           source_status=status, observed_at=check_time)
+        if source is not None:
+            save_source(store, head, source)
         return message('not_eligible')
     desktop_project = require_text(data.get('desktop_project_id'), 'desktop_project_id')
     expected = store.config.get('runtime', {}).get('desktop_project_id') or head['desktop_project_id']
@@ -133,5 +168,7 @@ def reserve(store, data):
     state = 'bound' if head['chat_id'] else 'reserved'
     store.update_item(head, request_id=request_id, state=state, assigned_to=assigned, source_status=status,
                       observed_at=check_time, desktop_project_id=desktop_project, config_snapshot=snapshot)
+    if source is not None:
+        save_source(store, head, source)
     return message('reserved', item=item_identity(head), request_id=request_id, expires_at=expires_at,
                    marker=head['marker'], chat_id=head['chat_id'], desktop_project_id=desktop_project)

@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS work_items (
     UNIQUE(instance, project_id, kind, item_id)
 );
 CREATE INDEX IF NOT EXISTS queue ON work_items(instance, project_id, state, priority, seq);
+CREATE TABLE IF NOT EXISTS work_item_sources (
+    item_seq INTEGER PRIMARY KEY REFERENCES work_items(seq), source TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dispatches (
     request_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
     desktop_project_id TEXT NOT NULL, state TEXT NOT NULL, expires_at TEXT NOT NULL
@@ -245,6 +248,11 @@ def validate_config(config):
     zentao = require_mapping(config.get('zentao'), 'zentao')
     require_text(zentao.get('base_url'), 'zentao.base_url')
     require_text(zentao.get('project_name'), 'zentao.project_name')
+    if zentao.get('scope_mode', 'project') not in ('project', 'project_or_product'):
+        raise ValueError('zentao.scope_mode must be project or project_or_product')
+    if zentao.get('scope_mode') == 'project_or_product':
+        source_id(zentao.get('product_id'), 'zentao.product_id')
+        require_text(zentao.get('product_name'), 'zentao.product_name')
     require_strings(zentao.get('assigned_to_accounts'), 'zentao.assigned_to_accounts')
     accepted = require_mapping(zentao.get('accepted_statuses'), 'zentao.accepted_statuses')
     for kind in ('story', 'bug'):

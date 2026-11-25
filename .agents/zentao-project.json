@@ -3,6 +3,9 @@
     "base_url": "http://127.0.0.1:8088",
     "credential_ref": "windows-dpapi:dotflow/zentao",
     "project_name": "海能发地质工程一体化",
+    "scope_mode": "project_or_product",
+    "product_id": "2",
+    "product_name": "海能发地质工程一体化",
     "assigned_to_accounts": ["DOt-hwc"],
     "accepted_statuses": {
       "story": ["reviewing", "active"],
@@ -268,6 +271,7 @@
     },
     "zentao": {
       "base_url / project_name": "禅道实例地址和要监测的项目名称。",
+      "scope_mode / product_id / product_name": "project_or_product 表示所属项目匹配 project_name，或所属产品匹配 product_id 与 product_name，任一成立即可接收；不填 scope_mode 时仍仅按项目。原单项目可为空，不修改原始归属；指派人、状态及类型过滤继续生效。",
       "credential_ref": "访问禅道时使用的本机凭据引用。",
       "assigned_to_accounts": "只接收指派给所列账号的工单，账号区分大小写。空数组暂停领取新单。",
       "accepted_statuses": "story 填需求状态，bug 填缺陷状态。某类的状态数组为空时跳过该类扫描。"

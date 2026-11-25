@@ -63,6 +63,21 @@ class TaskRemoteTests(unittest.TestCase):
         with self.assertRaisesRegex(RemoteRejected, '不唯一'):
             self.remote.target(34, 2)
 
+    def test_product_scope_uses_unique_actual_execution_in_another_project(self):
+        self.remote.product_id = '2'
+        story = self.api.get_story.return_value
+        story.update(product=2, executions=[{'id': 4, 'project': 7}])
+        self.assertEqual(self.remote.target('34', '2'), {'execution': '4', 'assignee': 'Alice'})
+        story['executions'].append({'id': 5, 'project': 8})
+        with self.assertRaises(RemoteRejected):
+            self.remote.target(34, 2)
+        story['executions'].append({'id': 6, 'project': 2})
+        self.assertEqual(self.remote.target('34', '2')['execution'], '6')
+        story['product'] = 9
+        story['executions'] = [{'id': 4, 'project': 7}]
+        with self.assertRaises(RemoteRejected):
+            self.remote.target(34, 2)
+
     def test_create_carries_marker_story_execution_and_owner(self):
         self.api.create_task.return_value = {'id': 31}
         self.assertEqual(self.remote.create({'execution': '7', 'assignee': 'Alice'},

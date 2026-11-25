@@ -7,6 +7,8 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 
 从项目根目录读取 `.agents/zentao-project.json`。仓库路径相对配置文件解析。监测使用当前配置，已接工单按账本保存的配置快照推进。凭据交由本机凭据存储解析，聊天、命令参数、交付记录和禅道备注只使用凭据引用及非敏感结果。
 
+接单范围默认按 `zentao.project_name` 对应的项目。配置 `zentao.scope_mode:"project_or_product"` 时，原单所属项目匹配，**或**所属产品匹配 `zentao.product_id` / `zentao.product_name`，满足任一条件即可；产品匹配时允许项目为空或属于其他项目。指派人、状态、类型仍按各自配置过滤。项目与产品列表完整分页后按类型及工单 ID 合并去重。账本的 `project_id` 此时是本自动化固定的队列与研发工作区归组，原单归属保存在 `work_item_sources.source`，不得把归组 ID 当成原单必须具有的项目，不修改原单项目来接单。旧 marker、聊天绑定、完成和主动停跑记录继续有效。
+
 每次调用先识别入口。项目监测聊天执行「监测入口」，已绑定且由 Windows 工单启动器启动的会话执行「工单执行入口」。就绪轮次只回复就绪；实际执行轮次获得账本绑定后才领取执行权。业务标题和描述只用于显示及理解需求，工单归属按实例、实际项目 ID、工单类型和工单 ID 核对。
 
 工单执行过程中无需人工确认或答复。遇到缺少材料、目标仓库、运行入口或执行权限等情况，在已授权范围内自行核对和尝试恢复。需求材料评审确认缺少需求文件时，记录缺失项，直接以「待补材料」收尾。其他步骤确认阻断后记录原因和证据，立即执行账本返回的下一步。每一步独立核对所需材料、代码或环境，直到合回与核验结束后汇总。收尾后按账本推进下一单。
@@ -26,8 +28,8 @@ description: 项目聊天扫描和接收禅道需求与 Bug，工单主聊天按
 1. 对账已有工单、派发不明的请求、超时尝试及待写回事项。使用 `record runtime_check` 核对监测聊天的实际权限。只有返回 `runtime_unattended` 才执行需要外部访问的监测或写回。关闭 `monitor.enabled` 或指派白名单为空时，跳过新单扫描和领取。仅在当前请求授权范围内处理已有工单和回写。
    在正式监测会话中执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py sync-tasks`，由受控同步进程按工单快照补办本项目 Task，覆盖已收尾工单。每轮核对回执，保留未完成项供续接。回执中的 `git_preflight` 是宿主需求仓库认证检查；失败或运行忙时保留新单队列，不领取或启动新单。扫描和领取原 Story 备注及附件时，只处理 `comment`、`attachment` 两类操作。
    `sync-tasks` 也返回 `story_reviews`。按 `ready` 的标识用原 `worker.py run --marker` 续接，遇到 `review_capacity_wait` 留到下一轮。等待禅道评审的工单无需重复扫描领取或重启聊天。
-2. 根据 `zentao.accepted_statuses` 只扫描状态列表非空的工单类型。使用经验证的禅道只读接口分页查询，参考 `zentao-query` 和项目内 `zentao-cron-dashboard`。完整扫描须证明目标项目唯一匹配、工单归属明确、所有启用类型的分页结束且权限有效。只向账本传递指派账号和状态符合配置的工单，指派账号区分大小写。接口失败、权限缺失或分页不完整时，以 `complete:false` 登记部分扫描并保留已有队列。
-3. 调用 `claim` 登记完整扫描，首次记录历史基线，随后按优先级和发现顺序返回待复核队首。领取需要材料同步的 Story 前运行 `worker.py git-preflight`，取得本轮 `git_preflight_passed`；禁用材料同步时允许 `git_preflight_skipped`。预检在宿主以禁止交互的 Git 只读查询核对实际上游，失败或忙时不预占名额，不把新单记为材料失败。项目开启页面 E2E 并配置 `e2e.playwright.preflight_checks` 时，在领取适用工单前运行 `worker.py e2e-preflight`。默认预检使用项目配置，确认本地前端可用、自动登录、工区已选和页面控件可见。凭本轮 `e2e_preflight_passed` 回执推进，失败或运行忙时保留排队状态并记录结果。然后重新读取工单归属、状态和指派人，再调用 `claim` 领取。若返回队首变化，复核新的队首。以事务返回的领取结果确认名额。
+2. 根据 `zentao.accepted_statuses` 只扫描状态列表非空的工单类型。执行 `python -B .agents/skills/zentao-autodelivery/scripts/monitor.py`，由统一入口核对本轮 `never`、项目与产品身份，完成配置范围内的分页、去重和 `claim scan`。读回输出中的 `directory`、`scan.complete`、`scan.claim` 和证据文件；该命令仅扫描入队，不领取或启动业务。任一启用范围读取失败或分页不完整时登记 `complete:false`，保留已有队列，不能报告无新增。只向账本传递指派账号和状态符合配置的工单，指派账号区分大小写。禁止继续使用只查 `/projects/<id>/...` 的旧扫描器代替此入口。
+3. 统一扫描入口已经调用 `claim scan`，不要再登记同一轮扫描。首次记录历史基线，随后按优先级和发现顺序返回待复核队首。领取需要材料同步的 Story 前运行 `worker.py git-preflight`，取得本轮 `git_preflight_passed`；禁用材料同步时允许 `git_preflight_skipped`。预检在宿主以禁止交互的 Git 只读查询核对实际上游，失败或忙时不预占名额，不把新单记为材料失败。项目开启页面 E2E 并配置 `e2e.playwright.preflight_checks` 时，在领取适用工单前运行 `worker.py e2e-preflight`。默认预检使用项目配置，确认本地前端可用、自动登录、工区已选和页面控件可见。凭本轮 `e2e_preflight_passed` 回执推进，失败或运行忙时保留排队状态并记录结果。然后用 `monitor.py --recheck <story或bug> <ID> --project-id <队列项目ID>` 读取最新详情；只有 `detail.eligible:true` 才领取，并在 `claim reserve` 原有字段中传入本次 `detail.source`。产品列表中的 Story 没有单一项目字段时，`source.project_id:null` 表示未报告，以明确的产品 ID 核对。禁止伪造项目 ID 或以扫描时的旧归属替代详情。若返回队首变化，复核新的队首。以事务返回的领取结果确认名额。
 4. 首次派发和后续续接统一使用 [工单启动器](references/worker.md)。首次 `prepare` 用 `never` 创建只回复就绪的工单聊天，读回实际聊天 ID，核对或挂载桌面项目后登记 `record bind`。正式执行调用 `run`，它用 `never` 恢复同一聊天。首次 `prepare` 和尚未开工的 `run` 也强制执行 Git 预检；确定失败且受控进程已停止时，启动器只把同一尚未开工的预占退回队列，保留已有聊天，读回 `reservation` 确认。停止不明或已正式开工时保留名额对账。禁止通过桌面建聊或发送消息工具启动业务轮次。启动器回执不明时，按原派发标记及其证据目录核对，确认停止后才能重试；执行权仍以账本为准。
 5. 按账本结果回收过期且从未取得执行权的名额。执行权已被领取的名额须等相关 Agent 和进程停止，或确认已被有效隔离。恢复工单时保存与阻断直接相关的新证据，同一份证据只触发一次，并继续使用原聊天。
 

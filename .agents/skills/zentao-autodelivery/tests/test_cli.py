@@ -65,6 +65,7 @@ class WorkflowCommandTests(unittest.TestCase):
             scope = {'instance': config['zentao']['base_url'], 'project_id': '2',
                      'project_name': config['zentao']['project_name']}
             sample = {'kind': 'story', 'id': '32001', 'title': '工区切换验证', 'status': 'active',
+                      'source': {'project_id': '2', 'product_id': '2'},
                       'assigned_to': config['zentao']['assigned_to_accounts'][0], 'priority': 1}
             for scan_id, items, expected in (('baseline', [], 'baseline'),
                                               ('new-story', [sample], 'scanned')):
@@ -75,6 +76,7 @@ class WorkflowCommandTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, response)
                 self.assertEqual(response['status'], expected)
             recheck = {'action': 'reserve', 'item': response['candidate'], 'status': sample['status'],
+                       'source': sample['source'],
                        'assigned_to': sample['assigned_to'], 'desktop_project_id': 'test-project',
                        'observed_at': datetime.now(timezone.utc).isoformat()}
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -98,6 +100,7 @@ class WorkflowCommandTests(unittest.TestCase):
                 scope = {'instance': config['zentao']['base_url'], 'project_id': '2',
                          'project_name': config['zentao']['project_name']}
                 bug = {'kind': 'bug', 'id': '32002', 'title': 'Bug 接收验证', 'status': 'active',
+                       'source': {'project_id': '2', 'product_id': '2'},
                        'assigned_to': config['zentao']['assigned_to_accounts'][0], 'priority': 1}
                 story = {**bug, 'kind': 'story', 'id': '32003', 'title': '需求接收验证', 'priority': 2}
                 closed_bug = {**bug, 'id': '32004', 'status': 'closed'}

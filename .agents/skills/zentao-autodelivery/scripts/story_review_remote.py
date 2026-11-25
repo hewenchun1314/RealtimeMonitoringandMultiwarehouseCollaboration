@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from task_remote import RemoteRejected, RemoteUnknown, _ApiRedirects, _credentials, _id, get_remote
+from intake_scope import object_id, product_scope
 
 
 class ReviewBlocked(RemoteRejected):
@@ -74,6 +75,9 @@ class StoryReviewRemote:
         return data
 
     def in_project(self, item, story):
+        if (product_scope(self.config['zentao']) and story.get('product') is not None and
+                object_id(story.get('product')) == str(self.config['zentao']['product_id'])):
+            return True
         project = _id(item['project_id'])
         if any(isinstance(row, dict) and str(row.get('project')) == project for row in rows(story.get('executions', []))):
             return True

@@ -78,9 +78,18 @@ def worker_prompt(operation, item):
     identity = {key: item[key] for key in ('instance', 'project_id', 'kind')}
     identity['id'] = item['item_id']
     binding = {'item': identity, 'request_id': item['request_id'], 'chat_id': item['chat_id']}
+    source_context = ''
+    admitted = json.loads(item['config_snapshot'] or '{}')
+    if admitted.get('zentao', {}).get('scope_mode') == 'project_or_product':
+        with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
+            source = conn.execute('SELECT source FROM work_item_sources WHERE item_seq=?', (item['seq'],)).fetchone()
+        source_context = ('本单按“所属项目或所属产品”接收，绑定中的 project_id 是自动化队列项目，'
+                          '不代表原单必须关联此项目。原始归属：' + (source[0] if source else '待复核') + '。'
+                          '按工单快照中 product_id 或实际项目复核原单；禁止改写原单项目来迁就账本。')
     return (
         f'从项目根目录读取 .agents/skills/zentao-autodelivery/SKILL.md，并按照其中的工单执行入口执行。'
         f'这是经授权的无人值守工单 {item["marker"]}。原账本绑定为 {json.dumps(binding)}。'
+        f'{source_context}'
         '先用 record runtime_check 核对本轮策略，并按实际账本状态领取或续接。'
         '恢复轮次读取本工单 recoveries 的最新记录及其中的本地证据文件，落实已核验的受阻范围。'
         '禁止申请临时权限、弹审批、提问或等待人工确认，也不要开启新的桌面聊天。'
