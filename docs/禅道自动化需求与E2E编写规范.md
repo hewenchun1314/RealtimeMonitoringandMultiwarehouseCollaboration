@@ -191,7 +191,7 @@
 1. **固定材料版本。** 使用现有目录 `req-demo/requirements/REQ-编号-简称/`。从 `intent.md` 能定位本期适用的规格、确认记录、原型、公共交付规范和验收。多版本材料写明适用范围和实际 Git 提交，并同步到自动化可读的工作区。确认缺少 `intent.md` 时，流程收尾为「待补材料」。[需求仓库说明](../req-demo/README.md) · [工单步骤](../.agents/skills/zentao-autodelivery/references/stages.md)
 2. **按禅道入口提交。** Story 正文只填一行实际目录标识加尾斜杠，例如 `REQ-035-解释结论管理/`。标题、项目和指派人填写禅道原生字段，状态和指派匹配项目配置。真实迭代关联支持自动创建拆分 Task。迭代待定时，主工单可继续，Task 保留待建单。独立 `AC.md`、附件及独立 E2E 文件按实际材料提供。[Story 提交约定](../req-demo/AGENTS.md#本地技能与禅道提交) · [项目配置](../.agents/zentao-project.json)
 3. **确认环境和数据。** 核对自动化能读取仓库、构建并启动候选版本、访问所需联调服务、用指定角色登录和准备数据。常用入口由项目配置提供，需求补充本单特有的环境、限制和第三方测试入口。需要真实页面验收时，确认工单启用了页面 E2E。[前端 E2E 手册](前端E2E操作手册.md) · [后端服务验收与联调](../.agents/skills/zentao-autodelivery/references/backend.md)
-4. **按实际证据收尾。** 通用预检确认能自动登录、选工区并打开数据概览，业务场景可另附 Playwright 入口档案。正式验收核对候选版本，跨端用已交接的后台版本。流程按配置记录审查、验收、合回及适用的部署证据。关键用例受环境、权限或数据限制时，保留已验证结果，逐项记录待验证原因和补验条件。[E2E 阶段指引](../.agents/skills/zentao-autodelivery/references/e2e.md) · [REQ-035 入口档案](../req-demo/requirements/REQ-035-解释结论管理/assets/e2e-entry-smoke.json)
+4. **按实际证据收尾。** AgentLimb 诊断确认登录会话、工区及数据概览可用，业务场景可另附入口档案。正式验收核对候选版本，跨端用已交接的后台版本。流程按配置记录审查、验收、合回及适用的部署证据。关键用例受环境、权限或数据限制时，保留已验证结果，逐项记录待验证原因和补验条件。[E2E 阶段指引](../.agents/skills/zentao-autodelivery/references/e2e.md) · [REQ-035 入口档案](../req-demo/requirements/REQ-035-解释结论管理/assets/e2e-entry-smoke.json)
 
 ## 提单前自查
 

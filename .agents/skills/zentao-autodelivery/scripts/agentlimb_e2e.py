@@ -1,11 +1,10 @@
-"""Launch the project's Playwright browser with a local Windows credential."""
+"""Run the project's browser acceptance through a paired AgentLimb Chrome profile."""
 
 import argparse
 from contextlib import closing
-import ctypes
-from ctypes import wintypes
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 import json
+import os
 from pathlib import Path
 import re
 from socket import create_connection
@@ -18,36 +17,9 @@ from urllib.parse import urlsplit
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 
 
-def windows_credential(reference, expected_username):
-    prefix = 'windows-dpapi:'
-    if not reference.startswith(prefix) or not reference[len(prefix):]:
-        raise ValueError('Unsupported E2E credential reference')
-
-    class Credential(ctypes.Structure):
-        _fields_ = [
-            ('Flags', wintypes.DWORD), ('Type', wintypes.DWORD), ('TargetName', wintypes.LPWSTR),
-            ('Comment', wintypes.LPWSTR), ('LastWritten', wintypes.FILETIME),
-            ('CredentialBlobSize', wintypes.DWORD), ('CredentialBlob', ctypes.c_void_p),
-            ('Persist', wintypes.DWORD), ('AttributeCount', wintypes.DWORD),
-            ('Attributes', ctypes.c_void_p), ('TargetAlias', wintypes.LPWSTR), ('UserName', wintypes.LPWSTR),
-        ]
-
-    advapi = ctypes.WinDLL('advapi32', use_last_error=True)
-    pointer = ctypes.POINTER(Credential)()
-    advapi.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(type(pointer))]
-    advapi.CredReadW.restype = wintypes.BOOL
-    advapi.CredFree.argtypes = [ctypes.c_void_p]
-    advapi.CredFree.restype = None
-    if not advapi.CredReadW(reference[len(prefix):], 1, 0, ctypes.byref(pointer)):
-        return None
-    try:
-        item = pointer.contents
-        if item.UserName != expected_username or not item.CredentialBlobSize:
-            return None
-        password = ctypes.string_at(item.CredentialBlob, item.CredentialBlobSize).decode('utf-16-le').rstrip('\0')
-        return {'username': item.UserName, 'password': password} if password else None
-    finally:
-        advapi.CredFree(pointer)
+def browser_config(config):
+    # Old work-item snapshots retain their paths and checks, but all use AgentLimb.
+    return config.get('agentlimb', config.get('playwright', {}))
 
 
 def local_origin(value):
@@ -80,11 +52,11 @@ def browser_options(config, args):
     e2e = config['e2e']
     if not e2e.get('enabled', True):
         raise ValueError('E2E is disabled')
-    playwright = e2e['playwright']
+    settings = browser_config(e2e)
     profile = json.loads(args.profile.read_text(encoding='utf-8-sig')) if args.profile else {}
     if not isinstance(profile, dict):
         raise ValueError('The test profile must be a JSON object')
-    checks = profile.get('checks', []) if args.profile or args.scenario else playwright.get('preflight_checks', [])
+    checks = profile.get('checks', []) if args.profile or args.scenario else settings.get('preflight_checks', [])
     if not isinstance(checks, list) or any(
         not isinstance(check, dict) or not isinstance(check.get('text'), str) or not check['text'].strip()
         or not isinstance(check.get('name'), str) or not re.fullmatch(r'[a-z0-9-]{1,50}', check['name'])
@@ -96,20 +68,37 @@ def browser_options(config, args):
         raise ValueError('Preflight requires an explicit read assertion')
     workspace = (CONFIG_PATH.parent / config['workspaces'][e2e['workspace']]).resolve(strict=True)
     options = {
-        'workspace': str(workspace), 'channel': playwright.get('channel'),
-        'baseUrl': local_origin(args.base_url or playwright['preflight_origin']),
+        'workspace': str(workspace), 'browser': os.getenv('ZENTAO_AGENTLIMB_BROWSER') or settings.get('browser', 'ZenTao-E2E'),
+        'host': os.getenv('ZENTAO_AGENTLIMB_HOST') or str(Path.home() / '.agentlimb' / 'host' / 'mcp-server.mjs'),
+        'baseUrl': local_origin(args.base_url or settings['preflight_origin']),
         'loginPath': relative_url(e2e['login']['path']), 'platformPath': relative_url(e2e['platform_entry_path']),
-        'entryPath': relative_url(profile.get('entry_path') or playwright['preflight_entry_path']),
+        'entryPath': relative_url(profile.get('entry_path') or settings['preflight_entry_path']),
         'workArea': profile.get('work_area') or e2e['default_work_area']['name'], 'checks': checks,
+        'username': e2e['login'].get('username', ''),
     }
     if args.scenario:
         scenario = args.scenario.resolve(strict=True)
-        if not (args.marker and args.base_url and checks and scenario.is_relative_to(PROJECT_ROOT)):
-            raise ValueError('Acceptance requires a work-item snapshot, candidate origin, profile and local scenario')
+        if not (args.marker and args.base_url and args.startup_log and checks and scenario.is_relative_to(PROJECT_ROOT)):
+            raise ValueError('Acceptance requires a work item, candidate startup, a profile and a local scenario')
         options['scenario'] = str(scenario)
+        options['resources'] = resource_profile(profile.get('candidate_resources'))
     elif args.marker or args.base_url:
         raise ValueError('Candidate parameters require an acceptance scenario')
     return options
+
+
+def resource_profile(resources):
+    if not isinstance(resources, list) or not resources:
+        raise ValueError('Identify at least one loaded candidate resource per changed application')
+    result = []
+    for row in resources:
+        parsed = urlsplit(row['url'])
+        origin = local_origin(f'{parsed.scheme}://{parsed.netloc}')
+        if not parsed.path or parsed.fragment or not re.fullmatch(r'[0-9a-f]{64}', row['sha256']):
+            raise ValueError('Each candidate resource requires a loopback asset URL and SHA-256')
+        url = origin + relative_url(parsed.path + ('?' + parsed.query if parsed.query else ''))
+        result.append({'app': row['app'], 'url': url, 'sha256': row['sha256']})
+    return result
 
 
 def deployment_gateway(value):
@@ -131,7 +120,7 @@ def candidate_workspace(options, config, branches, versions, supplied):
          if Path(proof['source_root']).resolve(strict=True) == project), None))
     if (workspace is None or workspace == project or not (workspace / 'package.json').is_file()
             or not versions or branches.keys() != versions.keys()):
-        raise ValueError('Deployed acceptance requires the assembled candidate frontend workspace')
+        raise ValueError('Acceptance requires the assembled candidate frontend workspace')
     applications = config['development']['frontend_bundle']['applications']
     for app, sha in versions.items():
         proof = branches[app]
@@ -142,13 +131,11 @@ def candidate_workspace(options, config, branches, versions, supplied):
     return str(workspace)
 
 
-def deployed_acceptance(config, options, args):
+def acceptance_setup(config, options, args):
     from deploy_state import DEPLOY_STAGE, configured_targets, deployed_receipt_matches
     from route_execution import read_history
 
     targets = configured_targets(config)
-    if not targets:
-        return {}
     with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute('BEGIN')
@@ -156,9 +143,20 @@ def deployed_acceptance(config, options, args):
         if item is None:
             raise ValueError('Missing work-item state')
         route, stages = read_history(SimpleNamespace(conn=conn), item)
-        attempt = conn.execute('SELECT phase FROM attempts WHERE item_seq=? AND outcome IS NULL',
-                               (item['seq'],)).fetchone()
-    if not route or route['scope'] != 'fullstack' or DEPLOY_STAGE not in route['stages']:
+        attempt = conn.execute('SELECT attempt_id, phase FROM attempts WHERE item_seq=? AND run_round=? AND outcome IS NULL',
+                               (item['seq'], item['run_round'])).fetchone()
+    effective_stage = (attempt['phase'] if attempt and attempt['phase'] != 'verify' else item['stage'])
+    if not route or not attempt or item['state'] != 'running' or effective_stage != 'frontend.e2e':
+        raise ValueError('Only the current frontend E2E attempt can run formal acceptance')
+    branches = stages['frontend.branch_check']['evidence']['repositories']
+    versions = stages['frontend.coding']['evidence']['versions']
+    if {row['app'] for row in options['resources']} != versions.keys():
+        raise ValueError('Candidate resources must identify every changed frontend application')
+    options['startupWorkspace'] = candidate_workspace(options, config, branches, versions, args.candidate_workspace)
+    options['candidateVersions'] = versions
+    options['candidateBranches'] = branches
+    options['attemptId'] = attempt['attempt_id']
+    if route['scope'] != 'fullstack' or DEPLOY_STAGE not in route['stages']:
         return {}
     deployed = stages.get(DEPLOY_STAGE, {})
     if deployed.get('outcome') != 'success':
@@ -168,19 +166,13 @@ def deployed_acceptance(config, options, args):
         return {}
     handoff = stages.get('handoff', {})
     evidence = handoff.get('evidence', {})
-    effective_stage = (attempt['phase'] if attempt and attempt['phase'] != 'verify' else item['stage'])
-    if (item['state'] != 'running' or effective_stage != 'frontend.e2e' or handoff.get('outcome') != 'success'
-            or evidence.get('deployment') != deployment or not args.startup_log):
+    if handoff.get('outcome') != 'success' or evidence.get('deployment') != deployment:
         raise ValueError('Deployed acceptance requires the current handoff and a candidate startup log')
     gateway = deployment_gateway(evidence['gateway_url'])
     if any(service not in targets or targets[service]['gateway_url'].rstrip('/') != gateway.rstrip('/')
            or not deployed_receipt_matches(receipt, service, evidence['backend_versions'].get(service), targets[service])
            for service, receipt in deployment.items()):
         raise ValueError('Deployment versions do not match the common handoff gateway')
-    options['startupWorkspace'] = candidate_workspace(
-        options, config, stages['frontend.branch_check']['evidence']['repositories'],
-        stages['frontend.coding']['evidence']['versions'], args.candidate_workspace,
-    )
     options['gatewayUrl'] = gateway
     return deployment
 
@@ -218,19 +210,23 @@ def prepare_frontend(config, options, startup_log):
     origin = urlsplit(options['baseUrl'])
     entry_port = origin.port or (443 if origin.scheme == 'https' else 80)
     gateway = options.get('gatewayUrl')
+    candidate = bool(options.get('startupWorkspace') or gateway)
     if port_open(origin.hostname, entry_port):
-        return ({'mode': 'start-failed', 'reason': 'candidate-port-in-use'} if gateway else {'mode': 'reused'})
+        return ({'mode': 'start-failed', 'reason': 'candidate-port-in-use'} if candidate else {'mode': 'reused'})
 
-    extra_ports = config['playwright'].get('preflight_startup_ports', [])
+    extra_ports = browser_config(config).get('preflight_startup_ports', [])
+    if options.get('resources'):
+        resource_origins = [urlsplit(row['url']) for row in options['resources']]
+        extra_ports = sorted({url.port or (443 if url.scheme == 'https' else 80) for url in resource_origins})
     if not isinstance(extra_ports, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in extra_ports):
         raise ValueError('Preflight startup ports must be valid TCP port numbers')
     command = config['start_command']
     if not isinstance(command, str) or not command.strip():
         raise ValueError('Preflight requires a frontend start command')
+    if candidate and any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
+        return {'mode': 'start-failed', 'reason': 'candidate-port-in-use'}
     if gateway:
         gateway = deployment_gateway(gateway)
-        if any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
-            return {'mode': 'start-failed', 'reason': 'candidate-port-in-use'}
         # Keep the configured command. Only replace its declared gateway option.
         flag = r'\s+--gateway(?:=|\s+)(?:"[^"]*"|\x27[^\x27]*\x27|[^\s"\x27]+)'
         command = re.sub(flag + r'\s*$', '', command)
@@ -239,7 +235,7 @@ def prepare_frontend(config, options, startup_log):
         command = f"{command.rstrip()} --gateway='{gateway}'"
     with startup_log.open('wb') as output:
         try:
-            # The worker runs this process inside the same Windows Job as Playwright.
+            # The Windows stage runner owns the candidate process tree.
             process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
                                        cwd=options.get('startupWorkspace', options['workspace']), stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT)
@@ -271,30 +267,48 @@ def run_browser(config, options, args, *, deployment=None):
         except (OSError, ValueError):
             return {'status': 'blocked', 'stage': 'backend-deployment', 'frontend': frontend,
                     'reason': 'backend-version-unverified'}
-    login = config['e2e']['login']
-    try:
-        options['credentials'] = windows_credential(login['credential_ref'], login['username'])
-    except (OSError, ValueError):
-        options['credentials'] = None
     command = ['node', str(Path(__file__).with_suffix('.cjs'))]
     try:
         completed = subprocess.run(command, input=json.dumps(options).encode('utf-8'), capture_output=True,
-                                   timeout=None if args.scenario else 100)
+                                   timeout=None if args.scenario else 100, cwd=PROJECT_ROOT)
         report = completed.stdout.splitlines()[-1:]
         result = json.loads(report[0]) if report else {'status': 'blocked', 'stage': 'browser-runner'}
     except subprocess.TimeoutExpired:
         result = {'status': 'blocked', 'stage': 'browser-timeout'}
     if frontend is not None:
         result['frontend'] = frontend
+    if options.get('candidateVersions') and result.get('status') in ('passed', 'failed'):
+        from route_evidence import check_candidate
+
+        versions = options['candidateVersions']
+        if any(check_candidate(options['candidateBranches'][app], sha) for app, sha in versions.items()):
+            return {'status': 'blocked', 'stage': 'candidate-version', 'reason': 'candidate-changed-during-acceptance'}
+        result['versions'] = versions
     if deployment:
         result['backend_deployment'] = backend
-        if result.get('status') == 'passed':
+        if result.get('status') in ('passed', 'failed'):
             try:
                 verify_deployment(deployment)
             except (OSError, ValueError):
                 return {**result, 'status': 'blocked', 'stage': 'backend-deployment',
                         'reason': 'backend-version-changed-during-acceptance'}
     return result
+
+
+def run_serialized(config, options, args, deployment):
+    import msvcrt
+
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with (DATABASE_PATH.parent / 'agentlimb-e2e.lock').open('a+b') as lock:
+        if lock.tell() == 0:
+            lock.write(b'0')
+            lock.flush()
+        lock.seek(0)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return {'status': 'blocked', 'stage': 'agentlimb-busy'}
+        return run_browser(config, options, args, deployment=deployment)
 
 
 def main():
@@ -309,15 +323,18 @@ def main():
     try:
         config = read_config(args.marker)
         options = browser_options(config, args)
-        deployment = deployed_acceptance(config, options, args) if args.scenario else {}
-        if args.startup_log and args.scenario and not deployment:
-            raise ValueError('Formal acceptance uses the separate candidate launch')
-        if args.candidate_workspace and not deployment:
-            raise ValueError('Candidate workspace is only used for deployed acceptance')
-        result = run_browser(config, options, args, deployment=deployment)
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError):
+        deployment = acceptance_setup(config, options, args) if args.scenario else {}
+        if args.candidate_workspace and not args.scenario:
+            raise ValueError('Candidate workspace requires formal acceptance')
+        if not Path(options['host']).is_file():
+            result = {'status': 'blocked', 'stage': 'agentlimb-host', 'reason': 'host-not-installed'}
+        else:
+            result = run_serialized(config, options, args, deployment)
+        if args.scenario:
+            result.update(marker=args.marker, attempt_id=options['attemptId'])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error, subprocess.SubprocessError):
         result = {'status': 'blocked', 'stage': 'runner-configuration'}
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps({'runner': 'agentlimb', **result}, ensure_ascii=False))
     return int(result.get('status') != 'passed')
 
 

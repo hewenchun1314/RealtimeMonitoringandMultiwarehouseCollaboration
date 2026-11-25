@@ -26,7 +26,7 @@
 | `<端>.coding` | 本端开发 Agent、主会话 | 开发 Agent 在已核验工作树编辑、构建和测试，返回逐仓文件清单、原 HEAD、提交说明及验证证据。主会话通过 [candidate_commit](branches.md#编码与候选提交) 交宿主运行原 hooks，恢复后把成功 `versions` 登记为候选。后端还运行配置的构建命令，跨端时编写联调文档。 |
 | `<端>.unit_test` | 本端开发 Agent | 对有效 coding 的同一 `versions` 跑测试，以 `verification` 保存实际命令、结果和证据；不得自行提交。需要代码或生成文件修订时，失败结果传 `repair_required:true`，回到 coding 后重跑单测。 |
 | `<端>.code_review` | 本端测试 Agent | 按[代码审查](#代码审查)逐仓准备 OCR 文件清单和评审规则，审查本端计划及候选改动。提交 `versions` 和 `verification`，记录位置、结论和严重度。 |
-| `backend.acceptance`、`frontend.e2e` | 本端测试 Agent | 按[后端服务验收](backend.md)或[前端页面验收](e2e.md)实际运行用例。提交 `versions`、`verification` 和逐项验证的本端任务编号数组 `verified_tasks`，覆盖当前有效清单。联合验收加 `backend_versions`，核对已交接服务版本。 |
+| `backend.acceptance`、`frontend.e2e` | 本端测试 Agent | 按[后端服务验收](backend.md)或[前端页面验收](e2e.md)实际运行用例。提交 `versions`、`verification` 和逐项验证的本端任务编号数组 `verified_tasks`，覆盖当前有效清单。前端通过或代码返工须提交本轮 `agentlimb_receipt`。联合验收加 `backend_versions`，核对已交接服务版本。 |
 | `<端>.integration` | 主会话、宿主执行器 | 通过 [integration_merge](branches.md#合回与恢复) 请求固定目标的安全快进或已包含核验，结束本轮交宿主执行；恢复后保存候选 `versions` 及实际 `merged_versions`。最终树与候选不同仍需 `merged_verification`。部分成功保留实际结果；目标分叉需要单独的受控历史处理路径，当前固定操作集不执行该处理；不在沙箱自行 merge、rebase 或 cherry-pick。 |
 | `backend.push`、`frontend.push` | Windows 工单启动器和 Git 推送执行器 | 工单快照启用 `runtime.git_push_enabled` 时，逐仓推送验收并合回的 SHA，即使该端没有镜像部署。部分交付依赖逐任务验收、实际合回及最终内容复验证据。核对快照、当前配置和分支核验回执，向配置分支普通推送并读回远端。已包含该 SHA 时登记已有远端版本。遇到分叉、权限或目标错误时记录该仓失败，保留其他仓结果。 |
 | `backend.deploy` | Windows 工单启动器和发布执行器 | 后端审查、独立验收、合回和已启用的 Git 推送成功后，按快照和当前授权选择实际服务的部署目标。用已合回版本打包并推送，按摘要更新 Deployment，核验 Pod 与网关版本后自动登记回执。工单主会话在此阶段交还执行权。详见[后端部署](backend.md#后端自动部署)。 |

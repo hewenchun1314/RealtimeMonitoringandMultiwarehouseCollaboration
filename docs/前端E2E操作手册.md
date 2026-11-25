@@ -5,7 +5,7 @@
 ## 登录和进入项目
 
 1. 从工单配置快照读取 `e2e`。基座未启动时，按 `e2e.start_command` 从本单对应的基座工作区启动。基座地址由 `e2e.ready_url` 或启动输出确认。下文示例使用本机常用地址 `http://localhost:5000`。
-2. 无人值守运行可启动独立 Playwright Chromium。访问基座下的 `/aggregation-platform/sso/login`，由 `e2e.login.credential_ref` 读取测试凭据并登录。登录后进入 `/aggregation-platform/sso/home-page/platform`，确认平台首页加载成功。
+2. 无人值守运行使用 AgentLimb 和已配对的 Chrome 配置。复用平台会话或 Chrome 为配置账号填充的登录信息，进入 `/aggregation-platform/sso/home-page/platform`。需要人工认证时记录「等待登录」。
 3. 在平台首页确认本用例要求的工区，再进入「测井解释」。当前默认工区是「海能发陆上示范区工区」。有指定测试井的用例以该井所属工区为准。
 4. 进入业务页后，核对浏览器加载的各改动应用属于本单待验提交。可记录子应用资源 URL 和响应哈希，并与待验提交的构建产物比对。合回前测试候选提交，补验已合回版本时记录实际合回提交。
 

@@ -241,20 +241,20 @@
     "start_command": "npm run serve-shell-hub --gateway=http://10.10.4.140:31111/",
     "ready_url": null,
     "platform_entry_path": "/aggregation-platform/sso/home-page/platform",
-    "playwright": {
-      "channel": "chrome",
+    "agentlimb": {
+      "browser": "Profile-744b45",
+      "intake_gate": false,
       "preflight_origin": "http://localhost:5000",
       "preflight_entry_path": "/aggregation-platform/shell-hub/data-overview",
       "preflight_startup_ports": [5010, 5150, 30042],
       "preflight_checks": [
-        {"name": "data-overview-map-tab", "text": "地图"},
-        {"name": "data-overview-well-list-tab", "text": "井列表"}
+        {"name": "data-query-navigation", "text": "数据查询"},
+        {"name": "multi-well-histogram-tab", "text": "多井柱状图"}
       ]
     },
     "login": {
       "path": "/aggregation-platform/sso/login",
-      "username": "hewenchun",
-      "credential_ref": "windows-dpapi:hnf-frontend/e2e"
+      "username": "hewenchun"
     },
     "default_work_area": {
       "id": "fa02e06b9cfb4b7a9b959b0a33cbf36c",
@@ -293,7 +293,7 @@
       "enabled": "true 执行前端页面验收，false 跳过页面验收并继续合回。缺省为 true。仅对新领取工单生效，已领取工单沿用原配置快照。",
       "workspace / start_command": "前端页面验收使用的工作区键，以及服务尚未运行时的启动命令。",
       "ready_url / platform_entry_path": "ready_url 可指定前端服务地址；为 null 时从启动输出或现有页面确认。platform_entry_path 是登录后进入平台的页面路径。",
-      "playwright": "channel 使用本机已安装的浏览器。派发前检查 preflight_origin 下的 preflight_entry_path，preflight_checks 指定页面控件。本次启动服务时等待额外的 preflight_startup_ports。正式验收传入工单候选服务的实际地址和用例档案。",
+      "agentlimb": "browser 是此工作区在 AgentLimb 中指定的 Chrome 配置 ID 或名称。intake_gate 控制派发前是否强制通过浏览器诊断。preflight_origin、preflight_entry_path、preflight_checks 和 preflight_startup_ports 用于诊断。正式验收使用本轮候选服务和资源指纹。",
       "login": "path 是登录页路径，username 是测试账号，credential_ref 指向该账号的本机凭据。",
       "default_work_area": "页面验收默认进入的业务工区，id 用于定位，name 用于核对名称。"
     }

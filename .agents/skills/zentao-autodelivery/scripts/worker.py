@@ -496,7 +496,7 @@ def run_e2e_preflight(profile):
     phase = 'e2e-preflight'
     output = DATABASE_PATH.parent / 'worker-probes'
     startup_log = output / attempt_id / phase / 'frontend.log'
-    command = [sys.executable, '-B', str(Path(__file__).with_name('playwright_e2e.py')),
+    command = [sys.executable, '-B', str(Path(__file__).with_name('agentlimb_e2e.py')),
                '--startup-log', str(startup_log)]
     if profile:
         command.extend(['--profile', str(profile.resolve(strict=True))])

@@ -303,7 +303,7 @@ def verify_http(target, sha):
     if credential:
         if origin.scheme != 'https' or not target.get('http_username'):
             raise DeploymentError('HTTP verification credentials require an HTTPS gateway and username')
-        from playwright_e2e import windows_credential
+        from windows_credentials import windows_credential
         try:
             auth = windows_credential(credential, target['http_username'])
         except (OSError, AttributeError, ValueError):

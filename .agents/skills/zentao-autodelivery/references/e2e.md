@@ -8,19 +8,21 @@
 
 E2E 在合回前执行。从工单配置快照读取 `e2e` 设置及当前前端开发仓库。基座准备、登录、选工区和场景验证共同使用本次 E2E 的单次最长耗时，当前配置为 90 分钟。
 
-工单快照配置了 `e2e.playwright` 时，正式验收使用阶段运行器下的独立 Playwright 浏览器。旧快照按原流程执行。若执行入口或凭据不可用，按本节登记验证阻断并进入合回。
+预检和正式验收统一使用 AgentLimb，旧工单快照仅沿用其中的页面和预检配置。`e2e.agentlimb.intake_gate` 为 `false` 时，浏览器诊断不作为接单条件。正式验收仍需核对候选并执行本单用例。
 
-## 独立 Playwright 浏览器
+## AgentLimb 浏览器
 
-由运行工单的 Windows 账号在「凭据管理器 → Windows 凭据 → 添加通用凭据」中保存测试账户。凭据目标名使用 `e2e.login.credential_ref` 中 `windows-dpapi:` 后的值，用户名与 `e2e.login.username` 一致。浏览器只从本机凭据存储读取登录信息。Playwright 依赖取自项目配置的前端工作区，浏览器使用 `e2e.playwright.channel` 指定的通道。
+在实际运行工单的 Windows 用户下安装 [AgentLimb MCP 主机和 Chrome 扩展](https://github.com/hooosberg/AgentLimb#quick-start)。可沿用已登录业务平台的 Chrome 配置。在扩展侧栏查看配置 ID 或设置浏览器名称，与 `e2e.agentlimb.browser` 对应。扩展需要首次授权时，在侧栏点击「复制连接提示词」，并在配对窗口内运行本项目 `worker.py e2e-preflight`，配对的固定客户端是 `ZenTao E2E`。默认主机为该用户目录下的 `.agentlimb/host/mcp-server.mjs`。宿主可用 `ZENTAO_AGENTLIMB_HOST` 和 `ZENTAO_AGENTLIMB_BROWSER` 指定主机文件和测试浏览器 ID。执行器仅使用唯一匹配的配置，在自建标签页内操作，完成后关闭该标签页。不同工单的浏览器执行串行。
 
-从项目根目录用 `worker.py e2e-preflight` 做派发前只读检查。预检地址已有本地服务时直接复用，端口空闲时从 `e2e.workspace` 执行 `e2e.start_command`，等待入口和配置的必要端口就绪。随后用独立 Chrome 自动登录，选择工区并检查项目配置的页面控件。当前入口是 `data-overview`，以「地图」和「井列表」均可见为通过条件，无需工单测试数据。回执区分复用和启动，并记录失败环节。阶段运行器回收浏览器和本次启动的前端进程，已运行的开发服务继续由原进程提供。
+从项目根目录用 `worker.py e2e-preflight` 诊断连接与登录。预检地址已有本地服务时直接复用，端口空闲时从 `e2e.workspace` 执行 `e2e.start_command`，等待入口和配置的必要端口就绪。AgentLimb 复用测试配置的会话。如果跳回配置的本地登录页且 Chrome 已为配置账号填入密码，执行器尝试提交一次。外部 SSO 或需扫码、验证码等交互时，记 `waiting-login`，用户完成登录后再试。E2E 执行器不读取 Windows 凭据管理器。登录后选工区，在 `data-overview` 检查「数据查询」和「多井柱状图」导航可见。阶段运行器回收本次启动的进程，原有开发服务继续运行。
+
+页面控件在后台标签页等待超时后，若标签页仍处于隐藏状态，执行器将该测试标签页切到前台，重试同一控件检查一次。当测试结束且测试标签页仍在前台时，恢复此前的标签页。预检通过回执以 `foreground_retry: true` 标明实际使用了前台重试。
 
 `--profile <JSON路径>` 可额外诊断指定业务页面，也可在正式验收中提供业务场景的测试档案。档案可以指定 `entry_path`、`work_area` 和 `checks`，每条检查包含 `name`、用于精确匹配的 `text`，以及可选的 `action`。`visible` 检查页面元素可见，`expand` 展开树节点，`click` 用于菜单、案例、页签、井或曲线等导航和选择。计算、归档和删除所需的专用数据由正式用例按其权限准备、核验和恢复。全程由工单执行并留证。
 
-正式验收从本单已核对的候选工作树启动服务。把实际本地地址、工单标识、测试档案和场景脚本交给 `playwright_e2e.py --marker <marker> --base-url <origin> --profile <JSON路径> --scenario <CJS路径>`，由当前 E2E 阶段运行器执行。场景文件导出 `async ({ page }) => { ... }`，在已经登录且通过数据检查的独立页面上确认前后端实际运行版本、执行本单用例并保存证据。断言失败时抛出错误，并在工单证据中记录脱敏的具体断言和页面状态。只在场景及现有逐项证据校验完成后登记 E2E 通过。
+正式验收在本单 E2E 尝试中用阶段运行器执行 `python -B .agents/skills/zentao-autodelivery/scripts/agentlimb_e2e.py --marker <marker> --base-url <候选源> --profile <JSON路径> --scenario <CJS路径> --startup-log <日志路径>`。仅子应用有工单工作树时，加 `--candidate-workspace <装配基座路径>`，由受控启动命令从这个基座启动。基座和待验子应用端口须空闲。档案有 `checks`，并为每个改动应用提供至少一条 `candidate_resources`，每条包含应用键 `app`、应由该页面实际加载的本地资源绝对 `url` 和候选产物的 `sha256`。先从已核对的候选环境取得资源指纹，验收时比对页面资源记录和实际响应。场景脚本导出 `async ({ browser }) => { ... }`，可调用 `browser.evaluate(expression)`、`browser.navigate(url)`、`browser.click(selector)`、`browser.input(selector, value)` 和 `browser.wait(options)`。只读断言使用 `node:assert/strict`，附脱敏复现证据。工单通过或触发代码返工时，在 `evidence.agentlimb_receipt` 提供本次阶段的 AgentLimb JSON stdout 文件，账本核对工单、尝试 ID、候选版本和资源覆盖。
 
-跨端工单若有自动部署结果，再传入 `--startup-log <本轮日志路径>`，由 runner 使用交接网关并启动候选前端。基座本身有工单 worktree 时默认使用该目录。仅子应用有工单 worktree 时，先准备可启动的基座目录并接入所有待验子应用，再通过 `--candidate-workspace <路径>` 传入。候选依赖须事先安装。基座与子应用启动端口须空闲。runner 会核实各前端仓库实际 SHA，并在 Playwright 执行前后核对后端发布证据。MCP 路线读回 Deployment 模板摘要、Ready Pod 和服务健康，kubeconfig 路线读回网关 HTTP 版本。业务场景使用交接网关。验收证据从实测回执填入 `gateway_url`（取 `frontend.gateway`）及 `backend_deployment`。
+跨端工单若有自动部署结果，执行器按当前联调交接的网关启动候选前端，并在 AgentLimb 执行前后核对后端发布证据。MCP 路线读回 Deployment 模板摘要、Ready Pod 和服务健康，kubeconfig 路线读回网关 HTTP 版本。验收证据从实测回执填入 `gateway_url`（取 `frontend.gateway`）及 `backend_deployment`。
 
 ## 基座应用
 
@@ -31,10 +33,10 @@ E2E 在合回前执行。从工单配置快照读取 `e2e` 设置及当前前端
 
 ## 登录和工区
 
-1. 从实际基座前端地址解析配置的 `e2e.login.path` 和 `e2e.platform_entry_path`，核实页面属于本单测试目标。已有配置账号的有效登录就直接复用。未登录或会话过期时才打开登录页，从本机凭据读取密码并登录。其他账号在独立的测试会话中处理，保留用户原会话。
+1. 从实际基座地址解析 `e2e.login.path` 和 `e2e.platform_entry_path`。在已配对的指定 Chrome 配置中复用会话或允许 Chrome 填充测试账号，认证需人工操作时留 `waiting-login` 回执。
 2. 有已选工区时直接沿用，包括登录后平台自动恢复的工区。当前会话没有工区时，在平台首页按 `e2e.default_work_area.id` 选择配置的默认工区，确认选中生效后再进入菜单。已有工区即使与默认配置不同也以实际当前工区为准。
 3. 因地址、登录或工区准备受阻时，记录实际失败的环节和必要证据。重试从环境检查开始，逐项复用已经就绪且仍符合版本及会话要求的部分。
 
 ## 验收结果
 
-按 `plan.md` 中的验收条件执行实际业务场景。保存基座前端入口、启动工作区、待验代码版本、实际工区、每个场景结果以及证据位置。使用测试数据，屏蔽截图和日志中的密码、会话凭据和无关业务数据。环境未能就绪或无法证明待验版本时，将 E2E 结果记为待验证并继续合回，保留已通过的单测和审查证据。
+按 `plan.md` 逐项运行。只有核实候选资源后出现的业务断言失败才按 `repair_required:true` 交回对应开发 Agent。连接、登录、候选启动、版本不符及测试数据问题按环境阻断或普通重试登记。保留单测和审查证据，E2E 结论由账本决定后续阶段。

@@ -13,7 +13,7 @@ from deploy_state import (DEPLOY_STAGE, GIT_PUSH_STAGES, WORKER_STAGES, configur
 from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from material_sync import requirement_checkout, verify_requirement_intent
-from route_evidence import delivery_summary, validate_partial_merge, validate_success
+from route_evidence import agentlimb_receipt_error, delivery_summary, validate_partial_merge, validate_success
 from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
                              stage_evidence, stage_role, stage_task_ids, stages_for, task_scope,
                              unit_test_revision, v2_repair)
@@ -450,6 +450,11 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     evidence = data.get('evidence')
     if isinstance(evidence, dict):
         evidence = evidence.copy()
+    if stage == 'frontend.e2e' and phase == 'verify' and (finished or repair_required) and config.get('e2e', {}).get('agentlimb'):
+        expected = 'passed' if finished else 'failed'
+        reason = agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_directory)
+        if reason:
+            return message('evidence_required', reason=reason)
     missing_file = (item['kind'] == 'story' and stage == 'material_check' and outcome == 'failed'
                     and isinstance(evidence, dict) and evidence.get('material_file_status') == 'missing')
     story_review = stage == 'material_check' and story_review_enabled(item)

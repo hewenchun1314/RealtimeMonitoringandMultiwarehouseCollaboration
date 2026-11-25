@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-import playwright_e2e as e2e
+import agentlimb_e2e as e2e
+from route_evidence import agentlimb_receipt_error
 
 
 class PreflightStartupTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class PreflightStartupTests(unittest.TestCase):
                 'workspace': 'frontend', 'start_command': 'npm run serve-shell-hub',
                 'login': {'path': '/login'}, 'platform_entry_path': '/platform',
                 'default_work_area': {'name': 'Test area'},
-                'playwright': {
+                'agentlimb': {
                     'preflight_origin': 'http://localhost:5000', 'preflight_entry_path': '/data-overview',
                     'preflight_checks': [{'name': 'overview', 'text': '井列表'}],
                     'preflight_startup_ports': [5010],
@@ -32,6 +33,37 @@ class PreflightStartupTests(unittest.TestCase):
         options = e2e.browser_options(self.config, self.args)
         self.assertEqual(options['entryPath'], '/data-overview')
         self.assertEqual(options['checks'], [{'name': 'overview', 'text': '井列表'}])
+        self.assertNotIn('credentials', options)
+
+    def test_previous_snapshot_still_uses_agentlimb_without_credentials(self):
+        settings = self.config['e2e']
+        settings['playwright'] = settings.pop('agentlimb')
+        settings['login']['credential_ref'] = 'windows-dpapi:retired'
+        options = e2e.browser_options(self.config, self.args)
+        self.assertEqual(options['browser'], 'ZenTao-E2E')
+        self.assertNotIn('credentials', options)
+
+    def test_receipt_requires_same_candidate_attempt_and_business_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / '.local/zentao-delivery/items/HNF-test/runner.json'
+            output.parent.mkdir(parents=True)
+            evidence = {'agentlimb_receipt': str(output)}
+            versions = {'shell': 'a' * 40}
+            receipt = {'runner': 'agentlimb', 'marker': 'HNF-test', 'attempt_id': 'current', 'status': 'failed',
+                       'stage': 'acceptance', 'repair_required': True, 'versions': versions,
+                       'checks': ['overview'], 'candidate_resources': [{'app': 'shell'}]}
+
+            def check(attempt_id):
+                output.write_text(json.dumps(receipt), encoding='utf-8')
+                with patch('route_evidence.stage_evidence', return_value={'versions': versions}):
+                    return agentlimb_receipt_error(None, {'marker': 'HNF-test'}, attempt_id,
+                                                 evidence, 'failed', root / '.agents')
+
+            self.assertIsNone(check('current'))
+            self.assertIn('active attempt', check('expired'))
+            receipt['repair_required'] = False
+            self.assertIn('business assertion', check('current'))
 
     def test_optional_profile_uses_its_own_entry_and_assertions(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -45,6 +77,14 @@ class PreflightStartupTests(unittest.TestCase):
         options = e2e.browser_options(self.config, self.args)
         with patch.object(e2e, 'port_open', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
             self.assertEqual(e2e.prepare_frontend(self.config['e2e'], options, None), {'mode': 'reused'})
+        start.assert_not_called()
+
+    def test_frontend_only_candidate_refuses_to_reuse_the_base_service(self):
+        options = e2e.browser_options(self.config, self.args)
+        options['startupWorkspace'] = str(self.workspace / 'candidate')
+        with patch.object(e2e, 'port_open', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
+            self.assertEqual(e2e.prepare_frontend(self.config['e2e'], options, None)['reason'],
+                             'candidate-port-in-use')
         start.assert_not_called()
 
     def test_cold_start_waits_for_owned_command_and_required_ports(self):
@@ -94,7 +134,7 @@ class PreflightStartupTests(unittest.TestCase):
         self.assertEqual(start.call_args.args[0][-1],
                          "npm run serve-shell-hub --gateway='http://deployment.example.test:31111/'")
 
-    def test_wrong_live_backend_blocks_the_browser_before_playwright(self):
+    def test_wrong_live_backend_blocks_the_browser_before_agentlimb(self):
         options = e2e.browser_options(self.config, self.args)
         target = {'gateway_url': 'http://deployment.example.test:31111/', 'verification_path': '/version'}
         options['gatewayUrl'] = target['gateway_url']
@@ -111,14 +151,12 @@ class PreflightStartupTests(unittest.TestCase):
         self.assertEqual([method[0] for method in ordered.mock_calls], ['start', 'verify'])
         browser.assert_not_called()
 
-    def test_version_drift_after_playwright_invalidates_acceptance(self):
+    def test_version_drift_after_agentlimb_invalidates_acceptance(self):
         options = e2e.browser_options(self.config, self.args)
-        self.config['e2e']['login'].update(credential_ref='windows-dpapi:test-e2e', username='test')
         args = argparse.Namespace(startup_log=Path('frontend.log'), scenario=Path('scenario.cjs'))
         deployment = {'smart-geo': {'sha': 'a' * 40}}
         with (patch.object(e2e, 'prepare_frontend', return_value={'mode': 'started'}),
               patch.object(e2e, 'verify_deployment', side_effect=[{}, ValueError('live SHA changed')]),
-              patch.object(e2e, 'windows_credential', return_value=None),
               patch.object(e2e.subprocess, 'run', return_value=Mock(stdout=b'{"status": "passed"}'))):
             result = e2e.run_browser(self.config, options, args, deployment=deployment)
         self.assertEqual(result['status'], 'blocked')
@@ -126,6 +164,7 @@ class PreflightStartupTests(unittest.TestCase):
 
     def test_deployed_acceptance_uses_only_the_current_ledger_handoff(self):
         options = e2e.browser_options(self.config, self.args)
+        options['resources'] = [{'app': 'shell'}]
         self.config['development'] = {'frontend_bundle': {'applications': {'shell': {'repository': '.'}}}}
         target = {'gateway_url': 'http://deployment.example.test:31111/', 'verification_path': '/version',
                   'registry': 'registry.example.test', 'image_repository': 'team/backend'}
@@ -146,8 +185,10 @@ class PreflightStartupTests(unittest.TestCase):
             }
             connection = Mock()
             connection.execute.return_value.fetchone.side_effect = [
-                {'seq': 1, 'state': 'running', 'stage': 'frontend.e2e'}, None,
-                {'seq': 1, 'state': 'running', 'stage': 'frontend.e2e'}, None,
+                {'seq': 1, 'run_round': 1, 'state': 'running', 'stage': 'frontend.e2e'},
+                {'phase': 'verify', 'attempt_id': 'current'},
+                {'seq': 1, 'run_round': 1, 'state': 'running', 'stage': 'frontend.e2e'},
+                {'phase': 'verify', 'attempt_id': 'current'},
             ]
             args = argparse.Namespace(marker='HNF-test', startup_log=candidate / 'frontend.log',
                                       candidate_workspace=None)
@@ -155,13 +196,13 @@ class PreflightStartupTests(unittest.TestCase):
                   patch('deploy_state.configured_targets', return_value={'smart-geo': target}),
                   patch('route_execution.read_history', return_value=(route, stages)),
                   patch('route_evidence.check_candidate', return_value=None) as verify):
-                self.assertEqual(e2e.deployed_acceptance(self.config, options, args), deployment)
+                self.assertEqual(e2e.acceptance_setup(self.config, options, args), deployment)
                 verify.assert_called_once_with(proof, 'b' * 40)
                 self.assertEqual(options['startupWorkspace'], str(candidate.resolve()))
                 self.assertEqual(options['gatewayUrl'], target['gateway_url'])
                 stages['handoff']['evidence']['backend_versions']['smart-geo'] = 'c' * 40
                 with self.assertRaisesRegex(ValueError, 'versions do not match'):
-                    e2e.deployed_acceptance(self.config, options, args)
+                    e2e.acceptance_setup(self.config, options, args)
 
 
 if __name__ == '__main__':

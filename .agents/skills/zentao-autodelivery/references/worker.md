@@ -14,7 +14,7 @@ Git 认证和 hooks 在本机普通 Windows 宿主进程运行，仓库物理位
 
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py probe` 运行一次只读的实机探针。它要求 CLI 实际调用 shell 检查项目文件，根据工具输出和进程回执验证通过。不接单、不访问禅道。
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py git-preflight` 在宿主执行最长 30 秒的受控只读 Git 认证及上游查询，禁止交互，不 fetch、不改工作区。领取 Story 前要求本轮 `git_preflight_passed`，禁用材料同步可为 `git_preflight_skipped`；失败或忙时保留队列。`prepare` 与尚未开工的 `run` 强制复核，不依赖是否开启页面 E2E。确定失败且进程已停止时，仅释放尚未开工的原预占，保留已绑定聊天；未知停止状态保留名额。每个需求仓库的预检和材料同步共用一个未核实宿主 Git 运行标识；任一后续预检或同步先查询原命名 Job Object，确认退出后才能启动新的宿主 Git 进程，不能用新 UUID、不同工单或切换操作类型绕过旧进程对账。
-- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py e2e-preflight` 执行默认页面预检。已有本地前端时复用，端口空闲时按项目启动命令拉起服务，再用独立 Playwright 浏览器核验登录、工区及页面控件。退出码 `0` 且回执为 `e2e_preflight_passed` 表示通过。命令不领取工单。`--profile <JSON路径>` 可用于单独诊断指定业务页面。 [E2E 阶段指引](e2e.md#独立-playwright-浏览器)
+- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py e2e-preflight` 执行 AgentLimb 页面诊断。已有本地前端时复用，端口空闲时按项目启动命令拉起服务，再用已配对的 Chrome 配置核验登录、工区及页面控件。退出码 `0` 且回执为 `e2e_preflight_passed` 表示通过。`--profile <JSON路径>` 可诊断指定业务页面。仅当 `e2e.agentlimb.intake_gate` 开启时阻挡接单。 [E2E 阶段指引](e2e.md#agentlimb-浏览器)
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py prepare --marker <marker>` 仅用于已预占且未绑定的工单。以 `worker_ready` 返回的实际聊天 ID 为准。核对该聊天工作目录和实际桌面项目，尚未归组时用桌面项目工具挂载并读回，随后登记 `record bind`。遇到不明回执，先按账本待核对派发流程处理，再使用原有证据；只有确认没有创建聊天且该进程已停止，才允许新的派发请求重新准备。
 - `python -B .agents/skills/zentao-autodelivery/scripts/worker.py run --marker <marker>` 在已绑定工单的原有会话里开始或续接。工单 Agent 用 `record runtime_check` 核对本轮实际策略，用 `record start` 领取执行权。已有活动尝试的情况下，先核对对应进程和账本，禁止重复启动。命令运行期间持续等待其回执；其他轮次遇到 `worker_busy` 时仅对账。回执缺失时根据受控进程和账本确认是否可恢复。
 

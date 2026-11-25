@@ -263,6 +263,11 @@ def validate_config(config):
     e2e = require_mapping(config.get('e2e', {}), 'e2e')
     if type(e2e.get('enabled', True)) is not bool:
         raise ValueError('e2e.enabled must be a boolean')
+    if 'agentlimb' in e2e:
+        browser = require_mapping(e2e['agentlimb'], 'e2e.agentlimb')
+        require_text(browser.get('browser'), 'e2e.agentlimb.browser')
+        if type(browser.get('intake_gate', False)) is not bool:
+            raise ValueError('e2e.agentlimb.intake_gate must be a boolean')
     development = require_mapping(config.get('development'), 'development')
     if type(development.get('max_concurrent_items')) is not int or development['max_concurrent_items'] < 1:
         raise ValueError('development.max_concurrent_items must be a positive integer')

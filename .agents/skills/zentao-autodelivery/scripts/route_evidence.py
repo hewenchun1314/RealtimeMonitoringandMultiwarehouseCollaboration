@@ -1,5 +1,6 @@
 """Version-bound evidence for a scoped work item, including its backend handoff."""
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -20,6 +21,33 @@ def commit_map(value):
     return isinstance(value, dict) and bool(value) and all(
         nonblank(key) and isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha)
         for key, sha in value.items())
+
+
+def agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_directory):
+    path = evidence.get('agentlimb_receipt') if isinstance(evidence, dict) else None
+    if not nonblank(path) or not config_directory:
+        return 'Provide the AgentLimb runner JSON receipt for this attempt'
+    project = config_directory.parent
+    root = (project / '.local' / 'zentao-delivery' / 'items' / item['marker']).resolve()
+    try:
+        receipt_path = (project / path).resolve(strict=True)
+        if not receipt_path.is_relative_to(root):
+            return 'AgentLimb receipt must be inside the current work-item evidence directory'
+        receipt = json.loads(receipt_path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return 'AgentLimb receipt could not be read'
+    versions = (stage_evidence(store, item, 'frontend.coding') or {}).get('versions')
+    if (not isinstance(receipt, dict) or receipt.get('runner') != 'agentlimb' or receipt.get('marker') != item['marker']
+            or receipt.get('attempt_id') != attempt_id or receipt.get('status') != expected
+            or receipt.get('stage') != 'acceptance' or not commit_map(versions) or receipt.get('versions') != versions):
+        return 'AgentLimb receipt must match the active attempt, candidate versions and result'
+    resources = receipt.get('candidate_resources')
+    if (not receipt.get('checks') or not isinstance(resources, list) or not resources
+            or any(not isinstance(row, dict) or not nonblank(row.get('app')) for row in resources)
+            or {row['app'] for row in resources} != versions.keys()):
+        return 'AgentLimb receipt must include checks and observed resources for every candidate application'
+    if expected == 'failed' and receipt.get('repair_required') is not True:
+        return 'Only a confirmed AgentLimb business assertion failure can trigger code repair'
 
 
 def check_candidate(proof, candidate):
