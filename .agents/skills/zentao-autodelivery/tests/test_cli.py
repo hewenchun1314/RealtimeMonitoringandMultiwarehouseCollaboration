@@ -86,26 +86,37 @@ class WorkflowCommandTests(unittest.TestCase):
                 self.assertEqual(connection.execute('SELECT COUNT(*) FROM dispatches').fetchone()[0], 1)
                 self.assertEqual(connection.execute('SELECT title FROM work_items').fetchone()[0], sample['title'])
 
-    def test_story_only_project_excludes_bugs_even_if_present_in_a_scan(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = json.loads(CONFIG.read_text(encoding='utf-8'))
-            config['monitor']['enabled'] = True
-            self.assertEqual(config['zentao']['accepted_statuses']['bug'], [])
-            config_path = Path(directory) / 'config.json'
-            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
-            scope = {'instance': config['zentao']['base_url'], 'project_id': '2',
-                     'project_name': config['zentao']['project_name']}
-            bug = {'kind': 'bug', 'id': '32002', 'title': 'Bug 停接验证', 'status': 'active',
-                   'assigned_to': config['zentao']['assigned_to_accounts'][0], 'priority': 1}
-            story = {**bug, 'kind': 'story', 'id': '32003', 'title': '需求接收验证', 'priority': 2}
-            for scan_id, items in [('baseline', []), ('mixed', [bug, story])]:
-                completed, result, _ = self.run_command(directory, 'claim', {
-                    **scope, 'action': 'scan', 'scan_id': scan_id, 'complete': True, 'items': items,
-                    'observed_at': datetime.now(timezone.utc).isoformat(),
-                }, config=config_path)
-                self.assertEqual(completed.returncode, 0, result)
-            self.assertEqual(result['candidate']['kind'], 'story')
-            self.assertEqual(result['candidate']['id'], '32003')
+    def test_bug_intake_respects_project_settings_and_can_be_disabled(self):
+        for bug_enabled in (True, False):
+            with self.subTest(bug_enabled=bug_enabled), tempfile.TemporaryDirectory() as directory:
+                config = json.loads(CONFIG.read_text(encoding='utf-8'))
+                config['monitor']['enabled'] = True
+                if not bug_enabled:
+                    config['zentao']['accepted_statuses']['bug'] = []
+                config_path = Path(directory) / 'config.json'
+                config_path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+                scope = {'instance': config['zentao']['base_url'], 'project_id': '2',
+                         'project_name': config['zentao']['project_name']}
+                bug = {'kind': 'bug', 'id': '32002', 'title': 'Bug 接收验证', 'status': 'active',
+                       'assigned_to': config['zentao']['assigned_to_accounts'][0], 'priority': 1}
+                story = {**bug, 'kind': 'story', 'id': '32003', 'title': '需求接收验证', 'priority': 2}
+                closed_bug = {**bug, 'id': '32004', 'status': 'closed'}
+                other_assignee = {**bug, 'id': '32005', 'assigned_to': 'other-account'}
+                for scan_id, items in [('baseline', []), ('mixed', [closed_bug, other_assignee, bug, story])]:
+                    completed, result, database = self.run_command(directory, 'claim', {
+                        **scope, 'action': 'scan', 'scan_id': scan_id, 'complete': True, 'items': items,
+                        'observed_at': datetime.now(timezone.utc).isoformat(),
+                    }, config=config_path)
+                    self.assertEqual(completed.returncode, 0, result)
+                expected = bug if bug_enabled else story
+                self.assertEqual(result['candidate']['kind'], expected['kind'])
+                self.assertEqual(result['candidate']['id'], expected['id'])
+                with closing(sqlite3.connect(database)) as connection:
+                    queued = connection.execute("SELECT kind, item_id FROM work_items WHERE state='queued'").fetchall()
+                expected_queue = [('story', story['id'])]
+                if bug_enabled:
+                    expected_queue.append(('bug', bug['id']))
+                self.assertCountEqual(queued, expected_queue)
 
 
 if __name__ == '__main__':

@@ -6,7 +6,7 @@
     "assigned_to_accounts": ["DOt-hwc"],
     "accepted_statuses": {
       "story": ["reviewing", "active"],
-      "bug": []
+      "bug": ["active"]
     }
   },
   "workspaces": {
