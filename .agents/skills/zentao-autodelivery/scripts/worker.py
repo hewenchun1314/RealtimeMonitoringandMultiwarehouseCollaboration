@@ -111,6 +111,8 @@ def worker_prompt(operation, item):
         '若账本进入 backend.push、frontend.push、backend.deploy 或 frontend.deploy（含返工分段），'
         '结束当前轮次，Windows 执行器会接手并续接原会话。'
         '各阶段按 task_scope.active 派发，按编号记录 task_blockers 与证据。'
+        '新路线工单通过评审和拆分后，依次处理账本返回的每个阶段。当前阶段缺少必要输入或没有可处理的任务时，'
+        '用 attempt_finish 的 outcome=skipped 记录本阶段核对结果并继续；实际运行失败记 failed。'
         '跨端依赖须验证交接；交接受阻时按账本继续独立的前端任务。旧工单沿用原阶段。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )

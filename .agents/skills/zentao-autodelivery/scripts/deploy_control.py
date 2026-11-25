@@ -11,7 +11,7 @@ from deploy_state import (COMMIT, DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_
 from execution import active_attempt, attempt_finish, attempt_seed, attempt_start, execution_matches, repair_advance
 from ledger import Ledger, item_identity, message, transaction, validate_config
 from route_evidence import deployment_requirements, git_push_evidence_error, git_push_requirements, push_covers
-from route_execution import get_split, is_routed, read_history, snapshot
+from route_execution import contract_revision_pending, get_split, is_routed, read_history, snapshot
 
 
 def pending_worker_stage(store, item):
@@ -92,6 +92,8 @@ def frontend_request(store, item, directory):
             or source != (directory / store.config.get('workspaces', {}).get('frontend', '.')).resolve()):
         raise ValueError('前端镜像发布或前端工作区授权已变更')
     route, steps = read_history(store, item)
+    if contract_revision_pending(steps):
+        raise ValueError('接口契约变更，等待重新拆分后核验前端发布')
     required = [name for name in route['stages'] if name.startswith('frontend.') and name not in
                 (FRONTEND_DEPLOY_STAGE, 'frontend.push')]
     if any(steps.get(name, {}).get('outcome') != 'success' for name in required):

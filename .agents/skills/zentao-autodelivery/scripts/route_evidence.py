@@ -9,7 +9,8 @@ from branch_check import git, planned_applications
 from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, GIT_PUSH_STAGES, TAG,
                           configured_targets, deployed_receipt_matches, frontend_release_config,
                           mcp_rollout_matches, release_verification)
-from route_execution import blocked_tasks, get_split, handoff_tasks, read_history, snapshot, stage_evidence
+from route_execution import (blocked_tasks, contract_revision_pending, get_split, handoff_tasks,
+                             read_history, snapshot, stage_evidence)
 from task_evidence import verified_task_merge
 
 
@@ -135,6 +136,8 @@ def git_push_requirements(store, item, stage):
     side = stage.split('.')[0]
     if not route or stage not in route['stages']:
         return {}, {}, {}, '工单未启用该端 Git 推送'
+    if contract_revision_pending(history):
+        return {}, {}, {}, '接口契约变更，等待重新拆分后核验 Git 推送'
     for step in ('plan', 'branch_check', 'coding', 'unit_test', 'code_review'):
         name = side + '.' + step
         if history.get(name, {}).get('outcome') != 'success':
@@ -401,7 +404,7 @@ def delivery_summary(route, stages):
     for side, acceptance, label in (('backend', 'acceptance', '服务验收'), ('frontend', 'e2e', '页面验收')):
         test = stages.get(f'{side}.{acceptance}')
         if test:
-            facts.append(label + ('通过' if test['outcome'] == 'success' else '失败'))
+            facts.append(label + {'success': '通过', 'failed': '失败', 'skipped': '已跳过'}[test['outcome']])
         elif side == 'frontend' and route['scope'] != 'backend_only' and not route.get('e2e_enabled', True):
             facts.append('页面验收已跳过（项目配置关闭）')
         merge = stages.get(side + '.integration')
@@ -423,7 +426,9 @@ def delivery_summary(route, stages):
     deployed = stages.get(DEPLOY_STAGE)
     if deployed:
         evidence = deployed.get('evidence') or {}
-        if deployed['outcome'] == 'failed':
+        if deployed['outcome'] == 'skipped':
+            facts.append('后端部署已跳过，待验证')
+        elif deployed['outcome'] == 'failed':
             facts.append('后端部署待验证')
         elif not evidence.get('services'):
             facts.append('后端部署已跳过（本轮无适用目标）')
@@ -441,6 +446,8 @@ def delivery_summary(route, stages):
                 target = rollout['target']
                 ready = rollout['pod_verification']['ready_replicas']
                 facts.append(f'前端已在 Rancher 更新 {target["namespace"]}/{target["deployment"]}，{ready} 个 Pod 已就绪')
+        elif frontend['outcome'] == 'skipped':
+            facts.append('前端镜像发布已跳过，待验证')
         else:
             facts.append('前端镜像发布待验证')
     facts.extend(route.get('blockers', []))

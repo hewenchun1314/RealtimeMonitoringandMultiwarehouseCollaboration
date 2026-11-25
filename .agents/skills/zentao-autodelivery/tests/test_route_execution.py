@@ -78,7 +78,17 @@ class RouteExecutionTests(WorkflowFixture):
         })
         result = self.finish_stage(context, 'backend.design', outcome='failed', retryable=False,
                                    evidence={'task_blockers': {'B1': 'Unavailable source'}})
-        self.assertEqual(result['next_stage'], 'frontend.design', result)
+        stage = result['next_stage']
+        while stage != 'frontend.design':
+            attempt = self.record('attempt_start', **context, stage=stage)
+            self.assertEqual(attempt['status'], 'attempt_started', attempt)
+            if stage != 'handoff':
+                self.assertEqual(attempt['task_scope']['active'], [], attempt)
+            result = self.record('attempt_finish', **context, attempt_id=attempt['attempt_id'],
+                                 outcome='skipped', summary='No eligible tasks for ' + stage)
+            self.assertEqual(result['status'], 'attempt_finished', result)
+            stage = result['next_stage']
+        self.assertEqual(self.record('attempt_start', **context, stage=stage)['task_scope']['active'], ['F1'])
 
     def test_dependency_discovery_uses_admitted_snapshot_and_selected_services(self):
         self.configure_backend_dependencies()
@@ -233,8 +243,13 @@ class RouteExecutionTests(WorkflowFixture):
         self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
         evidence = {'tasks': {'frontend': [{'id': 'F1', 'description': 'Show data', 'acceptance': ['Visible']}]}}
         self.finish_stage(context, 'split', evidence=evidence)
-        self.finish_stage(context, 'frontend.design', 'failed', retryable=False,
-                          evidence={'task_blockers': {'F1': 'Product rule is unclear'}})
+        failed = self.finish_stage(context, 'frontend.design', 'failed', retryable=False,
+                                   evidence={'task_blockers': {'F1': 'Product rule is unclear'}})
+        stage = failed['next_stage']
+        while stage:
+            skipped = self.finish_stage(context, stage, 'skipped')
+            self.assertEqual(skipped['status'], 'attempt_finished', skipped)
+            stage = skipped['next_stage']
         self.record('complete', blockers_path='blockers.md', **context)
         self.material.write_text('研发范围：前后端\n历史曲线应追溯原始输入。', encoding='utf-8')
         restored = self.record('recover', recovery_id='new-material', evidence='Confirmed historic curve policy')
@@ -308,6 +323,39 @@ class ContractRepairTests(WorkflowFixture):
             route, stages = read_history(store, store.find_item(d.item))
             self.assertEqual(route['interface_contract'], split['interface_contract'])
             self.assertEqual(set(stages), {'material_check', 'split'})
+
+    def test_unresolved_contract_enters_integration_without_authorizing_old_candidate(self):
+        d = self.drill
+        self.advance_to('frontend.e2e')
+        trial = d.record('attempt_start', stage='frontend.e2e')
+        failure = d.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='failed',
+                           summary='The interface contract changed', repair_required=True,
+                           contract_changed=True, retryable=False)
+        self.assertEqual(failure['next_stage'], 'frontend.integration')
+        merge = d.record('attempt_start', stage='frontend.integration')
+        requested = d.record('integration_merge', attempt_id=merge['attempt_id'])
+        self.assertNotIn('operation_id', requested, requested)
+        self.assertEqual(merge['task_scope']['active'], [], merge)
+        end = d.record('attempt_finish', attempt_id=merge['attempt_id'], outcome='skipped',
+                       summary='The interface contract still needs to be split again')
+        self.assertEqual(end['disposition'], 'close')
+        d.record('complete', blockers_path='blockers.md')
+        recovery = d.record('recover', recovery_id='contract-ready', evidence='New contract supplied')
+        self.assertEqual(recovery['stage'], 'frontend.e2e')
+
+    def test_failed_acceptance_assertion_does_not_authorize_integration(self):
+        d = self.drill
+        self.advance_to('frontend.e2e')
+        trial = d.record('attempt_start', stage='frontend.e2e')
+        failure = d.record('attempt_finish', attempt_id=trial['attempt_id'], outcome='failed',
+                           summary='The status page returned the wrong value', retryable=False,
+                           evidence={'versions': d.versions['frontend'], 'task_results': {
+                               'frontend': {'outcome': 'failed', 'verification': 'Displayed the wrong status'}}})
+        self.assertEqual(failure['next_stage'], 'frontend.integration')
+        merge = d.record('attempt_start', stage='frontend.integration')
+        self.assertEqual(merge['task_scope']['active'], [])
+        requested = d.record('integration_merge', attempt_id=merge['attempt_id'])
+        self.assertEqual(requested['status'], 'host_git_rejected', requested)
 
     def test_joint_test_backend_repair_remerges_and_resumes_failed_handoff(self):
         from test_route_drills import git
@@ -401,7 +449,7 @@ class ContractRepairTests(WorkflowFixture):
         merge = d.record('attempt_start', stage='frontend.integration')
         d.finish('frontend.integration', merge, d.evidence('frontend.integration', merge))
         final = d.record('complete', blockers_path='blockers.md')
-        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual(final['conclusion'], '待验证')
         steps = {entry['stage']: entry for entry in final['steps']}
         self.assertEqual(steps['backend.unit_test']['outcome'], 'failed')
         self.assertEqual(steps['backend.unit_test']['summary'], 'Unit suite failed on new version')

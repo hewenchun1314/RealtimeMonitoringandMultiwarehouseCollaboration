@@ -59,10 +59,12 @@ class DeployWorkerTests(unittest.TestCase):
         self.config_path.write_text(encode(self.config), encoding='utf-8')
         self.sha = 'a' * 40
 
-    def setup_item(self, number, service='smart-geo', accepted=True):
+    def setup_item(self, number, service='smart-geo', accepted=True, scope='backend_only'):
         marker = 'test-marker-' + str(number)
-        scope = 'backend_only'
-        route = {'scope': scope, 'source': 'config', 'tasks': {'backend': [], 'frontend': []},
+        tasks = {'backend': [], 'frontend': []}
+        if scope == 'fullstack':
+            tasks = {'backend': [{'id': 'B1'}], 'frontend': [{'id': 'F1', 'depends_on': ['B1']}]}
+        route = {'scope': scope, 'source': 'config', 'tasks': tasks,
                  'blockers': [], 'stages': route_stages(scope, deploy_enabled=True)}
         with transaction(self.database) as conn:
             conn.execute("""INSERT INTO work_items(seq,instance,project_id,kind,item_id,title,assigned_to,
@@ -104,8 +106,18 @@ class DeployWorkerTests(unittest.TestCase):
         self.assertEqual(result['status'], 'deployment_tags_locked')
         result = self.action('finish', marker, attempt_id=claim['attempt_id'], summary='Release failed',
                              outcome='failed', retryable=False, evidence={'services': {}, 'skipped': []})
-        self.assertEqual(result['disposition'], 'blocked')
+        self.assertEqual(result['disposition'], 'close')
         self.assertEqual(self.action('claim', other)['status'], 'deployment_claimed')
+
+    def test_failed_backend_deployment_still_enters_handoff(self):
+        self.config['runtime']['split_task_sync'] = False
+        marker = self.setup_item(1, scope='fullstack')
+        claim = self.action('claim', marker)
+        self.assertEqual(claim['status'], 'deployment_claimed', claim)
+        result = self.action('finish', marker, attempt_id=claim['attempt_id'], outcome='failed',
+                             retryable=False, summary='Release failed',
+                             evidence={'services': {}, 'task_blockers': {'B1': 'Release failed'}})
+        self.assertEqual((result['disposition'], result['next_stage']), ('next', 'handoff'))
 
     def test_missing_acceptance_or_revoked_target_blocks_external_writes(self):
         first = self.setup_item(1, accepted=False)

@@ -164,7 +164,15 @@ class RouteEvidenceTests(unittest.TestCase):
             self.assertIn(expected, summary)
 
     def test_status_page_shows_active_backend_repair_within_frontend_acceptance(self):
-        row = dict(item_id='1', title='审批状态', state='running', conclusion=None, stage='frontend.e2e',
+        row = dict(item_id='1', kind='story', title='审批状态', state='running', conclusion=None, stage='frontend.e2e',
                    phase='backend.integration', pending=0, retry_number=1)
         html = table_row(row, 'http://localhost')
         self.assertIn('后端合回', html)
+
+    def test_summary_reports_skipped_acceptance_and_deployment_as_pending(self):
+        stages = dict.fromkeys(('backend.acceptance', 'backend.deploy', 'frontend.e2e', 'frontend.deploy'),
+                               {'outcome': 'skipped'})
+        summary = delivery_summary({'scope': 'fullstack', 'source': 'config'}, stages)
+        for label in ('服务验收', '页面验收', '后端部署', '前端镜像发布'):
+            self.assertIn(label + '已跳过', summary)
+        self.assertNotIn('失败', summary)

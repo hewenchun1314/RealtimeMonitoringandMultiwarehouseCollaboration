@@ -151,7 +151,7 @@ class DeploymentRunnerTests(unittest.TestCase):
         self.assertEqual(action.call_args.kwargs['outcome'], 'failed')
 
     def test_skipped_and_blocked_deployments_do_not_launch_publisher(self):
-        for blocked, outcome in ((None, 'success'), ('目标授权已撤销', 'failed')):
+        for blocked, outcome in ((None, 'success'), ('目标授权已撤销', 'skipped')):
             with self.subTest(blocked=blocked):
                 claim = dict(self.claim, requests={}, skipped=['other'], blocked=blocked)
                 with patch.object(runner, 'deployment_action',

@@ -49,7 +49,7 @@ def run_frontend_release(marker, database, config_path, project_root, *, recover
         proof = recover_stage(checkpoint.parent / phase, attempt_id, phase)
     elif claim.get('blocked'):
         return finish({
-            'attempt_id': attempt_id, 'outcome': 'failed', 'summary': claim['blocked'],
+            'attempt_id': attempt_id, 'outcome': 'skipped', 'summary': claim['blocked'],
             'retryable': False, 'evidence': {}, 'stop_confirmed': True,
             'stop_evidence': {'mechanism': 'no_launch_records'},
         })

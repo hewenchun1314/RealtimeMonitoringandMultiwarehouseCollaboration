@@ -73,7 +73,7 @@ def run_git_delivery(marker, database, config_path, project_root, *, recover=Fal
         errors = claim['errors']
         summary = claim.get('blocked') or '；'.join(f'{key}：{reason}' for key, reason in sorted(errors.items()))
         return finish({
-            'attempt_id': attempt_id, 'outcome': 'failed', 'summary': summary or '没有可推送的仓库',
+            'attempt_id': attempt_id, 'outcome': 'skipped', 'summary': summary or '没有可推送的仓库',
             'retryable': False, 'evidence': {'repositories': {}, 'errors': errors}, 'stop_confirmed': True,
             'stop_evidence': {'mechanism': 'no_launch_records'},
         })

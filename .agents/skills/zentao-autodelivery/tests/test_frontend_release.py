@@ -271,7 +271,7 @@ class FrontendLedgerTests(unittest.TestCase):
             result = run_frontend_release(marker, self.database, self.config_path, self.root)
         run.assert_not_called()
         self.assertEqual(result['status'], 'attempt_finished')
-        self.assertEqual(result['disposition'], 'blocked')
+        self.assertEqual((result['outcome'], result['disposition']), ('skipped', 'close'))
 
     def test_runner_records_harbor_receipt_and_unlocks_repository(self):
         marker = self.setup_item(1)

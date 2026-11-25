@@ -186,7 +186,7 @@ def run_deployment(marker, database, config_path, project_root, *, recover=False
     result = initial_result(claim)
     requests = claim['requests']
     if claim.get('blocked'):
-        result.update(outcome='failed', summary=claim['blocked'], retryable=False)
+        result.update(outcome='skipped', summary=claim['blocked'], retryable=False)
         return record_finish(action, checkpoint, deadline, result)
     if not requests:
         result['summary'] = '本轮没有适用的后端部署目标'

@@ -63,14 +63,17 @@ def read_history(store, item):
             continue
         if record['outcome'] == 'success' and stage == 'split':
             route = result['route']
-        entry = {'stage': stage, 'outcome': 'success' if record['outcome'] == 'success' else 'failed',
+        outcome = 'failed' if record['outcome'] == 'timed_out' else record['outcome']
+        entry = {'stage': stage, 'outcome': outcome,
                  'summary': result['summary'], 'evidence': result['evidence'], 'started_at': record['started_at'],
                  'ended_at': record['ended_at'], 'retries': record['retry_number']}
         if 'terminal_step' in result:
             entry['terminal_step'] = result['terminal_step']
         if result.get('task_blockers'):
             entry['task_blockers'] = result['task_blockers']
-        if entry['outcome'] == 'failed':
+        if result.get('contract_revision_pending'):
+            entry['contract_revision_pending'] = True
+        if outcome != 'success':
             entry['completion'] = result.get('completion', '阻断')
             phase = result['phase']
             if phase != 'verify' and phase != 'split':
@@ -84,8 +87,15 @@ def get_split(store, item):
     return read_history(store, item)[0]
 
 
+def contract_revision_pending(stages):
+    return any(receipt.get('contract_revision_pending') for receipt in stages.values())
+
+
 def stage_evidence(store, item, stage):
-    step = read_history(store, item)[1].get(stage)
+    _, stages = read_history(store, item)
+    if stage.endswith(('.plan', '.coding')) and contract_revision_pending(stages):
+        return None
+    step = stages.get(stage)
     if step and step['outcome'] == 'success':
         return step['evidence']
     return None
@@ -139,8 +149,24 @@ def task_scope(store, item, stage):
     route, stages = read_history(store, item)
     if not route:
         return None
+    tasks = stage_task_ids(route, stage)
+    if stage.endswith('.integration'):
+        # Pending validation does not remove an otherwise mergeable candidate.
+        # Preserve observed assertion failures when selecting mergeable tasks.
+        acceptance = 'frontend.e2e' if stage.startswith('frontend.') else 'backend.acceptance'
+        if receipt := stages.get(acceptance):
+            evidence = receipt.get('evidence')
+            results = evidence.get('task_results') if isinstance(evidence, dict) else None
+            if isinstance(results, dict):
+                failed = {task: result.get('verification') or receipt['summary'] for task, result in results.items()
+                          if task in tasks and isinstance(result, dict) and result.get('outcome') == 'failed'}
+            else:
+                failed = {}
+            stages[acceptance] = {**receipt, 'task_blockers': failed}
     blocked = blocked_tasks(route, stages)
-    return {'active': sorted(stage_task_ids(route, stage) - blocked.keys()), 'blocked': blocked}
+    if contract_revision_pending(stages):
+        blocked.update({task: {'reason': '接口契约变更，等待重新拆分'} for task in tasks - blocked.keys()})
+    return {'active': sorted(tasks - blocked.keys()), 'blocked': blocked}
 
 
 def split_result(store, item, evidence, *, revision=False):

@@ -47,10 +47,13 @@ class RouteDrills(unittest.TestCase):
         self.config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
         self.config.pop('backend_dependencies', None)
         self.config.get('e2e', {}).pop('enabled', None)
+        self.config.get('e2e', {}).pop('agentlimb', None)
         # These drills end at integration. The frontend publisher has its own worker tests.
         self.config['development']['frontend_bundle'].pop('deployment', None)
         self.config['development']['allowed_requirement_types'] = ['frontend_only']
         self.config['zentao'].update(base_url='http://127.0.0.1:1', assigned_to_accounts=['drill'])
+        self.config['zentao'].pop('scope_mode', None)
+        self.config['zentao']['accepted_statuses'] = {'story': ['active'], 'bug': ['active']}
         self.config['runtime'] = {'desktop_project_id': 'drill'}
         self.config['workspaces'] = {'requirement': 'requirements'}
         self.item = {'instance': 'http://127.0.0.1:1', 'project_id': '1', 'kind': 'story', 'id': '17'}
@@ -94,7 +97,7 @@ class RouteDrills(unittest.TestCase):
                 'project_name': self.config['zentao']['project_name']}
         self.assertEqual(self.call('claim', dict(scan, scan_id='1', items=[],
                                                  observed_at=self.now.isoformat()))['status'], 'baseline')
-        entry = {'kind': 'story', 'id': '17', 'title': 'Show status', 'status': 'active', 'priority': 1,
+        entry = {'kind': self.item['kind'], 'id': '17', 'title': 'Show status', 'status': 'active', 'priority': 1,
                  'assigned_to': 'drill'}
         self.assertEqual(self.call('claim', dict(scan, scan_id='2', items=[entry],
                                                  observed_at=self.now.isoformat()))['candidate'], self.item)
@@ -199,6 +202,8 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
 
     def evidence(self, stage, attempt):
         if stage == 'material_check':
+            if self.item['kind'] == 'bug':
+                return {'detail': 'The status page repeats its empty-state title.'}
             return {'path': 'requirements/17/intent.md'}
         if stage == 'split':
             return self.split()
@@ -341,6 +346,66 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
     def test_fullstack_backend_then_frontend(self):
         self.drill('fullstack', '前后端')
 
+    def check_unavailable_e2e_continues_to_release_checks(self):
+        from development_git_runner import run_development_git
+        from frontend_release_runner import run_frontend_release
+        from git_delivery_runner import run_git_delivery
+        from unittest.mock import patch
+
+        self.config['runtime']['git_push_enabled'] = True
+        project = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+        self.config['development']['frontend_bundle']['deployment'] = project['development']['frontend_bundle']['deployment']
+        self.begin_drill('frontend_only', '纯前端')
+        stage = 'material_check'
+        while stage != 'frontend.e2e':
+            attempt = self.record('attempt_start', stage=stage)
+            result = self.finish(stage, attempt, self.evidence(stage, attempt))
+            self.assertEqual(result['status'], 'attempt_finished', result)
+            stage = result['next_stage']
+
+        attempt = self.record('attempt_start', stage=stage)
+        result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
+                             retryable=False, summary='Credentials unavailable',
+                             evidence={'task_blockers': {'frontend': 'Credentials unavailable'}})
+        self.assertEqual((result['disposition'], result['next_stage']), ('next', 'frontend.integration'))
+        integration = self.record('attempt_start', stage='frontend.integration')
+        self.assertEqual(integration['task_scope']['active'], ['frontend'])
+        config_file = self.root / 'delivery-config.json'
+        config_file.write_text(json.dumps(self.config), encoding='utf-8')
+        marker = self.artifacts.parent.name
+        merge = self.record('integration_merge', attempt_id=integration['attempt_id'])
+        self.assertEqual(merge['status'], 'host_git_worker_required', merge)
+        merged = run_development_git(marker, self.database, config_file, self.root, recover=True)
+        self.assertEqual(merged['status'], 'host_git_completed', merged)
+        self.assertEqual(merged['merged_versions'], self.versions['frontend'])
+        integrated = self.finish('frontend.integration', integration, {
+            'versions': self.versions['frontend'], 'merged_versions': merged['merged_versions'],
+        })
+        self.assertEqual(integrated['next_stage'], 'frontend.push', integrated)
+
+        with patch('git_delivery_runner.run_stage') as push, patch('frontend_release_runner.run_stage') as publish:
+            pushed = run_git_delivery(marker, self.database, config_file, self.root)
+            self.assertEqual((pushed['outcome'], pushed['next_stage']), ('skipped', 'frontend.deploy'), pushed)
+            released = run_frontend_release(marker, self.database, config_file, self.root)
+            self.assertEqual((released['outcome'], released['disposition']), ('skipped', 'close'), released)
+            push.assert_not_called()
+            publish.assert_not_called()
+
+        final = self.record('complete', blockers_path='blockers.md')
+        self.assertEqual(final['conclusion'], '待验证')
+        self.assertEqual([step['outcome'] for step in final['steps'][-4:]],
+                         ['failed', 'success', 'skipped', 'skipped'])
+        self.assertTrue(all(step.get('started_at') for step in final['steps'][-4:]))
+        self.assertEqual(self.record('recover', recovery_id='credentials-restored', evidence='Login available')['stage'],
+                         'frontend.e2e')
+
+    def test_bug_continues_to_release_checks_after_e2e_failure(self):
+        self.item['kind'] = 'bug'
+        self.check_unavailable_e2e_continues_to_release_checks()
+
+    def test_story_continues_to_release_checks_after_e2e_failure(self):
+        self.check_unavailable_e2e_continues_to_release_checks()
+
     def test_independent_frontend_is_verified_and_merged_after_backend_blocker(self):
         self.begin_drill('fullstack', '前后端')
         stage = 'material_check'
@@ -352,6 +417,9 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
                 result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
                                      retryable=False, summary='Missing upstream contract',
                                      evidence={'task_blockers': {'backend': 'Missing upstream contract'}})
+            elif attempt.get('task_scope', {}).get('active') == []:
+                result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='skipped',
+                                     summary='No eligible tasks for ' + stage)
             else:
                 evidence = self.evidence(stage, attempt)
                 if stage == 'split':
@@ -373,10 +441,12 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             self.assertEqual(result['status'], 'attempt_finished', result)
             completed.append(stage)
             stage = result['next_stage']
-        self.assertEqual(completed[3], 'frontend.design')
+        self.assertEqual(completed[3:11], ['backend.plan', 'backend.branch_check', 'backend.coding',
+                                          'backend.unit_test', 'backend.code_review', 'backend.acceptance',
+                                          'backend.integration', 'handoff'])
         self.assertEqual(completed[-1], 'frontend.integration')
         closeout = self.record('complete', blockers_path=str(self.artifacts / 'blockers.md'))
-        self.assertEqual(closeout['conclusion'], '阻断', closeout)
+        self.assertEqual(closeout['conclusion'], '待验证', closeout)
         self.assertEqual(set(closeout['blocked_tasks']), {'backend', 'dependent', 'fixture'})
         self.assertEqual(git(self.repositories['frontend'], 'rev-parse', 'HEAD'), self.merged['frontend'][self.key])
 
@@ -397,11 +467,23 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
         self.assertEqual(self.finish(stage, attempt, self.evidence(stage, attempt))['status'], 'evidence_required')
         blocked = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
                               summary='The required service acceptance failed', retryable=False)
-        self.assertIsNone(blocked['next_stage'])
+        self.assertEqual(blocked['next_stage'], 'frontend.design')
+        stage = blocked['next_stage']
+        skipped = []
+        while stage:
+            attempt = self.record('attempt_start', stage=stage)
+            self.assertEqual(attempt['task_scope']['active'], [])
+            receipt = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='skipped',
+                                  summary='The required service acceptance failed')
+            self.assertEqual(receipt['status'], 'attempt_finished', receipt)
+            skipped.append(stage)
+            stage = receipt['next_stage']
         final = self.record('complete', blockers_path='blockers.md')
-        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual(final['conclusion'], '待验证')
         with closing(sqlite3.connect(self.database)) as conn:
-            self.assertEqual(conn.execute("SELECT count(*) FROM attempts WHERE stage LIKE 'frontend.%'").fetchone()[0], 0)
+            self.assertEqual([row[0] for row in conn.execute(
+                "SELECT stage FROM attempts WHERE stage LIKE 'frontend.%' AND outcome='skipped' ORDER BY rowid")],
+                skipped)
         recovered = self.record('recover', recovery_id='new-run', evidence='Service endpoint repaired')
         self.assertEqual(recovered['stage'], 'backend.acceptance')
 
@@ -453,9 +535,9 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             self.assertEqual(rejected['status'], 'evidence_required', rejected)
         outcome = self.record('attempt_finish', attempt_id=first['attempt_id'], outcome='failed', retryable=False,
                               summary='Only the primary service merged', evidence=partial)
-        self.assertEqual(outcome['disposition'], 'blocked', outcome)
+        self.assertEqual(outcome['disposition'], 'close', outcome)
         final = self.record('complete', blockers_path='blockers.md')
-        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual(final['conclusion'], '待验证')
         self.assertIn(merged_first, final['delivery_summary'])
         self.assertEqual(git(secondary, 'rev-parse', 'HEAD'), blocked_target)
 

@@ -171,7 +171,7 @@ class TaskDeliveryTests(unittest.TestCase):
                 self.assertEqual(len(remote.tasks), 5)
             stage = result['next_stage']
         final = fixture.record('complete', blockers_path='blockers.md')
-        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual(final['conclusion'], '待验证')
         with closing(sqlite3.connect(fixture.database)) as conn:
             rows = dict(conn.execute('SELECT task_key,remote_status FROM split_tasks'))
         self.assertEqual(rows, {'B1': 'closed', 'B2': 'closed', 'F1': 'closed', 'F2': 'doing', 'F3': 'doing'})
