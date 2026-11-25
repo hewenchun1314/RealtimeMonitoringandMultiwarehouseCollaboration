@@ -95,6 +95,16 @@ class WorkflowTests(WorkflowFixture):
             conn.commit()
         return super().reserve(item_id, **overrides)
 
+    def test_status_board_shows_stories_and_bugs_with_distinct_links(self):
+        self.scan('initial', [])
+        self.scan('new', [self.row(2), self.row(2, kind='bug')])
+
+        board = publish_status(self.database, self.config).read_text(encoding='utf-8')
+
+        self.assertIn('m=bug&amp;f=view&amp;bugID=2">Bug #2 Fixture 2</a>', board)
+        self.assertIn('m=story&amp;f=view&amp;storyID=2">需求 #2 Fixture 2</a>', board)
+        self.assertIn('<h2>排队中 <span>2</span></h2>', board)
+
     def test_baseline_stale_partial_and_case_sensitive_queue(self):
         self.assertEqual(self.scan('initial', [self.row(1)])['status'], 'baseline')
         self.assertIsNone(self.scan('initial', [self.row(9)])['candidate'])

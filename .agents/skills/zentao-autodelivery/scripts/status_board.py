@@ -1,4 +1,4 @@
-"""Publish a local, read-only snapshot of the formal demand queue."""
+"""Publish a local, read-only snapshot of the delivery queue."""
 
 import json
 import os
@@ -69,8 +69,10 @@ def task_progress(tasks, base_url):
 
 
 def table_row(item, base_url, delivery='', tasks=()):
-    url = f'{base_url}/index.php?' + urlencode({'m': 'story', 'f': 'view', 'storyID': item['item_id']})
-    label = escape(item['title'] or '查看禅道需求')
+    kind = item['kind']
+    url = f'{base_url}/index.php?' + urlencode({'m': kind, 'f': 'view', f'{kind}ID': item['item_id']})
+    item_type = 'Bug' if kind == 'bug' else '需求'
+    label = f'{item_type} #{item["item_id"]} {item["title"] or ""}'.rstrip()
     status = item['conclusion'] or STATES[item['state']]
     if item['state'] == 'queued' and item['dispatch_state'] == 'runtime_blocked':
         status = '待核验无人值守权限'
@@ -87,7 +89,7 @@ def table_row(item, base_url, delivery='', tasks=()):
             progress += ' → ' + STAGE_NAMES.get(item['phase'], item['phase'])
     pending = str(item['pending']) if item['pending'] else '—'
     return (
-        f'<tr><td><a href="{escape(url, quote=True)}">#{escape(item["item_id"])} {label}</a></td>'
+        f'<tr><td><a href="{escape(url, quote=True)}">{escape(label)}</a></td>'
         f'<td>{escape(status)}</td><td>{escape(progress)}</td><td>{escape(delivery) or "—"}</td>'
         f'<td>{task_progress(tasks, base_url)}</td><td>{pending}</td></tr>'
     )
@@ -110,7 +112,7 @@ def publish_status(database, config):
             FROM work_items w
             LEFT JOIN attempts a ON a.item_seq=w.seq AND a.outcome IS NULL
             LEFT JOIN dispatches d ON d.request_id=w.request_id
-            WHERE w.instance=? AND w.project_id=? AND w.kind='story'
+            WHERE w.instance=? AND w.project_id=? AND w.kind IN ('story', 'bug')
             ORDER BY w.priority IS NULL, w.priority, w.seq''', (scope[0], scan['project_id'])).fetchall()
         store = Ledger(conn, config, datetime.now(timezone.utc))
         summaries = {row['seq']: delivery_summary(*read_history(store, row)) for row in rows
@@ -135,9 +137,9 @@ def publish_status(database, config):
                           for row in selected)
         sections.append(
             f'<section><h2>{title} <span>{len(selected)}</span></h2>' + (
-                f'<table><thead><tr><th>禅道需求</th><th>状态</th><th>当前步骤</th><th>范围与交付</th>'
+                f'<table><thead><tr><th>禅道工单</th><th>状态</th><th>当前步骤</th><th>范围与交付</th>'
                 f'<th>拆分任务</th><th>待回写</th></tr></thead>'
-                f'<tbody>{content}</tbody></table>' if content else '<p>暂无需求</p>'
+                f'<tbody>{content}</tbody></table>' if content else '<p>暂无工单</p>'
             ) + '</section>'
         )
     title = escape(config['zentao']['project_name'])
@@ -145,14 +147,14 @@ def publish_status(database, config):
     enabled = '已开启' if config['monitor']['enabled'] else '已关闭'
     html = f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30"><title>{title} · 需求进度</title>
+<meta http-equiv="refresh" content="30"><title>{title} · 工单进度</title>
 <style>
 body{{font:16px/1.55 system-ui,sans-serif;background:#f2f5f6;color:#183039;margin:0}}
 main{{max-width:1080px;margin:auto;padding:32px 20px}}h1{{font-size:28px;margin:0 0 10px}}
 header p,section p{{color:#52666e}}section{{background:#fff;border:1px solid #d9e3e6;border-radius:12px;padding:18px;margin:16px 0;overflow:auto}}
 h2{{font-size:19px;margin:0 0 12px}}h2 span{{background:#e3efee;color:#145851;border-radius:12px;padding:2px 8px}}
 table{{border-collapse:collapse;width:100%;text-align:left}}th,td{{padding:10px;border-bottom:1px solid #e5ecee}}a{{color:#005b66}}
-</style></head><body><main><header><h1>{title} · 需求进度</h1>
+</style></head><body><main><header><h1>{title} · 工单进度</h1>
 <p>接单{enabled} · 最近一次完整扫描 {last_scan}</p></header>{"".join(sections)}</main></body></html>
 '''
     destination = database.parent / 'status.html'
