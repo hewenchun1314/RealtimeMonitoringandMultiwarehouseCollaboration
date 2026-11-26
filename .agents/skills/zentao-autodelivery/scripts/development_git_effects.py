@@ -34,7 +34,7 @@ def diagnostic(process):
 
 
 
-def git(root, *args, deadline, allowed=(0,), env=None, raw=False):
+def git(root, *args, deadline, allowed=(0,), env=None, raw=False, keep_output=False):
     budget = (datetime.fromisoformat(deadline) - datetime.now(timezone.utc)).total_seconds()
     if budget <= 0:
         raise ValueError('The original host Git deadline elapsed')
@@ -50,7 +50,7 @@ def git(root, *args, deadline, allowed=(0,), env=None, raw=False):
     if process.returncode not in allowed:
         raise ValueError('Git operation failed (exit ' + str(process.returncode) + '); hooks/checks remain enabled'
                          + ('; diagnostics: ' + log if log else ''))
-    return (process.stdout if raw else process.stdout.strip()) if process.returncode == 0 else None
+    return (process.stdout if raw else process.stdout.strip()) if process.returncode == 0 or keep_output else None
 
 
 def common_directory(source, deadline):
@@ -76,6 +76,21 @@ def inventory(source, deadline):
 def tracked_dirty(root, deadline):
     return bool(git(root, '--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no',
                     '--ignore-submodules=untracked', deadline=deadline))
+
+
+def active_git_operation(root, deadline):
+    directory = Path(git(root, 'rev-parse', '--absolute-git-dir', deadline=deadline))
+    return any((directory / name).exists() for name in (
+        'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer'))
+
+
+def has_local_work(root, deadline):
+    if tracked_dirty(root, deadline):
+        return True
+    # Git status deliberately skips assume-unchanged and sparse index entries.
+    # Treat them as local state before choosing a checkout or merge strategy.
+    records = git(root, 'ls-files', '-v', '-z', deadline=deadline, raw=True)
+    return any(row and (row[0] == 'S' or row[0].islower()) for row in records.split('\0'))
 
 
 def validate_worktree(proof, deadline):
@@ -398,79 +413,131 @@ def commit(proof, entry, context, operation, key, journal):
     return {'status': 'verified', 'candidate': after}
 
 
-def integrate_main(source, proof, tip, checked, journal, key, deadline, payload):
-    candidate = proof['candidate']
+def integrate_checkout(source, root, proof, tip, journal, key, deadline, payload, earlier_effect):
+    from development_git_overlay import (matches_parked_overlay, prepare_overlay, park_overlay, restore_original_overlay,
+                                         restore_overlay, verify_overlay)
+
     branch = 'refs/heads/' + proof['target_branch']
-    if checked and checked != [source]:
-        raise ValueError('The target branch is checked out outside the main frontend workspace')
-    if tracked_dirty(source, deadline):
-        raise ValueError('The main frontend checkout has tracked or staged edits; preserve and reconcile them')
-    contained = git(source, 'merge-base', '--is-ancestor', candidate, tip, deadline=deadline, allowed=(0, 1)) is not None
-    fast_forward = git(source, 'merge-base', '--is-ancestor', tip, candidate, deadline=deadline, allowed=(0, 1)) is not None
-    prediction = None
-    if not contained and not fast_forward:
-        if not proof['verify_after_merge']:
-            raise ValueError('A divergent frontend target must have post-merge verification enabled')
-        prediction = git(source, 'merge-tree', '--write-tree', '--no-messages', tip, candidate,
-                         deadline=deadline, allowed=(0, 1))
-        if prediction is None:
-            raise ValueError('The queued candidate conflicts with the current target; resolve and review it before merging')
+    candidate = proof['candidate']
     effect = journal / 'integration.json'
-    earlier_effect = effect.is_file()
-    planned = {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(source)}
-    if not checked:
-        ensure_hooks(source, source, deadline, checkout=tip)
-        write_json(effect, {**planned, 'phase': 'checkout'})
-        with hooks(source, journal, deadline) as (opts, env):
-            git(source, *opts, 'switch', '--no-guess', '--no-overwrite-ignore', '--', proof['target_branch'],
-                deadline=deadline, env=env)
+    planned = {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(root)}
+    if active_git_operation(root, deadline):
+        raise ValueError('Another Git operation is using the target checkout')
     prior_failed = payload.get('failed_hooks', {}).get(key) or failed_hooks(journal)
+    contained = git(source, 'merge-base', '--is-ancestor', candidate, tip, deadline=deadline, allowed=(0, 1)) is not None
     if not contained:
+        # A fresh merge invokes its own merge/commit hooks. Only a failed checkout
+        # ran outside that command and still needs its original dispatch.
         prior_failed = [name for name in prior_failed if name == 'post-checkout']
-    if prior_failed:
-        ensure_hooks(source, source, deadline)
-        rerun_post_hooks(source, prior_failed, journal, deadline,
-                         payload.get('failed_hook_args', {}).get(key) or failed_hook_args(journal), checkout_source=source)
-    if (git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != branch
-            or git(source, 'rev-parse', 'HEAD', deadline=deadline) != tip or tracked_dirty(source, deadline)):
-        raise ValueError('The main target checkout or iteration baseline changed; reconcile before integration')
-    if contained:
+    result = {'status': 'verified', 'candidate': candidate, 'target_before': tip}
+    if contained and not prior_failed:
         if (earlier_effect or key in payload.get('needs_retest', [])) and not str(payload.get('verification', '')).strip():
-            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
-                    'worktree': str(source), 'reason': 'Verify interrupted integration and retest this merged revision'}
-        return {'status': 'verified', 'candidate': candidate, 'merged': tip}
-    write_json(effect, {**planned, 'phase': 'merge', 'prediction': prediction})
-    ensure_hooks(source, source, deadline)
+            return {**result, 'status': 'integration_retest_required', 'merged': tip, 'worktree': str(root),
+                    'reason': 'Verify interrupted integration and retest this merged revision'}
+        return {**result, 'merged': tip, 'already_contained': True}
+    def on_target():
+        return git(root, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) == branch
+
+    if not on_target() or git(root, 'rev-parse', 'HEAD', deadline=deadline) != tip:
+        raise ValueError('The checked-out target or its tip changed before integration')
+
+    merge_target = candidate
+    expected = tip if contained else candidate
+    divergent = not contained and git(root, 'merge-base', '--is-ancestor', tip, candidate,
+                                      deadline=deadline, allowed=(0, 1)) is None
+    decisions = payload.get('resolutions', {}).get(key, {})
+    if divergent:
+        expected = git(root, 'merge-tree', '--write-tree', '--no-messages', tip, candidate,
+                       deadline=deadline, allowed=(0, 1))
+        if expected is None:
+            from development_git_history import reviewed_history_merge
+            merge_target = reviewed_history_merge(source, tip, candidate, journal, Path(proof['worktree']).parent,
+                                                  decisions, deadline)
+            expected = merge_target
+            divergent = False
+    tree = git(root, 'rev-parse', expected + '^{tree}', deadline=deadline)
+    overlay = journal / 'overlay'
+    preserve = root == source and has_local_work(root, deadline)
+    native = None
+    if preserve and not divergent and not prior_failed and not contained:
+        from development_git_native import native_fingerprint_if_disjoint
+        native = native_fingerprint_if_disjoint(root, tip, merge_target, deadline)
+        if native:
+            preserve = False
+            planned['local_fingerprint'] = native
+            planned['merge_target'] = merge_target
+    if preserve:
+        prepare_overlay(root, tip, tree, overlay, deadline, resolutions=decisions)
+    ensure_hooks(source, root, deadline)
+    write_json(effect, {**planned, 'phase': 'merge', 'prediction': tree})
+    if preserve:
+        park_overlay(root, overlay, deadline)
+
+    def unexpected_changes():
+        if preserve:
+            return not matches_parked_overlay(root, overlay, deadline)
+        return not native and tracked_dirty(root, deadline)
+
     try:
-        with hooks(source, journal, deadline) as (opts, env):
-            strategy = ['--ff-only'] if fast_forward else ['--no-ff', '--no-edit']
-            git(source, *opts, 'merge', *strategy, '--no-autostash', '--no-overwrite-ignore', candidate,
-                deadline=deadline, env=env)
+        if native:
+            from development_git_native import fingerprint
+            if fingerprint(root, deadline) != native:
+                raise ValueError('Local modifications changed before fast-forward')
+        if unexpected_changes() or git(root, 'rev-parse', 'HEAD', deadline=deadline) != tip:
+            raise ValueError('Integration inputs changed before the original Git hooks ran')
+        if prior_failed:
+            rerun_post_hooks(root, prior_failed, journal, deadline,
+                             payload.get('failed_hook_args', {}).get(key) or failed_hook_args(journal),
+                             checkout_source=source)
+            if unexpected_changes():
+                raise ValueError('The rechecked original integration hook modified tracked files')
+        if not contained:
+            with hooks(root, journal, deadline) as (opts, env):
+                if not on_target() or git(root, 'rev-parse', 'HEAD', deadline=deadline) != tip:
+                    raise ValueError('The checked-out branch or baseline changed before merge')
+                strategy = ['--no-ff', '--no-edit'] if divergent else ['--ff-only']
+                git(root, *opts, 'merge', *strategy, '--no-autostash', '--no-overwrite-ignore', merge_target,
+                    deadline=deadline, env=env)
     except (ValueError, subprocess.TimeoutExpired):
-        merged = git(source, 'rev-parse', branch, deadline=deadline)
-        if git(source, 'merge-base', '--is-ancestor', candidate, merged, deadline=deadline, allowed=(0, 1)) is not None:
-            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
-                    'worktree': str(source), 'reason': 'Merge took effect but a check failed; reconcile and retest',
+        merged = git(root, 'rev-parse', branch, deadline=deadline)
+        if merged == tip:
+            if (divergent and on_target()
+                    and git(root, 'rev-parse', '--verify', 'MERGE_HEAD', deadline=deadline, allowed=(0, 128)) == candidate
+                    and not tracked_changes(root, deadline) and git(root, 'write-tree', deadline=deadline) == tree):
+                git(root, 'merge', '--abort', deadline=deadline)
+            if preserve:
+                restore_original_overlay(root, overlay, deadline)
+        elif git(root, 'merge-base', '--is-ancestor', candidate, merged, deadline=deadline, allowed=(0, 1)) is not None:
+            if preserve:
+                restore_overlay(root, overlay, deadline)
+            return {**result, 'status': 'integration_retest_required', 'merged': merged, 'worktree': str(root),
+                    'reason': 'Merge took effect but an original check failed; retest this revision',
                     'failed_hooks': failed_hooks(journal)}
-        # An original hook may reject a predicted-clean merge before commit.
-        # Abort only if the operation owns the untouched predicted index/tree.
-        if (prediction and merged == tip
-                and git(source, 'rev-parse', '--verify', 'MERGE_HEAD', deadline=deadline, allowed=(0, 128)) == candidate
-                and not tracked_changes(source, deadline)
-                and git(source, 'write-tree', deadline=deadline) == prediction):
-            git(source, 'merge', '--abort', deadline=deadline)
         raise
-    merged = git(source, 'rev-parse', branch, deadline=deadline)
-    if fast_forward:
-        correct_tree = merged == candidate
-    else:
-        correct_tree = (git(source, 'rev-list', '--parents', '-n', '1', merged, deadline=deadline).split()
-                        == [merged, tip, candidate]
-                        and git(source, 'rev-parse', merged + '^{tree}', deadline=deadline) == prediction)
-    if not correct_tree or tracked_dirty(source, deadline):
-        return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
-                'worktree': str(source), 'reason': 'The main integration tree or index differs; reconcile and retest'}
-    return {'status': 'verified', 'candidate': candidate, 'merged': merged, 'target_before': tip}
+    merged = git(root, 'rev-parse', branch, deadline=deadline)
+    if not on_target():
+        raise ValueError('The target checkout switched branches during integration')
+    correct = merged == (tip if contained else merge_target)
+    if divergent:
+        correct = (git(root, 'rev-list', '--parents', '-n', '1', merged, deadline=deadline).split()
+                   == [merged, tip, candidate] and git(root, 'rev-parse', merged + '^{tree}', deadline=deadline) == tree)
+    if preserve:
+        restored = restore_overlay(root, overlay, deadline)
+        if restored.get('additional_checkout_changes'):
+            return {**result, 'status': 'integration_retest_required', 'merged': merged, 'worktree': str(root),
+                    'reason': 'Local edits restored; additional checkout changes appeared during integration. Verify this revision.'}
+        verify_overlay(root, overlay, deadline)
+        result['overlay_verified'] = True
+    if native:
+        result['local_fingerprint'] = native
+        correct = correct and fingerprint(root, deadline) == native
+    if not correct or (not native and not preserve and tracked_dirty(root, deadline)):
+        return {**result, 'status': 'integration_retest_required', 'merged': merged, 'worktree': str(root),
+                'reason': 'The integration result differs from its predicted tree; reconcile and retest'}
+    if contained and key in payload.get('needs_retest', []) and not str(payload.get('verification', '')).strip():
+        return {**result, 'status': 'integration_retest_required', 'merged': merged,
+                'reason': 'Retest the checked merged revision and supply verification'}
+    return {**result, 'merged': merged}
 
 
 def integrate(proof, context, operation, key, journal, database, payload):
@@ -487,8 +554,6 @@ def integrate(proof, context, operation, key, journal, database, payload):
         tip = git(source, 'rev-parse', '--verify', remote, deadline=deadline)
         git(source, 'branch', '--', proof['target_branch'], tip, deadline=deadline)
     checked = [Path(x['worktree']).resolve() for x in inventory(source, deadline) if x.get('branch') == branch]
-    if proof.get('main_delivery'):
-        return integrate_main(source, proof, tip, checked, journal, key, deadline, payload)
     worktrees_root = database.resolve().parent / 'worktrees'
     temporary = worktrees_root / (proof['worktree_branch'].split('/')[-1] + '-integration') / key
     if temporary.resolve() != temporary or not temporary.is_relative_to(worktrees_root):
@@ -513,59 +578,42 @@ def integrate(proof, context, operation, key, journal, database, payload):
                         owned.add(legacy)
     if len(checked) > 1 or any(path != source and path not in owned for path in checked):
         raise ValueError('The target branch is checked out in another user worktree')
-    if tracked_dirty(source, deadline):
-        raise ValueError('The source checkout has tracked/index edits; preserve and reconcile them')
     if temporary.exists() and temporary not in owned:
         raise ValueError('The integration checkout path lacks matching item ownership evidence')
-    merge_root = checked[0] if checked else temporary
-    if merge_root.exists() and tracked_dirty(merge_root, deadline):
-        return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
-                'worktree': str(merge_root), 'reason': 'Clean and retest the original item-owned integration checkout'}
     effect = journal / 'integration.json'
-    contained = git(source, 'merge-base', '--is-ancestor', candidate, tip, deadline=deadline, allowed=(0, 1)) is not None
-    prior_failed = payload.get('failed_hooks', {}).get(key) or failed_hooks(journal)
-    if prior_failed:
-        if not merge_root.exists():
-            raise ValueError('The original integration hook checkout is unavailable for recheck')
-        ensure_hooks(source, merge_root, deadline)
-        rerun_post_hooks(merge_root, prior_failed, journal, deadline,
-                         payload.get('failed_hook_args', {}).get(key) or failed_hook_args(journal), checkout_source=source)
-        if tracked_dirty(merge_root, deadline):
-            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
-                    'worktree': str(merge_root), 'reason': 'The rechecked original integration hook modified tracked files'}
-    if contained:
-        if (key in payload.get('needs_retest', []) or effect.exists()) and not str(payload.get('verification', '')).strip():
-            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
-                    'worktree': str(merge_root), 'reason': 'Verify failed or interrupted integration hooks and retest this merged SHA'}
-        if merge_root != source and merge_root.exists():
-            git(source, 'worktree', 'remove', '--', str(merge_root), deadline=deadline)
-        return {'status': 'verified', 'candidate': candidate, 'merged': tip}
-    if git(source, 'merge-base', '--is-ancestor', tip, candidate, deadline=deadline, allowed=(0, 1)) is None:
-        raise ValueError('This fixed operation supports only fast-forward/already-contained results; resolve divergence through a separate controlled path')
-    if merge_root == temporary and not temporary.exists():
+    earlier_effect = effect.is_file()
+    planned = {'target': branch, 'candidate': candidate, 'before': tip}
+    original_ref = git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) or 'HEAD'
+    if (proof.get('main_delivery') and not checked and not has_local_work(source, deadline)
+            and not active_git_operation(source, deadline)):
         ensure_hooks(source, source, deadline, checkout=tip)
-        temporary.parent.mkdir(parents=True, exist_ok=True)
-        write_json(ownership_path, identity)
-        write_json(effect, {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(merge_root)})
+        write_json(effect, {**planned, 'worktree': str(source), 'phase': 'checkout'})
         with hooks(source, journal, deadline) as (opts, env):
-            git(source, *opts, 'worktree', 'add', '--', str(temporary), proof['target_branch'], deadline=deadline, env=env)
-    else:
-        write_json(effect, {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(merge_root)})
-    ensure_hooks(source, merge_root, deadline)
-    try:
-        with hooks(merge_root, journal, deadline) as (opts, env):
-            git(merge_root, *opts, 'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', candidate, deadline=deadline, env=env)
-    except ValueError:
-        merged = git(source, 'rev-parse', branch, deadline=deadline)
-        if git(source, 'merge-base', '--is-ancestor', candidate, merged, deadline=deadline, allowed=(0, 1)) is not None:
-            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
-                    'worktree': str(merge_root), 'reason': 'Merge took effect but an original hook failed; fix and retest',
-                    'failed_hooks': failed_hooks(journal)}
-        raise
-    merged = git(source, 'rev-parse', branch, deadline=deadline)
-    if tracked_dirty(merge_root, deadline):
-        return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
-                'worktree': str(merge_root), 'reason': 'Integration hooks changed tracked/index files; clean and retest before success'}
-    if merge_root != source:
-        git(source, 'worktree', 'remove', '--', str(merge_root), deadline=deadline)
-    return {'status': 'verified', 'candidate': candidate, 'merged': merged}
+            git(source, *opts, 'switch', '--no-guess', '--no-overwrite-ignore', '--', proof['target_branch'],
+                deadline=deadline, env=env)
+        checked = [source]
+    root = checked[0] if checked else temporary
+    if root != source and root.exists() and tracked_dirty(root, deadline):
+        return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip, 'worktree': str(root),
+                'reason': 'Reconcile the previous changes in the item-owned integration checkout'}
+    if not root.exists():
+        if payload.get('failed_hooks', {}).get(key) or failed_hooks(journal):
+            raise ValueError('The original integration hook checkout is unavailable for recheck')
+        if git(source, 'merge-base', '--is-ancestor', candidate, tip, deadline=deadline, allowed=(0, 1)) is not None:
+            if (earlier_effect or key in payload.get('needs_retest', [])) and not str(payload.get('verification', '')).strip():
+                return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
+                        'reason': 'Verify interrupted integration and retest this merged revision'}
+            return {'status': 'verified', 'candidate': candidate, 'merged': tip, 'already_contained': True,
+                    'preserved_source_ref': original_ref, 'target_before': tip}
+        ensure_hooks(source, source, deadline, checkout=tip)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        write_json(ownership_path, identity)
+        write_json(effect, {**planned, 'worktree': str(root), 'phase': 'checkout'})
+        with hooks(source, journal, deadline) as (opts, env):
+            git(source, *opts, 'worktree', 'add', '--', str(root), proof['target_branch'], deadline=deadline, env=env)
+    result = integrate_checkout(source, root, proof, tip, journal, key, deadline, payload, earlier_effect)
+    if root != source and result['status'] == 'verified':
+        git(source, 'worktree', 'remove', '--', str(root), deadline=deadline)
+        if proof.get('main_delivery'):
+            result['preserved_source_ref'] = original_ref
+    return result

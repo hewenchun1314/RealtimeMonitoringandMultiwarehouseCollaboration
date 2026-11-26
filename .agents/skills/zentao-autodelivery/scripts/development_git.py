@@ -286,6 +286,8 @@ def operation_history(conn, database, context, exclude=None):
             value = published.get(key)
             if value is None and saved.is_file():
                 value = json.loads(saved.read_text(encoding='utf-8'))
+                if context['kind'] == 'integrate' and value.get('status') == 'verified':
+                    value = {**value, 'status': 'integration_retest_required'}
             effect = journal / {'prepare': 'prepare.json', 'commit': 'commit.json', 'integrate': 'integration.json'}[context['kind']]
             if value is None and effect.is_file():
                 value = {'status': {'prepare': 'failed', 'commit': 'candidate_retest_required',
@@ -299,9 +301,60 @@ def operation_history(conn, database, context, exclude=None):
                 if old.get('main_repair') and context['kind'] == 'commit':
                     entry = saved_request['payload'][key]
                     value = {**value, 'repair_files': entry.get('confirmed_files', entry['files'])}
+                if context['kind'] == 'integrate' and old.get('candidate') == proof.get('candidate'):
+                    if value.get('status') == 'integration_conflict' and key not in published:
+                        value = {**value, 'status': 'failed'}
+                    decisions = dict(saved_request['payload'].get('resolutions', {}).get(key, {}))
+                    if value.get('status') == 'failed':
+                        submitted = saved_request.get('submission', {}).get('resolutions', {}).get(key, {})
+                        decisions.pop(submitted.get('conflict_id'), None)
+                    value = {**value, 'candidate': old['candidate'],
+                             'applied_resolutions': decisions}
+                    if value.get('status') != 'verified':
+                        native = saved_request['payload'].get('native_recovery', {}).get(key)
+                        if effect.is_file():
+                            data = json.loads(effect.read_text(encoding='utf-8'))
+                            if data.get('local_fingerprint'):
+                                native = data
+                        if native:
+                            value['native_recovery'] = native
                 repositories[key] = value
         history.append({'repositories': repositories})
     return history
+
+
+def conflict_resolutions(context, history, submitted):
+    if not isinstance(submitted, dict) or not submitted.keys() <= context['repositories'].keys():
+        raise ValueError('Conflict resolutions must name registered repositories')
+    resolutions = {}
+    for key, proof in context['repositories'].items():
+        decisions = {}
+        last_conflict = None
+        for event in history:
+            prior = event['repositories'].get(key, {})
+            if prior.get('candidate') != proof['candidate']:
+                continue
+            decisions.update(prior.get('applied_resolutions', {}))
+            if prior.get('status') == 'integration_conflict':
+                last_conflict = prior
+        if key in submitted:
+            entry = submitted[key]
+            if not isinstance(entry, dict) or not last_conflict or entry.get('conflict_id') != last_conflict.get('conflict_id'):
+                raise ValueError('Resolution must identify the reported conflict for this candidate')
+            files = entry.get('files')
+            if not isinstance(files, dict) or set(files) != {file['path'] for file in last_conflict['conflicts']}:
+                raise ValueError('Provide a resolution for each reported conflict path and no other paths')
+            for value in files.values():
+                if isinstance(value, str):
+                    if '\x00' in value:
+                        raise ValueError('Use an explicit side selection for binary content')
+                elif not (isinstance(value, dict) and set(value) == {'take'}
+                          and value['take'] in ('local', 'upstream', 'base', 'delete')):
+                    raise ValueError('Resolution must supply UTF-8 text or an explicit side selection')
+            decisions[entry['conflict_id']] = {'files': files, 'verification': require_text(entry.get('verification'), 'verification')}
+        if decisions:
+            resolutions[key] = decisions
+    return resolutions
 
 
 def apply_obligations(request, history):
@@ -319,6 +372,7 @@ def apply_obligations(request, history):
                          failed_hooks=previous.get('failed_hooks', []), failed_hook_args=previous.get('failed_hook_args', {}))
     else:
         payload.update(needs_retest=[key for key, value in latest.items() if value.get('status') == 'integration_retest_required'],
+                       native_recovery={key: value['native_recovery'] for key, value in latest.items() if value.get('native_recovery')},
                        failed_hooks={key: value['failed_hooks'] for key, value in latest.items() if value.get('failed_hooks')},
                        failed_hook_args={key: value.get('failed_hook_args', {}) for key, value in latest.items()})
     return request
@@ -336,6 +390,10 @@ def request_host_git(database, config, data, now, directory):
                 raise ValueError('Only repositories in the successful plan can be selected')
             operation = hashlib.sha256(encode([context['attempt_id'], context['phase'], kind, event]).encode()).hexdigest()
             submission = {key: data.get(key) for key in ('commits', 'application', 'service', 'verification')}
+            if 'resolutions' in data:
+                if kind != 'integrate':
+                    raise ValueError('Resolutions belong to an integration request')
+                submission['resolutions'] = data['resolutions']
             old = conn.execute('SELECT * FROM development_git_operations WHERE operation_id=?', (operation,)).fetchone()
             if old:
                 previous = validate_operation(store, old, directory)
@@ -384,6 +442,9 @@ def request_host_git(database, config, data, now, directory):
                 context['repositories'] = {key: context['repositories'][key] for key in commits}
             if kind == 'integrate':
                 payload = {'verification': data.get('verification', '')}
+                resolutions = conflict_resolutions(context, history, data.get('resolutions', {}))
+                if resolutions:
+                    payload['resolutions'] = resolutions
             request = {'context': context, 'payload': payload, 'submission': submission}
             apply_obligations(request, history)
             # One outstanding request per phase keeps batches and their stop

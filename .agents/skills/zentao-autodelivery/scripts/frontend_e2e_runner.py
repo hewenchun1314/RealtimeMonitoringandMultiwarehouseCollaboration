@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from ledger import Ledger, message
 from material_sync_runner import checkout_lock, read_json, recover_proof
+from merged_e2e_sources import remove_committed_sources
 from route_execution import get_split
 from stage_runner import run_stage, utc_now
 
@@ -243,6 +244,7 @@ def run_frontend_e2e(marker, database, config_path, project_root):
         if not proof or proof.get('stop_confirmed') is not True or proof.get('stop_evidence', {}).get(
                 'owned_processes_active_after_stop') != 0:
             return message('host_e2e_stop_unverified', attempt_id=job.attempt_id)
+        cleanup = remove_committed_sources(stage_folder)
         current = _active_job(marker, database, config_path)
         if job != current:
             if current and current.attempt_id == job.attempt_id:
@@ -260,4 +262,6 @@ def run_frontend_e2e(marker, database, config_path, project_root):
             check = {'status': 'blocked', 'stage': 'host-runner'}
         elif check['status'] in ('passed', 'failed') and not _valid_case_results(check, stage_root):
             check = {'status': 'blocked', 'stage': 'scenario-results'}
+        if cleanup:
+            check['source_cleanup'] = cleanup
         return _report(marker, job, check, proof)

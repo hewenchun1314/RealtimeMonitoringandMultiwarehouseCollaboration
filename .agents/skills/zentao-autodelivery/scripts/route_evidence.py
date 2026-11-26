@@ -142,6 +142,29 @@ def check_merge(proof, candidate, merged, reverified):
             return 'Record merged_verification for a merge that changed the tested tree'
 
 
+def host_merge_receipt_error(store, item, side, versions, merged):
+    # Historical integrations can predate host operations. Where a host request
+    # exists in this attempt its per-repository terminal outcome is authoritative.
+    outstanding = set(merged)
+    rows = store.conn.execute("""SELECT g.request, g.result FROM development_git_operations g
+        JOIN attempts a ON a.attempt_id=g.attempt_id WHERE g.item_seq=? AND g.kind='integrate'
+        AND a.run_round=? AND a.ended_at IS NULL ORDER BY g.created_at DESC,g.rowid DESC""",
+                              (item['seq'], item['run_round']))
+    for row in rows:
+        context = json.loads(row['request'])['context']
+        if context['side'] != side:
+            continue
+        actual = json.loads(row['result'])['repositories'] if row['result'] else {}
+        for key in outstanding.intersection(context['repositories']):
+            repo = actual.get(key, {})
+            if (context['repositories'][key]['candidate'] != versions[key] or repo.get('status') != 'verified'
+                    or repo.get('merged') != merged[key]):
+                return f'{key}: a verified host integration receipt is required for this revision'
+            outstanding.remove(key)
+        if not outstanding:
+            break
+
+
 def validate_partial_merge(store, item, stage, evidence):
     """Verify successful repositories in a failed or interrupted normal/repair merge."""
     if not stage.endswith('.integration') or not isinstance(evidence, dict) or 'merged_versions' not in evidence:
@@ -156,6 +179,8 @@ def validate_partial_merge(store, item, stage, evidence):
     if (not commit_map(merged) or not commit_map(versions) or not merged.keys() <= versions.keys()
             or not merged.keys() <= targets.keys() or any(candidates.get(k) != sha for k, sha in versions.items())):
         return 'Partial merge receipts must identify registered repositories and their recorded candidates'
+    if reason := host_merge_receipt_error(store, item, side, versions, merged):
+        return reason
     try:
         for key, sha in merged.items():
             reason = check_merged_commit(targets[key], versions[key], sha)
@@ -176,6 +201,8 @@ def repository_evidence(store, item, side, stage, evidence):
         candidate = stage_evidence(store, item, side + '.coding') or {}
         if versions != candidate.get('versions') or not commit_map(merged) or merged.keys() != targets.keys():
             return 'Merge evidence must cover the recorded candidates and every target repository'
+        if reason := host_merge_receipt_error(store, item, side, versions, merged):
+            return reason
     route = get_split(store, item)
     post_merge = side == 'frontend' and (route or {}).get('post_merge_e2e')
     defer_page_checks = post_merge and 'frontend.e2e' in route['stages']

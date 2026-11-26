@@ -1,5 +1,5 @@
 """Host Git handoff contracts exercised against disposable real Git repositories."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -192,6 +192,14 @@ class DevelopmentGitTests(unittest.TestCase):
         self.request('integration_merge')
         result = self.host()
         self.assertEqual(result['repositories'][self.d.key]['status'], 'integration_retest_required', result)
+        self.assertEqual(result['merged_versions'], {})
+        from route_evidence import host_merge_receipt_error
+        from ledger import transaction
+        with transaction(self.d.database) as conn:
+            from types import SimpleNamespace
+            item = conn.execute('SELECT * FROM work_items WHERE item_id=17').fetchone()
+            self.assertIn('verified host', host_merge_receipt_error(SimpleNamespace(conn=conn), item, self.side,
+                          candidate['versions'], candidate['versions']))
         self.request('integration_merge', verification='retested merged fixture')
         self.assertEqual(self.host()['status'], 'host_git_failed')
         self.install_hook('post-merge', 'exit 0\n')
@@ -310,6 +318,128 @@ class DevelopmentGitTests(unittest.TestCase):
         self.assertTrue(path.exists())
         with patch.object(runner, 'recover_proof', return_value={'stop_confirmed': True}):
             self.assertEqual(self.host()['status'], 'host_git_completed')
+
+    def test_stopped_worker_restores_parked_overlay_before_another_integration(self):
+        from development_git_runner import begin_integration, pending_overlay
+        from development_git_effects import common_directory
+        from development_git_overlay import prepare_overlay, park_overlay
+
+        root = self.begin_coding()
+        (root / 'index.html').write_text('<output>approved</output>\n', encoding='utf-8')
+        self.candidate(root)
+        submitted = self.host()
+        self.integration_phase(submitted)
+        first = self.request('integration_merge')
+        with closing(sqlite3.connect(self.d.database)) as conn:
+            raw, = conn.execute('SELECT request FROM development_git_operations WHERE operation_id=?',
+                                (first['operation_id'],)).fetchone()
+        context = json.loads(raw)['context']
+        source = self.d.repositories[self.side]
+        key = self.d.key
+        deadline = context['deadline_at']
+        before = git(source, 'rev-parse', 'HEAD')
+        after = submitted['versions'][key]
+        draft = source / 'personal.txt'
+        draft.write_text('Staged content\n', encoding='utf-8')
+        git(source, 'add', '--', draft.name)
+        draft.write_text('Local content\n', encoding='utf-8')
+        folder = self.d.database.parent / 'items' / context['marker'] / 'development-git' / first['operation_id']
+        overlay = folder / 'host-git' / 'effects' / key / 'overlay'
+        self.assertIsNone(begin_integration(self.d.database, context, key, first['operation_id']))
+        prepare_overlay(source, before, after, overlay, deadline)
+        park_overlay(source, overlay, deadline)
+        self.assertFalse(draft.exists())
+        common = common_directory(source, deadline)
+        self.assertEqual(pending_overlay(self.d.database, common)['marker'], context['marker'])
+        with self.assertRaisesRegex(ValueError, 'owns the unfinished'):
+            begin_integration(self.d.database, {**context, 'marker': 'HNF-' + '9' * 20}, key, 'b' * 64)
+        rolled_back = begin_integration(self.d.database, context, key, first['operation_id'])
+        self.assertEqual(rolled_back['status'], 'integration_retry_required', rolled_back)
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
+        self.assertEqual(git(source, 'show', ':' + draft.name), 'Staged content')
+        self.assertEqual(draft.read_text(), 'Local content\n')
+        second = 'c' * 64
+        self.assertIsNone(begin_integration(self.d.database, context, key, second))
+        overlay = folder.parent / second / 'host-git' / 'effects' / key / 'overlay'
+        prepare_overlay(source, before, after, overlay, deadline)
+        park_overlay(source, overlay, deadline)
+        git(source, 'merge', '--ff-only', after)
+        recovered = begin_integration(self.d.database, context, key, 'a' * 64)
+        self.assertEqual(recovered['status'], 'integration_retest_required', recovered)
+        self.assertEqual(git(source, 'show', ':' + draft.name), 'Staged content')
+        self.assertEqual(draft.read_text(), 'Local content\n')
+        self.assertIsNone(pending_overlay(self.d.database, common))
+
+    def test_conflict_resolution_is_bound_to_candidate_identifier_and_reported_paths(self):
+        from development_git import conflict_resolutions
+        context = {'repositories': {'app': {'candidate': 'c' * 40}}}
+        receipt = {'candidate': 'c' * 40, 'status': 'integration_conflict',
+                   'conflict_id': 'a' * 64, 'conflicts': [{'path': 'view.ts'}],
+                   'applied_resolutions': {'b' * 64: {'verification': 'Earlier layer', 'files': {'index.ts': 'x'}}}}
+        history = [{'repositories': {'app': receipt}}]
+        entry = {'conflict_id': 'a' * 64, 'files': {'view.ts': 'resolved view'}, 'verification': 'Compared both sides'}
+        decisions = conflict_resolutions(context, history, {'app': entry})['app']
+        self.assertEqual(set(decisions), {'a' * 64, 'b' * 64})
+        self.assertEqual(decisions['a' * 64]['files'], entry['files'])
+        with self.assertRaisesRegex(ValueError, 'reported conflict'):
+            conflict_resolutions(context, history, {'app': {**entry, 'conflict_id': 'f' * 64}})
+        with self.assertRaisesRegex(ValueError, 'no other paths'):
+            conflict_resolutions(context, history, {'app': {**entry, 'files': {'other.ts': 'unexpected'}}})
+
+    def test_host_replays_reviewed_resolutions_through_both_local_layers(self):
+        root = self.begin_coding()
+        (root / 'index.html').write_text('<output>approved</output>\n', encoding='utf-8')
+        self.candidate(root)
+        candidate = self.host()
+        self.integration_phase(candidate)
+        key = self.d.key
+        source = self.d.repositories[self.side]
+        page = source / 'index.html'
+        page.write_text('<output>staged draft</output>\n', encoding='utf-8')
+        git(source, 'add', '--', page.name)
+        page.write_text('<output>working draft</output>\n', encoding='utf-8')
+        self.request('integration_merge')
+        result = self.host()
+        for layer, resolved in [('index', 'approved + staged draft'), ('worktree', 'approved + working draft')]:
+            receipt = result['repositories'][key]
+            self.assertEqual(receipt['status'], 'integration_conflict', result)
+            self.assertEqual(receipt['layer'], layer)
+            self.assertFalse(result['merged_versions'])
+            entry = {'conflict_id': receipt['conflict_id'], 'files': {page.name: '<output>' + resolved + '</output>\n'},
+                     'verification': 'Combined both output labels and preserved the intended staging boundary'}
+            submitted = self.request('integration_merge', resolutions={key: entry})
+            self.assertEqual(submitted['status'], 'host_git_worker_required', submitted)
+            result = self.host()
+        self.assertEqual(result['merged_versions'], candidate['versions'], result)
+        self.assertEqual(git(source, 'show', 'HEAD:index.html'), '<output>approved</output>')
+        self.assertEqual(git(source, 'show', ':index.html'), '<output>approved + staged draft</output>')
+        self.assertEqual(page.read_text(), '<output>approved + working draft</output>\n')
+
+    def test_interrupted_native_merge_rechecks_the_exact_result_and_pending_content(self):
+        from development_git_native import fingerprint
+        from development_git_runner import check_native_recovery
+
+        root = self.begin_coding()
+        (root / 'index.html').write_text('<output>approved</output>\n', encoding='utf-8')
+        self.candidate(root)
+        candidate = self.host()['versions'][self.d.key]
+        source = self.d.repositories[self.side]
+        branch = git(source, 'symbolic-ref', '--short', 'HEAD')
+        deadline = self.attempt['deadline_at']
+        draft = source / 'draft.txt'
+        draft.write_text('staged\n', encoding='utf-8')
+        git(source, 'add', '--', draft.name)
+        draft.write_text('working\n', encoding='utf-8')
+        expected = fingerprint(source, deadline)
+        proof = {'source_root': str(source), 'target_branch': branch, 'candidate': candidate}
+        effect = {'target': 'refs/heads/' + branch, 'candidate': candidate, 'before': git(source, 'rev-parse', 'HEAD'),
+                  'prediction': git(source, 'rev-parse', candidate + '^{tree}'), 'local_fingerprint': expected}
+        git(source, 'merge', '--ff-only', candidate)
+        self.assertEqual(check_native_recovery(proof, effect, deadline), expected)
+        draft.write_text('concurrent edit\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'saved local changes'):
+            check_native_recovery(proof, effect, deadline)
+        self.assertEqual(draft.read_text(), 'concurrent edit\n')
 
     def test_integration_never_moves_target_checked_out_in_another_user_worktree(self):
         root = self.begin_coding()
@@ -796,6 +926,101 @@ class DevelopmentGitTests(unittest.TestCase):
         self.assertIn('conflict', result['repositories'][self.d.key]['reason'])
         self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
         self.assertEqual(git(source, 'status', '--porcelain'), '')
+        conflict = result['repositories'][self.d.key]
+        resolved_text = '<output>approved</output> from both changes\n'
+        self.request('integration_merge', resolutions={self.d.key: {
+            'conflict_id': conflict['conflict_id'], 'files': {'index.html': resolved_text},
+            'verification': 'Checked the resolved output and both original versions'}})
+        merged = self.host()
+        self.assertEqual(merged['status'], 'host_git_completed', merged)
+        self.assertEqual(git(source, 'rev-list', '--parents', '-n', '1', 'HEAD').split()[1:],
+                         [before, git(candidate_workspace, 'rev-parse', 'HEAD')])
+        self.assertEqual((source / 'index.html').read_text(), resolved_text)
+
+    def check_dirty_integration(self):
+        candidate_tree = self.begin_coding()
+        source = self.d.repositories[self.side]
+        if self.side == 'backend':
+            (candidate_tree / 'status.json').write_text('{"status":"approved"}', encoding='utf-8')
+            self.candidate(candidate_tree, files=['status.json'])
+        else:
+            (candidate_tree / 'index.html').write_text('<output>approved</output>\n', encoding='utf-8')
+            self.candidate(candidate_tree)
+        result = self.host()
+        self.integration_phase(result)
+        draft = source / 'local-draft.txt'
+        draft.write_text('index content\n', encoding='utf-8')
+        git(source, 'add', '--', draft.name)
+        draft.write_text('working content\n', encoding='utf-8')
+        self.request('integration_merge')
+        merged = self.host()
+        self.assertEqual(merged['status'], 'host_git_completed', merged)
+        self.assertEqual(merged['merged_versions'], result['versions'])
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), result['versions'][self.d.key])
+        self.assertEqual(git(source, 'show', ':' + draft.name), 'index content')
+        self.assertEqual(draft.read_text(), 'working content\n')
+        self.assertEqual(git(source, 'status', '--porcelain', '--', draft.name), 'AM ' + draft.name)
+
+    def test_legacy_integration_preserves_partial_staging(self):
+        self.check_dirty_integration()
+
+    def test_post_merge_integration_preserves_partial_staging(self):
+        self.start_side('frontend', post_merge=True)
+        self.check_dirty_integration()
+
+    def test_backend_integration_preserves_partial_staging(self):
+        self.start_side('backend')
+        self.check_dirty_integration()
+
+    def test_dirty_non_target_main_keeps_its_branch_and_index(self):
+        self.start_side('frontend', post_merge=True)
+        candidate_tree = self.begin_coding()
+        (candidate_tree / 'index.html').write_text('<output>approved</output>\n', encoding='utf-8')
+        self.candidate(candidate_tree)
+        candidate = self.host()
+        self.integration_phase(candidate)
+        source = self.d.repositories['frontend']
+        target = git(source, 'symbolic-ref', '--short', 'HEAD')
+        before = git(source, 'rev-parse', 'HEAD')
+        git(source, 'switch', '-c', 'local-edits')
+        (source / 'draft').write_text('staged')
+        git(source, 'add', '--', 'draft')
+        (source / 'draft').write_text('still editing')
+        self.request('integration_merge')
+        result = self.host()
+        self.assertEqual(result['status'], 'host_git_completed', result)
+        self.assertEqual(git(source, 'rev-parse', target), candidate['versions'][self.d.key])
+        self.assertEqual(git(source, 'symbolic-ref', '--short', 'HEAD'), 'local-edits')
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
+        self.assertEqual(git(source, 'show', ':draft'), 'staged')
+        self.assertEqual((source / 'draft').read_text(), 'still editing')
+
+    def test_other_branch_at_same_sha_cannot_receive_the_merge(self):
+        import development_git_effects as effects
+        source = self.d.repositories['frontend']
+        target = git(source, 'symbolic-ref', '--short', 'HEAD')
+        before = git(source, 'rev-parse', 'HEAD')
+        git(source, 'switch', '-c', 'candidate')
+        (source / 'approved.txt').write_text('candidate')
+        git(source, 'add', '--', 'approved.txt')
+        git(source, 'commit', '-m', 'Fixture candidate')
+        candidate = git(source, 'rev-parse', 'HEAD')
+        git(source, 'switch', '--', target)
+        git(source, 'branch', 'user', before)
+        original_hooks = effects.hooks
+        journal = self.d.root / 'effect'
+        journal.mkdir()
+
+        @contextmanager
+        def switch_before_merge(*args):
+            with original_hooks(*args) as wrapped:
+                git(source, 'switch', '--', 'user')
+                yield wrapped
+        with patch.object(effects, 'hooks', switch_before_merge), self.assertRaisesRegex(ValueError, 'branch'):
+            effects.integrate_checkout(source, source, {'target_branch': target, 'candidate': candidate}, before,
+                                       journal, 'app', self.attempt['deadline_at'], {}, False)
+        self.assertEqual(git(source, 'rev-parse', 'user'), before)
+        self.assertEqual(git(source, 'rev-parse', target), before)
 
     def test_post_merge_frontend_rechecks_failed_original_checkout_hook_on_retry(self):
         self.start_side('frontend', post_merge=True)

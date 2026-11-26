@@ -15,6 +15,7 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+from merged_e2e_sources import RuntimeSourcesChanged, merged_workspace, prepare_committed_sources, verify_runtime_sources
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 
 
@@ -130,41 +131,6 @@ def candidate_workspace(options, config, branches, versions, supplied):
         if checkout_path != checkout or check_candidate(proof, sha):
             raise ValueError('Frontend startup does not include every exact candidate worktree')
     return str(workspace)
-
-
-def check_merged_checkout(repository, branch, sha):
-    from branch_check import git
-
-    root = Path(repository).resolve(strict=True)
-    if (Path(git(root, 'rev-parse', '--show-toplevel')).resolve() != root
-            or git(root, 'symbolic-ref', '--quiet', 'HEAD', allowed=(0, 1)) != 'refs/heads/' + branch
-            or git(root, 'rev-parse', 'HEAD') != sha
-            or git(root, '--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no',
-                   '--ignore-submodules=untracked')):
-        raise ValueError('Main workspace must contain the exact, clean merged checkout')
-
-
-def merged_workspace(options, config, branches, versions):
-    root = Path(options['workspace']).resolve(strict=True)
-    applications = config['development']['frontend_bundle']['applications']
-    if not (root / 'package.json').is_file() or not versions or versions.keys() != branches.keys():
-        raise ValueError('Acceptance requires the merged frontend workspace')
-    # The shell serves every child application and must use a committed startup definition.
-    from branch_check import git
-    root_sha = git(root, 'rev-parse', 'HEAD')
-    root_branch = git(root, 'symbolic-ref', '--short', 'HEAD')
-    check_merged_checkout(root, root_branch, root_sha)
-    checkouts = {str(root): {'repository': str(root), 'branch': root_branch, 'sha': root_sha}}
-    for app, sha in versions.items():
-        proof, application = branches[app], applications[app]
-        checkout = (root / application['repository']).resolve(strict=True)
-        branch = application['branch']
-        if (not checkout.is_relative_to(root) or checkout != Path(proof['source_root']).resolve(strict=True)
-                or branch != proof['target_branch']):
-            raise ValueError('Merged checkout must match the configured application and target branch')
-        check_merged_checkout(checkout, branch, sha)
-        checkouts[str(checkout)] = {'repository': str(checkout), 'branch': branch, 'sha': sha}
-    return checkouts
 
 
 def acceptance_setup(config, options, args):
@@ -309,13 +275,19 @@ def prepare_frontend(config, options, startup_log, *, restart=False):
         raise ValueError('Preflight requires a frontend start command')
     start_options = {}
     reclaimed = None
+    source_workspace = None
     if post_merge:
         configured_ports = config.get('startup_ports')
         if (not isinstance(configured_ports, list) or not configured_ports
                 or any(type(port) is not int or not 1 <= port <= 65535 for port in configured_ports)
                 or not ports.keys() <= set(configured_ports)):
             raise ValueError('All formal E2E ports must be in the configured startup ports')
-        if (not restart and all(port_open(origin.hostname, port) for port in ports)
+        if options.get('mergedCheckouts'):
+            try:
+                source_workspace = prepare_committed_sources(options, startup_log.resolve().parent / 'frontend-source')
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                return {'mode': 'start-failed', 'reason': 'merged-source-preparation', 'detail': str(error)}
+        if (not restart and not source_workspace and all(port_open(origin.hostname, port) for port in ports)
                 and http_ready(options['baseUrl'] + options['loginPath'])):
             return {'mode': 'reused', **({'gateway': gateway} if gateway else {})}
         try:
@@ -329,6 +301,8 @@ def prepare_frontend(config, options, startup_log, *, restart=False):
         if gateway:
             witness_config['gatewayHash'] = options['gatewayHash']
         environment['ZENTAO_E2E_WITNESS'] = json.dumps(witness_config)
+        if source_workspace:
+            environment['ZENTAO_E2E_SOURCE'] = source_workspace
         start_options['env'] = environment
     elif candidate and any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
         return {'mode': 'start-failed', 'reason': 'candidate-port-in-use'}
@@ -340,15 +314,22 @@ def prepare_frontend(config, options, startup_log, *, restart=False):
         if re.search(r'(?<!\S)--gateway\b', command):
             raise ValueError('Use a single terminal --gateway option in the frontend start command')
         command = f"{command.rstrip()} --gateway='{gateway}'"
+    if source_workspace:
+        # npm runs the pinned package's lifecycle in its own tree; the host
+        # launcher still starts in the main workspace with its configured options.
+        if re.fullmatch(r"npm(?:\.cmd)?\s+run\s+[\w:-]+(?:\s+--[\w.=/:'-]+)*", command):
+            command = re.sub(r'^(npm(?:\.cmd)?)', r'\1 --prefix "$env:ZENTAO_E2E_SOURCE"', command, count=1)
+        else:
+            command = 'Set-Location -LiteralPath $env:ZENTAO_E2E_SOURCE -ErrorAction Stop\n' + command
     with startup_log.open('wb') as output:
         try:
             # The Windows stage runner owns the candidate process tree.
-            process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
-                                       cwd=options.get('startupWorkspace', options['workspace']), stdin=subprocess.DEVNULL,
-                                       stdout=output, stderr=subprocess.STDOUT, **start_options)
+            process = launch_frontend(command, options.get('startupWorkspace', options['workspace']), output, start_options)
         except OSError:
             return {'mode': 'start-failed', 'reason': 'start-command-unavailable', 'log': str(startup_log)}
     launched = {'pid': process.pid, 'log': str(startup_log)}
+    if source_workspace:
+        launched['source_workspace'] = source_workspace
     if reclaimed:
         launched['released_listeners'] = reclaimed
     if gateway:
@@ -361,6 +342,12 @@ def prepare_frontend(config, options, startup_log, *, restart=False):
             return {'mode': 'started', **launched}
         sleep(1)
     return {'mode': 'start-failed', 'reason': 'startup-timeout', **launched}
+
+
+def launch_frontend(command, workspace, output, start_options):
+    return subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
+                            cwd=workspace, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                            **start_options)
 
 
 def browser_result(options, args):
@@ -404,10 +391,19 @@ def run_browser(config, options, args, *, deployment=None):
         versions = options['candidateVersions']
         try:
             if options.get('postMerge'):
-                for checkout in options['mergedCheckouts'].values():
-                    check_merged_checkout(**checkout)
+                verify_runtime_sources(options, (frontend or {}).get('source_workspace'))
             elif any(check_candidate(options['candidateBranches'][app], sha) for app, sha in versions.items()):
                 raise ValueError('Candidate changed during acceptance')
+        except RuntimeSourcesChanged:
+            business_result = result['status'] == 'passed' or (
+                result.get('repair_required') is True and result.get('stage') == 'acceptance')
+            if business_result and frontend and not frontend.get('source_workspace') and not options.get('forceCommittedSources'):
+                # A hot-reloading main service may have run a mixture of versions.
+                # Rerun the same cases once in the same deadline and job.
+                retry = run_browser(config, {**options, 'forceCommittedSources': True}, args, deployment=deployment)
+                retry['source_retry'] = {'reason': 'main-workspace-edited', 'previous_result': result['status']}
+                return retry
+            return {'status': 'blocked', 'stage': 'candidate-version', 'reason': 'runtime-sources-changed'}
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             return {'status': 'blocked', 'stage': 'candidate-version', 'reason': 'candidate-changed-during-acceptance'}
         result['versions'] = versions

@@ -68,7 +68,7 @@
 
 每仓文件都是字面相对路径，可登记删除文件；不接收通配符、目录、越界路径、Git 元数据或任意宿主命令。只能在 coding 阶段或返工 coding 分段提交。`host_git_completed` 的逐仓状态均为 `verified`；`host_git_failed` 中保留成功仓库、具体失败原因和诊断目录，按仓库继续处理。候选成功版本在 `versions`，合回结果另有 `merged_versions`。准备结果在 `repositories`。
 
-逐仓 `candidate_retest_required` / `integration_retest_required` 表示已有 Git 效果仍需确认。核对真实 SHA、保留 hooks 改动、清理并重跑受影响验证，再用新事件提供非空 `verification`；候选确认使用当前 `expected_head`、`files:[]`。失败的原 hooks 还须由宿主实际重跑通过，文字证明不能替代。`host_git_busy`、`host_git_stop_unverified`、`host_git_recovery_required` 时由启动器对账原进程和日志，不另起 Git 或更换事件绕过。`host_git_rejected` / `host_git_inactive` 表示绑定、阶段、截止时间或授权无效，不能作为阶段成功证据。详见[分支流程](branches.md)。
+逐仓 `candidate_retest_required` / `integration_retest_required` 表示已有 Git 效果仍需确认。核对实际 SHA、原 hooks 及工作区恢复结果，重跑受影响验证，再用新事件提供非空 `verification`。候选确认使用当前 `expected_head` 和 `files:[]`。失败的原 hooks 由宿主实际重跑。收到 `integration_retry_required` 时，原工作区已恢复，以新事件续接合回。`host_git_busy`、`host_git_stop_unverified`、`host_git_recovery_required` 时由启动器对账原进程和日志。`host_git_rejected` / `host_git_inactive` 表示绑定、阶段、截止时间或授权无效。详见[分支流程](branches.md)。
 
 ### 工单动作
 
@@ -87,7 +87,7 @@
 | `branch_inspect` | `request_id`、`chat_id`、有效分支核验 `attempt_id`。可传 `worktrees`（应用配置键对应的工作树绝对路径）。首次调用解析分支，准备好工作树后再次调用验证真实提交和工单分支。参照 [分支核验与工作树](branches.md) 处理每项状态。 |
 | `branch_prepare` | 当前绑定、分支核验 `attempt_id`、实际 `phase`、稳定 `event_id`。只登记整个成功计划的宿主准备请求，缺 ref 时只补取 origin 的配置目标；成功后以 `repositories` 继续只读核验，不自行切换源分支。 |
 | `candidate_commit` | 当前 coding 绑定、尝试、分段、稳定事件和 `commits`。每仓提供 `expected_head`、字面 `files`、`message`、可选验证说明；具体格式及复验规则见上文。成功 `versions` 供 coding 结果使用。 |
-| `integration_merge` | 当前 integration 绑定、尝试、分段和稳定事件；复验时加非空 `verification`。候选和目标由账本及配置确定。返回逐仓合回结果及版本；安全快进以外的历史处理需要单独的受控实现路径，本固定操作集不执行。 |
+| `integration_merge` | 当前 integration 绑定、尝试、分段和稳定事件。候选和目标由账本及配置确定。复验时加非空 `verification`。遇到单仓 `integration_conflict`，按分支流程用新事件提交 `resolutions`，包括仓库键、实际 `conflict_id`、逐文件 `files` 和核对依据 `verification`。已核验仓库的合回版本在 `merged_versions`。 |
 | `host_git_status` | 当前绑定、`attempt_id`、`phase`、`operation_id`，仅查询原操作，不启动 Git；不能用旧尝试结果推进新阶段。 |
 | `repair_advance` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`summary` 和本分段的成功 `evidence`。获得新的 `repair_advanced` 后，使用同一 `attempt_id` 执行返回的下一分段及其新截止时间。重放返回 `phase_already_advanced`，需对账当前分段。 |
 | `attempt_finish` | `request_id`、`chat_id`、`attempt_id`、当前 `phase`、`outcome`、`summary`、`evidence`。`outcome` 为 `success`、`failed`、`timed_out` 或 `skipped`。需求和 Bug 通过材料评审及拆分后，当前阶段核对到必要条件缺失或没有可处理项时用 `skipped`，附该阶段的具体原因和证据。`skipped` 不重试，不提交实际执行结果。单测需要候选修订，或 Code Review、验收、E2E、integration 有确需修复的代码缺陷时，失败结果提供 `repair_required:true`，按账本返回的 coding 分段修订并重验。既有返工中的单测可用同一标记回到紧邻的同端 coding；环境失败仍重试原验证。分叉的历史处理不在本固定操作集内。环境问题按普通失败处理。分段失败也由本操作记录，超时须提供 `stop_confirmed:true` 和 `stop_evidence`。确定无法重试时提供 `retryable:false`，可用 `completion` 指定「待补材料」「待验证」或「阻断」。`disposition:next` 时处理 `next_stage`，任务阻断记录不能跳过后续阶段的独立核对。`retry` 续跑本步。走完整条路线后返回 `close`，有缺项时结论为「待验证」。评审或拆分提前结束时返回 `blocked`。需求的 `material_check` 确认缺少需求文件时，提交 `outcome:"failed"` 和 `evidence.material_file_status:"missing"` 并附核对依据。账本跳过重试，返回 `blocked`，后续步骤记为跳过，结论为「待补材料」。 |

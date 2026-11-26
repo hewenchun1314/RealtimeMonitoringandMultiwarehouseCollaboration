@@ -18,6 +18,91 @@ from material_sync_runner import checkout_lock, load_config, read_json, recover_
 from stage_runner import run_stage, utc_now, write_json
 
 
+def pending_overlay(database, common):
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='development_checkout_overlays'").fetchone():
+            return None
+        row = conn.execute('''SELECT marker, operation_id, repository, source_root, target_branch, candidate
+                              FROM development_checkout_overlays WHERE common=?''', (str(common).casefold(),)).fetchone()
+    if not row:
+        return None
+    marker, operation, key, source, branch, candidate = row
+    directory = database.parent / 'items' / marker / 'development-git' / operation / 'host-git' / 'effects' / key / 'overlay'
+    state_file = directory / 'state.json'
+    if not state_file.exists():
+        return None
+    manifest = json.loads(state_file.read_text(encoding='utf-8'))
+    if not isinstance(manifest, dict):
+        raise ValueError('The checkout recovery journal is unreadable')
+    if manifest.get('phase') in ('planning', 'prepared', 'original', 'restored'):
+        return None
+    if manifest.get('source') != source or manifest.get('phase') not in ('parking', 'parked', 'restoring', 'rolling_back'):
+        raise ValueError('The incomplete checkout journal cannot be identified')
+    return {'marker': marker, 'source': source, 'target_branch': branch, 'candidate': candidate,
+            'directory': directory, 'manifest': manifest}
+
+
+def begin_integration(database, context, key, operation):
+    from development_git_overlay import restore_original_overlay, restore_overlay
+
+    proof = context['repositories'][key]
+    source = Path(proof['source_root'])
+    deadline = context['deadline_at']
+    common = common_directory(source, deadline)
+    pending = pending_overlay(database, common)
+    if pending:
+        if (context['marker'] != pending['marker'] or str(source) != pending['source']
+                or proof['target_branch'] != pending['target_branch']
+                or git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1))
+                    != 'refs/heads/' + pending['target_branch']):
+            raise ValueError('A different target checkout owns the unfinished local changes')
+        state = pending['manifest']
+        head = git(source, 'rev-parse', 'HEAD', deadline=deadline)
+        hook_evidence = {'failed_hooks': failed_hooks(pending['directory'].parent),
+                         'failed_hook_args': failed_hook_args(pending['directory'].parent)}
+        if head == state['before']:
+            restore_original_overlay(source, pending['directory'], deadline)
+            return {**hook_evidence, 'status': 'integration_retry_required', 'candidate': proof['candidate'],
+                    'reason': 'Restored the original index and worktree after the interrupted operation; retry integration'}
+        if (git(source, 'rev-parse', head + '^{tree}', deadline=deadline) != state['merged_tree']
+                or any(git(source, 'merge-base', '--is-ancestor', commit, head, deadline=deadline, allowed=(0, 1)) is None
+                       for commit in (state['before'], pending['candidate']))):
+            raise ValueError('The interrupted merge target changed outside its planned history; original edits are retained')
+        restore_overlay(source, pending['directory'], deadline)
+        return {**hook_evidence, 'status': 'integration_retest_required', 'candidate': proof['candidate'], 'merged': head,
+                'reason': 'Recovered the merged index and local edits after an interrupted operation; retest this revision'}
+    # Register ownership before the first possible write to the checkout. A stopped
+    # worker and a new operation ID must still discover a partially parked index.
+    with transaction(database) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS development_checkout_overlays(
+            common TEXT PRIMARY KEY, marker TEXT NOT NULL, operation_id TEXT NOT NULL, repository TEXT NOT NULL,
+            source_root TEXT NOT NULL, target_branch TEXT NOT NULL, candidate TEXT NOT NULL)''')
+        conn.execute('INSERT OR REPLACE INTO development_checkout_overlays VALUES(?,?,?,?,?,?,?)',
+                     (str(common).casefold(), context['marker'], operation, key, str(source), proof['target_branch'], proof['candidate']))
+    return None
+
+
+def check_native_recovery(proof, effect, deadline):
+    if not effect or not effect.get('local_fingerprint'):
+        return None
+    from development_git_native import fingerprint
+    source = Path(proof['source_root'])
+    ref = 'refs/heads/' + proof['target_branch']
+    if effect.get('target') != ref or effect.get('candidate') != proof['candidate']:
+        raise ValueError('Native integration recovery does not match the registered target and candidate')
+    actual = git(source, 'rev-parse', ref, deadline=deadline)
+    if actual == effect['before']:
+        return None
+    if (git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != ref
+            or actual != effect.get('merge_target', proof['candidate'])
+            or git(source, 'rev-parse', actual + '^{tree}', deadline=deadline) != effect['prediction']
+            or any(git(source, 'merge-base', '--is-ancestor', sha, actual, deadline=deadline, allowed=(0, 1)) is None
+                   for sha in (effect['before'], proof['candidate']))
+            or fingerprint(source, deadline) != effect['local_fingerprint']):
+        raise ValueError('Interrupted native merge differs from its predicted commit, tree or saved local changes')
+    return effect['local_fingerprint']
+
+
 def pending_development_git(marker, database, config_path):
     if not database.is_file():
         return message('host_git_not_pending')
@@ -37,7 +122,7 @@ def pending_development_git(marker, database, config_path):
     return message('host_git_not_pending')
 
 
-def verify_result(context, key, result, entry=None):
+def verify_result(context, key, result, entry=None, journal=None):
     if result.get('status') != 'verified':
         return
     deadline = context['deadline_at']
@@ -64,16 +149,34 @@ def verify_result(context, key, result, entry=None):
         if actual != result['merged'] or git(source, 'merge-base', '--is-ancestor', proof['candidate'], actual,
                                             deadline=deadline, allowed=(0, 1)) is None:
             raise ValueError('Integration result changed before host publication')
+        if result.get('overlay_verified'):
+            from development_git_overlay import verify_overlay
+            if journal is None:
+                raise ValueError('Missing checkout restoration evidence')
+            manifest = verify_overlay(source, journal / 'overlay', deadline)
+            if manifest['merged_tree'] != git(source, 'rev-parse', actual + '^{tree}', deadline=deadline):
+                raise ValueError('Restored checkout belongs to a different merged tree')
+        if result.get('local_fingerprint'):
+            from development_git_native import fingerprint
+            if (git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != 'refs/heads/' + proof['target_branch']
+                    or fingerprint(source, deadline) != result['local_fingerprint']):
+                raise ValueError('The local index or worktree changed since native fast-forward verification')
         if proof.get('main_delivery'):
             ref = 'refs/heads/' + proof['target_branch']
-            if (git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != ref
-                    or tracked_dirty(source, deadline)
+            source_ref = git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) or 'HEAD'
+            expected_ref = result.get('preserved_source_ref', ref)
+            if (source_ref != expected_ref
+                    or (source_ref == ref and not any(result.get(gate) for gate in
+                        ('overlay_verified', 'already_contained', 'local_fingerprint'))
+                        and tracked_dirty(source, deadline))
                     or (result.get('target_before') and git(source, 'merge-base', '--is-ancestor',
                         result['target_before'], actual, deadline=deadline, allowed=(0, 1)) is None)):
                 raise ValueError('The main frontend checkout changed before integration publication')
 
 
 def compute(database, config_path, operation, folder):
+    from development_git_overlay import OverlayConflict
+
     config = load_config(config_path)
     with transaction(database) as conn:
         row = conn.execute('SELECT * FROM development_git_operations WHERE operation_id=?', (operation,)).fetchone()
@@ -89,8 +192,22 @@ def compute(database, config_path, operation, folder):
         saved = read_json(journal / 'result.json')
         token = DIAGNOSTICS.set(journal / 'git-diagnostics')
         try:
-            if saved:
-                verify_result(context, key, saved, request['payload'].get(key))
+            recovered = None
+            native_fingerprint = None
+            if context['kind'] == 'integrate':
+                recovered = begin_integration(database, context, key, operation)
+                if not recovered:
+                    prior = request['payload'].get('native_recovery', {}).get(key)
+                    native_fingerprint = check_native_recovery(proof, prior, context['deadline_at'])
+                    if not saved:
+                        effect = read_json(journal / 'integration.json')
+                        native_fingerprint = check_native_recovery(proof, effect, context['deadline_at']) or native_fingerprint
+                    if native_fingerprint and key not in request['payload']['needs_retest']:
+                        request['payload']['needs_retest'].append(key)
+            if recovered:
+                results[key] = recovered
+            elif saved:
+                verify_result(context, key, saved, request['payload'].get(key), journal)
                 results[key] = saved
             elif context['kind'] == 'prepare':
                 result = prepare(proof, context, key, database, journal, request['payload'].get(key))
@@ -100,7 +217,12 @@ def compute(database, config_path, operation, folder):
                 results[key] = result
             else:
                 result = integrate(proof, context, operation, key, journal, database, request['payload'])
+                if native_fingerprint and result.get('status') == 'verified':
+                    result['local_fingerprint'] = native_fingerprint
                 results[key] = result
+        except OverlayConflict as error:
+            results[key] = {**error.receipt, 'status': 'integration_conflict', 'candidate': proof['candidate'],
+                            'reason': str(error)}
         except (OSError, ValueError, KeyError) as error:
             results[key] = {'status': 'failed', 'reason': str(error), 'diagnostics': str(journal / 'git-diagnostics')}
             if context['kind'] == 'prepare' and request['payload'].get(key, {}).get('failed_hooks'):
@@ -165,6 +287,14 @@ def run_development_git(marker, database, config_path, project_root, *, recover=
         for common in canonical:
             if not stack.enter_context(checkout_lock(database.parent / 'development-git-locks', common)) or not reconcile(database, common):
                 return message('host_git_busy', operation_id=operation)
+            try:
+                unfinished = pending_overlay(database, common)
+            except (KeyError, OSError, ValueError):
+                return message('host_git_recovery_required', operation_id=operation)
+            if unfinished and (context['kind'] != 'integrate' or context['marker'] != unfinished['marker']
+                               or not any(p['source_root'] == unfinished['source'] and p['target_branch'] == unfinished['target_branch']
+                                          for p in context['repositories'].values())):
+                return message('host_git_busy', operation_id=operation, recovery_marker=unfinished['marker'])
         with transaction(database) as conn:
             row = conn.execute('SELECT * FROM development_git_operations WHERE operation_id=?', (operation,)).fetchone()
             request = validate_operation(Ledger(conn, load_config(config_path), utc_now()), row, config_path.parent)
@@ -219,9 +349,13 @@ def run_development_git(marker, database, config_path, project_root, *, recover=
                 try:
                     if key not in results:
                         raise ValueError('The host operation did not produce a result before stopping')
-                    verify_result(current['context'], key, results[key], current['payload'].get(key))
+                    verify_result(current['context'], key, results[key], current['payload'].get(key), folder / 'effects' / key)
                 except (OSError, ValueError, KeyError) as error:
-                    results[key] = {'status': 'failed', 'reason': str(error)}
+                    prior = results.get(key, {})
+                    if context['kind'] == 'integrate' and prior.get('status') == 'verified':
+                        results[key] = {**prior, 'status': 'integration_retest_required', 'reason': str(error)}
+                    else:
+                        results[key] = {'status': 'failed', 'reason': str(error)}
             passed = all(x.get('status') == 'verified' for x in results.values())
             result = message('host_git_completed' if passed else 'host_git_failed', operation_id=operation,
                              repositories=results, runner_receipt=proof['receipt_path'])
@@ -229,7 +363,7 @@ def run_development_git(marker, database, config_path, project_root, *, recover=
                 result['versions'] = {k: v['candidate'] for k, v in results.items() if v.get('status') == 'verified'}
             elif context['kind'] == 'integrate':
                 result['versions'] = {k: p['candidate'] for k, p in context['repositories'].items()}
-                result['merged_versions'] = {k: v['merged'] for k, v in results.items() if v.get('merged')}
+                result['merged_versions'] = {k: v['merged'] for k, v in results.items() if v.get('status') == 'verified'}
             conn.execute('UPDATE development_git_operations SET result=? WHERE operation_id=?', (encode(result), operation))
         return result
 
