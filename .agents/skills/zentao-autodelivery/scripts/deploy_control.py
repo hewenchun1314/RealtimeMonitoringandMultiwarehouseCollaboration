@@ -94,9 +94,10 @@ def frontend_request(store, item, directory):
     route, steps = read_history(store, item)
     if contract_revision_pending(steps):
         raise ValueError('接口契约变更，等待重新拆分后核验前端发布')
-    required = ('frontend.plan', 'frontend.branch_check', 'frontend.coding', 'frontend.integration')
+    required = [name for name in route['stages'] if name.startswith('frontend.') and name not in
+                (FRONTEND_DEPLOY_STAGE, 'frontend.push')]
     if any(steps.get(name, {}).get('outcome') != 'success' for name in required):
-        raise ValueError('前端发布需要成功的计划、分支核验、开发及合回回执')
+        raise ValueError('前端发布需要本单前端验证及合回成功')
     planned = steps['frontend.plan']['evidence']['applications']
     versions = steps['frontend.integration']['evidence']['merged_versions']
     if not planned or set(planned) != versions.keys():

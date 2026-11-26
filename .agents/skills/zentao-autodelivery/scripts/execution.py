@@ -563,9 +563,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             return message('evidence_required', reason=reason)
     number = stages.index(stage)
     no_work = route and route['blockers'] and not any(route['tasks'].values())
-    merge_blocked = (outcome in ('failed', 'timed_out') and not retry
-                     and (leaf == 'integration' or phase.endswith('.integration')))
-    stop_route = (missing_file or no_work or merge_blocked or
+    stop_route = (missing_file or no_work or
                   (not finished and ((routed and entry_stage) or sync_required or story_review)))
     next_stage = stages[number + 1] if not stop_route and number + 1 < len(stages) else None
     recorded_blockers = dict(reported or {}) if not retry else {}
@@ -614,8 +612,6 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         result['completion'] = '待补材料' if missing_file or clarification else data.get('completion', default_completion)
         if result['completion'] not in ('待补材料', '待验证', '阻断'):
             raise ValueError('Invalid completion for a blocked step')
-        if merge_blocked:
-            result['completion'] = '阻断'
     store.conn.execute('UPDATE attempts SET ended_at=?,outcome=?,result=? WHERE attempt_id=?',
                        (store.time, outcome, encode(result), attempt_id))
     if routed:
@@ -653,9 +649,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
             conclusion = next((step['completion'] for step in steps if 'completion' in step),
                               '阻断' if route and (route.get('blockers') or any(
                                   step.get('task_blockers') for step in steps)) else '已交付')
-            if merge_blocked:
-                conclusion = '阻断'
-            elif route and not stop_route and conclusion != '已交付':
+            if route and not stop_route and conclusion != '已交付':
                 conclusion = '待验证'
             if conclusion == '已交付' and task_evidence.first_unverified_stage(store, item):
                 conclusion = '待验证'

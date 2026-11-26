@@ -347,18 +347,15 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
     def test_fullstack_backend_then_frontend(self):
         self.drill('fullstack', '前后端')
 
-    def check_unavailable_e2e_continues_to_release_checks(self, *, merge_success=True):
+    def check_unavailable_e2e_continues_to_release_checks(self):
         from development_git_runner import run_development_git
-        from frontend_release import tag_for
         from frontend_release_runner import run_frontend_release
-        from git_delivery_runner import push_repositories, run_git_delivery
+        from git_delivery_runner import run_git_delivery
         from unittest.mock import patch
 
         self.config['runtime']['git_push_enabled'] = True
         project = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-        release = project['development']['frontend_bundle']['deployment']
-        release.pop('rancher', None)
-        self.config['development']['frontend_bundle']['deployment'] = release
+        self.config['development']['frontend_bundle']['deployment'] = project['development']['frontend_bundle']['deployment']
         self.begin_drill('frontend_only', '纯前端')
         stage = 'material_check'
         while stage != 'frontend.e2e':
@@ -374,17 +371,6 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
         self.assertEqual((result['disposition'], result['next_stage']), ('next', 'frontend.integration'))
         integration = self.record('attempt_start', stage='frontend.integration')
         self.assertEqual(integration['task_scope']['active'], ['frontend'])
-        if not merge_success:
-            failed = self.record('attempt_finish', attempt_id=integration['attempt_id'], outcome='failed',
-                                 retryable=False, summary='Target branch diverged', evidence={})
-            self.assertEqual((failed['disposition'], failed['next_stage']), ('blocked', None), failed)
-            final = self.record('complete', blockers_path='blockers.md')
-            self.assertEqual(final['conclusion'], '阻断')
-            push, deploy = final['steps'][-2:]
-            self.assertEqual([(step['stage'], step['outcome']) for step in (push, deploy)],
-                             [('frontend.push', 'skipped'), ('frontend.deploy', 'skipped')])
-            self.assertTrue(all('started_at' not in step for step in (push, deploy)))
-            return
         config_file = self.root / 'delivery-config.json'
         config_file.write_text(json.dumps(self.config), encoding='utf-8')
         marker = self.artifacts.parent.name
@@ -398,42 +384,18 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
         })
         self.assertEqual(integrated['next_stage'], 'frontend.push', integrated)
 
-        remote = self.root / 'frontend-remote.git'
-        git(self.root, 'init', '--bare', str(remote))
-        git(self.repositories['frontend'], 'remote', 'add', 'origin', str(remote))
-
-        def stopped(attempt_id, phase):
-            return {'attempt_id': attempt_id, 'phase': phase, 'outcome': 'success', 'stop_confirmed': True,
-                    'stop_evidence': {'owned_processes_active_after_stop': 0}}
-
-        def push_locally(attempt_id, phase, deadline, cwd, output, prompt, argv, **kwargs):
-            push_repositories(json.loads(Path(argv[-2]).read_text(encoding='utf-8')), Path(argv[-1]))
-            return stopped(attempt_id, phase)
-
-        def publish_fixture(attempt_id, phase, deadline, cwd, output, prompt, argv, **kwargs):
-            request = json.loads(Path(argv[-3]).read_text(encoding='utf-8'))
-            self.assertTrue(request['git_push_verified'])
-            self.assertEqual({key: app['sha'] for key, app in request['applications'].items()}, merged['merged_versions'])
-            sha = git(remote, 'rev-parse', 'refs/heads/' + request['applications'][self.key]['branch'])
-            self.assertEqual(sha, merged['merged_versions'][self.key])
-            Path(argv[-1]).write_text(json.dumps({
-                'status': 'published', 'versions': merged['merged_versions'], 'remote_versions': {self.key: sha},
-                'image': tag_for(request), 'digest': 'sha256:' + 'a' * 64, 'config_digest': 'sha256:' + 'b' * 64,
-                'stopped_ports': release['local_ports'], 'base_image': release['base_image'],
-            }), encoding='utf-8')
-            return stopped(attempt_id, phase)
-
-        with (patch('git_delivery_runner.run_stage', side_effect=push_locally),
-              patch('frontend_release_runner.run_stage', side_effect=publish_fixture)):
+        with patch('git_delivery_runner.run_stage') as push, patch('frontend_release_runner.run_stage') as publish:
             pushed = run_git_delivery(marker, self.database, config_file, self.root)
-            self.assertEqual((pushed['outcome'], pushed['next_stage']), ('success', 'frontend.deploy'), pushed)
+            self.assertEqual((pushed['outcome'], pushed['next_stage']), ('skipped', 'frontend.deploy'), pushed)
             released = run_frontend_release(marker, self.database, config_file, self.root)
-            self.assertEqual((released['outcome'], released['disposition']), ('success', 'close'), released)
+            self.assertEqual((released['outcome'], released['disposition']), ('skipped', 'close'), released)
+            push.assert_not_called()
+            publish.assert_not_called()
 
         final = self.record('complete', blockers_path='blockers.md')
         self.assertEqual(final['conclusion'], '待验证')
         self.assertEqual([step['outcome'] for step in final['steps'][-4:]],
-                         ['failed', 'success', 'success', 'success'])
+                         ['failed', 'success', 'skipped', 'skipped'])
         self.assertTrue(all(step.get('started_at') for step in final['steps'][-4:]))
         self.assertEqual(self.record('recover', recovery_id='credentials-restored', evidence='Login available')['stage'],
                          'frontend.e2e')
@@ -444,9 +406,6 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
 
     def test_story_continues_to_release_checks_after_e2e_failure(self):
         self.check_unavailable_e2e_continues_to_release_checks()
-
-    def test_failed_frontend_merge_skips_push_and_deployment(self):
-        self.check_unavailable_e2e_continues_to_release_checks(merge_success=False)
 
     def test_independent_frontend_is_verified_and_merged_after_backend_blocker(self):
         self.begin_drill('fullstack', '前后端')
@@ -577,9 +536,9 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             self.assertEqual(rejected['status'], 'evidence_required', rejected)
         outcome = self.record('attempt_finish', attempt_id=first['attempt_id'], outcome='failed', retryable=False,
                               summary='Only the primary service merged', evidence=partial)
-        self.assertEqual((outcome['disposition'], outcome['next_stage']), ('blocked', None), outcome)
+        self.assertEqual(outcome['disposition'], 'close', outcome)
         final = self.record('complete', blockers_path='blockers.md')
-        self.assertEqual(final['conclusion'], '阻断')
+        self.assertEqual(final['conclusion'], '待验证')
         self.assertIn(merged_first, final['delivery_summary'])
         self.assertEqual(git(secondary, 'rev-parse', 'HEAD'), blocked_target)
 

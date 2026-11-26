@@ -214,6 +214,13 @@ def _push_result(route, stages, side, facts):
         return '已合回版本待远端核验 ' + '、'.join(pending)
 
 
+def verified_task_merge(stages, side, task, *, skip_e2e=False):
+    facts = {}
+    if _side_result(stages, side, task, facts, {}, skip_e2e=skip_e2e):
+        return {}
+    return facts[side]['merged']
+
+
 def evaluate(route, stages, history=None, *, deployment_targets=None):
     from route_evidence import pushed_backend_versions
     from route_execution import blocked_tasks, handoff_tasks

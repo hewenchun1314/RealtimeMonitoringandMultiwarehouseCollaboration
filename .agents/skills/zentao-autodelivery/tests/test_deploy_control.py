@@ -76,16 +76,15 @@ class DeployWorkerTests(unittest.TestCase):
             conn.execute("INSERT INTO dispatches VALUES(?,?,'desktop','started','')", (f'request-{number}', number))
             stages = [('split', {}, {'route': route}), ('backend.plan', {'services': [service]}, {}),
                       ('backend.code_review', {'versions': {service: self.sha}}, {}),
-                      ('backend.coding', {'versions': {service: self.sha}}, {}),
-                      ('backend.acceptance', {'versions': {service: self.sha}}, {}),
                       ('backend.integration', {'merged_versions': {service: self.sha}}, {})]
+            if accepted:
+                stages.insert(3, ('backend.acceptance', {'versions': {service: self.sha}}, {}))
             for stage, evidence, extra in stages:
                 result = {'summary': stage, 'evidence': evidence, 'phase': 'verify', 'terminal_step': True, **extra}
                 conn.execute("""INSERT INTO attempts(attempt_id,item_seq,run_round,stage,retry_number,
                              started_at,ended_at,outcome,result,phase,phase_started_at)
-                             VALUES(?,?,1,?,0,'','',?,?,'verify','')""",
-                             (f'{marker}-{stage}', number, stage,
-                              'failed' if stage == 'backend.acceptance' and not accepted else 'success', encode(result)))
+                             VALUES(?,?,1,?,0,'','','success',?,'verify','')""",
+                             (f'{marker}-{stage}', number, stage, encode(result)))
         return marker
 
     def action(self, operation, marker, **fields):
@@ -120,17 +119,15 @@ class DeployWorkerTests(unittest.TestCase):
                              evidence={'services': {}, 'task_blockers': {'B1': 'Release failed'}})
         self.assertEqual((result['disposition'], result['next_stage']), ('next', 'handoff'))
 
-    def test_backend_deployment_claim_after_failed_acceptance_and_successful_merge(self):
-        marker = self.setup_item(1, accepted=False)
-        claim = self.action('claim', marker)
-        self.assertFalse(claim.get('blocked'), claim)
-        self.assertEqual(claim['requests']['smart-geo']['sha'], self.sha)
-
-    def test_revoked_target_blocks_external_writes(self):
-        marker = self.setup_item(1)
+    def test_missing_acceptance_or_revoked_target_blocks_external_writes(self):
+        first = self.setup_item(1, accepted=False)
+        second = self.setup_item(2)
+        claim = self.action('claim', first)
+        self.assertTrue(claim.get('blocked'), claim)
+        self.assertFalse(claim['requests'])
         self.config['development']['backend_bundle']['services']['smart-geo']['deployment']['enabled'] = False
         self.config_path.write_text(encode(self.config), encoding='utf-8')
-        revoked = self.action('claim', marker)
+        revoked = self.action('claim', second)
         self.assertTrue(revoked.get('blocked'), revoked)
         self.assertFalse(revoked['requests'])
 
