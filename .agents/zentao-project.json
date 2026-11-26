@@ -32,6 +32,9 @@
     "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true,
     "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"],
+    "worker_git_integration_worktrees": {
+      "backend:smart-geo": { "branch": "AI-development", "path": "../srv-workspace/smart-geo" }
+    },
     "worker_git_write_repositories": [
       "backend:smart-geo",
       "backend:model-manage-srv",
@@ -62,7 +65,7 @@
   },
   "development": {
     "allowed_requirement_types": ["frontend_only", "backend_only", "fullstack"],
-    "max_concurrent_items": 1,
+    "max_concurrent_items": 2,
     "max_retries_per_step": 3,
     "frontend_bundle": {
       "name": "micro-hnf-universal-subapp",
@@ -280,6 +283,7 @@
     "backend_dependencies": "后端的按需依赖。access 省略时为 read_only。writable 需要 delivery 登记目标分支、构建、单测、验收及启动命令或服务地址，工单按依赖键选择修改目标。source_path 相对于本配置文件，api_source 相对于依赖目录，used_by 填消费方服务键。",
     "monitor": "enabled 控制新单扫描和领取。interval_minutes 以分钟表示期望的监测间隔；实际唤醒时间由 Codex 桌面定时任务决定。",
     "runtime": "desktop_project_id 用于绑定工单会话。require_unattended_approval 启用无人值守权限核验。split_task_sync 控制拆分任务建单、关闭及重开。split_task_progress_sync 为新领取 Story 增加实际开工和阻塞备注回写。已领工单沿用快照。",
+    "runtime.worker_git_integration_worktrees": "按端和仓库登记可合回的目标分支及实际工作树。相对路径基于本配置文件，工单快照和当前配置必须一致。",
     "development": {
       "max_concurrent_items": "同时占用执行名额的工单上限。",
       "max_retries_per_step": "每一步首次尝试失败后允许重试的次数。填 3 表示首次执行加最多 3 次重试。",

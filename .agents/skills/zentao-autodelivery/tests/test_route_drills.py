@@ -92,14 +92,15 @@ class RouteDrills(unittest.TestCase):
         return self.call('record', {'action': action, 'event_id': uuid4().hex, 'item': self.item,
                                     **self.binding, **fields})
 
-    def admit(self):
+    def admit(self, *, baseline=True):
         scan = {'action': 'scan', 'complete': True, 'instance': self.item['instance'], 'project_id': '1',
                 'project_name': self.config['zentao']['project_name']}
-        self.assertEqual(self.call('claim', dict(scan, scan_id='1', items=[],
-                                                 observed_at=self.now.isoformat()))['status'], 'baseline')
-        entry = {'kind': self.item['kind'], 'id': '17', 'title': 'Show status', 'status': 'active', 'priority': 1,
+        if baseline:
+            self.assertEqual(self.call('claim', dict(scan, scan_id='1', items=[],
+                                                     observed_at=self.now.isoformat()))['status'], 'baseline')
+        entry = {'kind': self.item['kind'], 'id': self.item['id'], 'title': 'Show status', 'status': 'active', 'priority': 1,
                  'assigned_to': 'drill'}
-        self.assertEqual(self.call('claim', dict(scan, scan_id='2', items=[entry],
+        self.assertEqual(self.call('claim', dict(scan, scan_id=uuid4().hex, items=[entry],
                                                  observed_at=self.now.isoformat()))['candidate'], self.item)
         receipt = self.call('claim', {'action': 'reserve', 'item': self.item, 'observed_at': self.now.isoformat(),
                                       'assigned_to': 'drill', 'status': 'active', 'desktop_project_id': 'drill'})

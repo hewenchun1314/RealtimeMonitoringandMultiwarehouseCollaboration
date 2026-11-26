@@ -3,7 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -101,6 +101,9 @@ def worker_prompt(operation, item):
         '前后端 branch_prepare、candidate_commit、integration_merge 只登记固定宿主 Git 请求。'
         '返回 host_git_worker_required 时立即结束当前轮次；Windows 启动器确认主进程及任务同步进程均已停止后执行，'
         '随后续接原聊天。恢复后用相同 event_id 和原提交数据读回，或用 host_git_status 按 operation_id 查询。'
+        '逐仓返回 integration_candidate_ready 时，在回执的独立工作树验证确切 integration_candidate，'
+        '成功后以新事件传 verified_integration_candidates 和 verification。目标前进后按新回执重新验证。'
+        'integration_conflict 按受阻任务记录冲突文件并保留已有合回结果。'
         '沙箱内只编辑、构建、测试及只读 Git 核验；禁止自行 fetch、worktree add、commit、checkout 或 merge，禁止跳过原有 hooks。'
         '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
         '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
@@ -213,7 +216,14 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
                 return {**last_turn, 'status': 'worker_host_git_blocked',
                         'development_git': {'status': 'host_git_runtime_blocked'}}
             last_git = run_development_git(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT, recover=True)
-            if last_git['status'] not in ('host_git_completed', 'host_git_failed', 'host_git_inactive', 'host_git_not_pending'):
+            if last_git['status'] == 'host_git_busy':
+                wait_until = min(deadline, datetime.fromisoformat(development_git['request']['context']['deadline_at']))
+                remaining = (wait_until - utc_now()).total_seconds()
+                if remaining > 0:
+                    time.sleep(min(1, remaining))
+                    continue
+            if last_git['status'] not in ('host_git_completed', 'host_git_failed', 'host_git_retest_required',
+                                          'host_git_inactive', 'host_git_not_pending'):
                 return {**last_turn, 'status': 'worker_host_git_blocked', 'development_git': last_git}
             continue
         material = pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)

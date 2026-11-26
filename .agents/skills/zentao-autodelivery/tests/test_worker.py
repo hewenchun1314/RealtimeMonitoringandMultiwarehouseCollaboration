@@ -53,6 +53,39 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result['status'], 'worker_host_git_stop_unverified')
         host.assert_not_called()
 
+    def test_busy_host_git_waits_then_resumes_chat_for_integration_candidate(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'backend.integration'}
+        now = worker.utc_now()
+        request = {'status': 'host_git_pending', 'request': {
+            'context': {'deadline_at': (now + worker.timedelta(minutes=1)).isoformat()}}}
+        receipts = [{'status': 'host_git_busy'}, {'status': 'host_git_retest_required'}]
+        calls = []
+
+        def pending(*args):
+            return request if receipts else {'status': 'host_git_not_pending'}
+
+        def host(*args, **kwargs):
+            calls.append('host')
+            return receipts.pop(0)
+
+        def chat(current):
+            self.assertIs(current, item)
+            calls.append('chat')
+            return {'receipt_path': 'chat', 'stop_confirmed': True, 'outcome': 'success'}, None
+
+        with (
+            patch.object(worker, 'read_item', return_value=item),
+            patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}),
+            patch.object(worker, 'pending_development_git', side_effect=pending),
+            patch.object(worker, 'run_development_git', side_effect=host),
+            patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}),
+            patch.object(worker.time, 'sleep') as sleep,
+        ):
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, chat, recover_git=lambda _: True)
+        self.assertEqual(calls, ['host', 'host', 'chat'])
+        self.assertEqual(result['development_git']['status'], 'host_git_retest_required')
+        sleep.assert_called_once_with(1)
+
     def deployment_route(self, peek, deployments, chat_outcomes):
         item = {'state': 'running', 'chat_id': '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'}
         calls = []

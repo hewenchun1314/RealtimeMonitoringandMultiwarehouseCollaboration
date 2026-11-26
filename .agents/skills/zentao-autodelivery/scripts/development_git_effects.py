@@ -73,6 +73,24 @@ def inventory(source, deadline):
     return result
 
 
+def checked_out_target_paths(source, branch, deadline):
+    entries = inventory(source, deadline)
+    checked = [Path(entry['worktree']).resolve() for entry in entries if entry.get('branch') == branch]
+    if len(checked) != 1 or checked[0] == source or entries[0].get('branch') != branch:
+        return checked
+
+    # Git can list an absorbed submodule's primary checkout at its Git directory.
+    git_dir = Path(git(source, 'rev-parse', '--absolute-git-dir', deadline=deadline)).resolve()
+    if checked[0] != git_dir or git_dir != common_directory(source, deadline):
+        return checked
+    worktree = git(source, 'config', '--local', '--get', 'core.worktree',
+                   deadline=deadline, allowed=(0, 1))
+    if (worktree and (git_dir / worktree).resolve() == source
+            and git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) == branch):
+        return [source]
+    return checked
+
+
 def tracked_dirty(root, deadline):
     return bool(git(root, '--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no',
                     '--ignore-submodules=untracked', deadline=deadline))
@@ -311,6 +329,62 @@ def commit(proof, entry, context, operation, key, journal):
     return {'status': 'verified', 'candidate': after}
 
 
+def integration_checkout(temporary, operation):
+    if not re.fullmatch(r'[0-9a-f]{64}', operation):
+        raise ValueError('Invalid integration preparation operation')
+    checkout = temporary.with_name(temporary.name + '-combine-' + operation[:16])
+    if checkout.resolve() != checkout:
+        raise ValueError('The integration candidate checkout must remain in the ledger worktree root')
+    return checkout
+
+
+def combined_candidate(source, temporary, operation, key, journal, tip, candidate, deadline, payload):
+    receipt = journal / 'integration-candidate.json'
+    saved = json.loads(receipt.read_text(encoding='utf-8')) if receipt.is_file() else None
+    prior = payload.get('prepared_candidates', {}).get(key, {})
+    prepared = saved or prior
+    if prepared.get('integration_base') == tip and prepared.get('candidate') == candidate:
+        if prepared['status'] == 'integration_conflict':
+            return prepared
+        checkout = integration_checkout(temporary, prepared['preparation_operation'])
+        combined = prepared['integration_candidate']
+        if (str(checkout) != prepared['worktree'] or common_directory(checkout, deadline) != common_directory(source, deadline)
+                or git(checkout, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) is not None
+                or git(checkout, 'rev-list', '--parents', '-n', '1', 'HEAD', deadline=deadline).split()
+                != [combined, tip, candidate] or tracked_dirty(checkout, deadline)):
+            raise ValueError('The prepared integration candidate or its checkout has changed')
+        return prepared
+
+    checkout = integration_checkout(temporary, operation)
+    if checkout.exists():
+        raise ValueError('An interrupted integration candidate checkout exists; retain it and use a new operation')
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    ensure_hooks(source, source, deadline, checkout=tip)
+    with hooks(source, journal / 'combine-checkout-hooks', deadline) as (opts, env):
+        git(source, *opts, 'worktree', 'add', '--detach', '--', str(checkout), tip, deadline=deadline, env=env)
+    ensure_hooks(source, checkout, deadline)
+    prepared = {'candidate': candidate, 'integration_base': tip,
+                'preparation_operation': operation, 'worktree': str(checkout)}
+    try:
+        with hooks(checkout, journal / 'combine-merge-hooks', deadline) as (opts, env):
+            git(checkout, *opts, 'merge', '--no-ff', '--no-edit', '--no-autostash', '--no-overwrite-ignore',
+                '-m', 'Merge validated work item candidate ' + candidate, candidate, deadline=deadline, env=env)
+    except ValueError:
+        conflicts = git(checkout, 'diff', '--name-only', '--diff-filter=U', '-z', deadline=deadline)
+        if not conflicts:
+            raise
+        prepared.update(status='integration_conflict', conflicts=conflicts.rstrip('\0').split('\0'),
+                        reason='The candidate conflicts with the latest target; resolve and verify a new work item candidate')
+    else:
+        commit, *parents = git(checkout, 'rev-list', '--parents', '-n', '1', 'HEAD', deadline=deadline).split()
+        if parents != [tip, candidate] or tracked_dirty(checkout, deadline):
+            raise ValueError('Integration hooks changed the prepared merge parents or left tracked/index edits')
+        prepared.update(status='integration_candidate_ready', integration_candidate=commit,
+                        reason='Verify this exact combined commit before advancing the target')
+    write_json(receipt, prepared)
+    return prepared
+
+
 def integrate(proof, context, operation, key, journal, database, payload):
     deadline = context['deadline_at']
     source = Path(proof['source_root'])
@@ -324,7 +398,7 @@ def integrate(proof, context, operation, key, journal, database, payload):
         remote = 'refs/remotes/origin/' + proof['target_branch']
         tip = git(source, 'rev-parse', '--verify', remote, deadline=deadline)
         git(source, 'branch', '--', proof['target_branch'], tip, deadline=deadline)
-    checked = [Path(x['worktree']).resolve() for x in inventory(source, deadline) if x.get('branch') == branch]
+    checked = checked_out_target_paths(source, branch, deadline)
     worktrees_root = database.resolve().parent / 'worktrees'
     temporary = worktrees_root / (proof['worktree_branch'].split('/')[-1] + '-integration') / key
     if temporary.resolve() != temporary or not temporary.is_relative_to(worktrees_root):
@@ -347,13 +421,21 @@ def integrate(proof, context, operation, key, journal, database, payload):
                     legacy = previous / 'integration-worktree'
                     if recorded.get('worktree') == str(legacy):
                         owned.add(legacy)
-    if len(checked) > 1 or any(path != source and path not in owned for path in checked):
+    registered = proof.get('integration_worktree')
+    external = Path(registered) if registered else None
+    if len(checked) > 1 or any(path not in (source, external) and path not in owned for path in checked):
         raise ValueError('The target branch is checked out in another user worktree')
     if tracked_dirty(source, deadline):
         raise ValueError('The source checkout has tracked/index edits; preserve and reconcile them')
     if temporary.exists() and temporary not in owned:
         raise ValueError('The integration checkout path lacks matching item ownership evidence')
     merge_root = checked[0] if checked else temporary
+    if merge_root == external and merge_root != source:
+        if common_directory(merge_root, deadline) != common_directory(source, deadline):
+            raise ValueError('The authorized integration checkout belongs to a different repository')
+        if git(merge_root, '--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=normal',
+               deadline=deadline):
+            raise ValueError('The authorized integration checkout is dirty; preserve and reconcile its work')
     if merge_root.exists() and tracked_dirty(merge_root, deadline):
         return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
                 'worktree': str(merge_root), 'reason': 'Clean and retest the original item-owned integration checkout'}
@@ -373,11 +455,19 @@ def integrate(proof, context, operation, key, journal, database, payload):
         if (key in payload.get('needs_retest', []) or effect.exists()) and not str(payload.get('verification', '')).strip():
             return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
                     'worktree': str(merge_root), 'reason': 'Verify failed or interrupted integration hooks and retest this merged SHA'}
-        if merge_root != source and merge_root.exists():
+        if merge_root in owned and merge_root.exists():
             git(source, 'worktree', 'remove', '--', str(merge_root), deadline=deadline)
         return {'status': 'verified', 'candidate': candidate, 'merged': tip}
+    selected = candidate
+    prepared = None
     if git(source, 'merge-base', '--is-ancestor', tip, candidate, deadline=deadline, allowed=(0, 1)) is None:
-        raise ValueError('This fixed operation supports only fast-forward/already-contained results; resolve divergence through a separate controlled path')
+        prepared = combined_candidate(source, temporary, operation, key, journal, tip, candidate, deadline, payload)
+        if (prepared['status'] != 'integration_candidate_ready'
+                or payload.get('verified_integration_candidates', {}).get(key) != prepared['integration_candidate']
+                or not str(payload.get('verification', '')).strip()
+                or prepared['preparation_operation'] == operation):
+            return prepared
+        selected = prepared['integration_candidate']
     if merge_root == temporary and not temporary.exists():
         ensure_hooks(source, source, deadline, checkout=tip)
         temporary.parent.mkdir(parents=True, exist_ok=True)
@@ -388,9 +478,13 @@ def integrate(proof, context, operation, key, journal, database, payload):
     else:
         write_json(effect, {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(merge_root)})
     ensure_hooks(source, merge_root, deadline)
+    if (git(merge_root, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != branch
+            or git(merge_root, 'rev-parse', 'HEAD', deadline=deadline) != tip
+            or tracked_dirty(merge_root, deadline)):
+        raise ValueError('The integration checkout or target tip changed; recheck before merging')
     try:
         with hooks(merge_root, journal, deadline) as (opts, env):
-            git(merge_root, *opts, 'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', candidate, deadline=deadline, env=env)
+            git(merge_root, *opts, 'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', selected, deadline=deadline, env=env)
     except ValueError:
         merged = git(source, 'rev-parse', branch, deadline=deadline)
         if git(source, 'merge-base', '--is-ancestor', candidate, merged, deadline=deadline, allowed=(0, 1)) is not None:
@@ -402,6 +496,11 @@ def integrate(proof, context, operation, key, journal, database, payload):
     if tracked_dirty(merge_root, deadline):
         return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
                 'worktree': str(merge_root), 'reason': 'Integration hooks changed tracked/index files; clean and retest before success'}
-    if merge_root != source:
+    if merged != selected:
+        raise ValueError('The target advanced to a different commit during integration')
+    if merge_root != source and merge_root != external:
         git(source, 'worktree', 'remove', '--', str(merge_root), deadline=deadline)
-    return {'status': 'verified', 'candidate': candidate, 'merged': merged}
+    result = {'status': 'verified', 'candidate': candidate, 'merged': merged}
+    if prepared:
+        result['verification_worktree'] = prepared['worktree']
+    return result
