@@ -72,7 +72,7 @@ class GitDeliveryWorkerTests(unittest.TestCase):
         return subprocess.check_output(['git', *args], cwd=directory, text=True,
                                        stderr=subprocess.DEVNULL).strip()
 
-    def setup_item(self, side, keys, *, accepted=True, deployment=False):
+    def setup_item(self, side, keys, *, accepted=True, deployment=False, unit_test_passed=True):
         workspace = self.root / side
         self.config['workspaces'][side] = side
         self.config['backend_dependencies'] = {}
@@ -92,7 +92,8 @@ class GitDeliveryWorkerTests(unittest.TestCase):
             self.git(repo, 'commit', '--allow-empty', '-m', 'merged')
             repositories[key] = (repo.resolve(), remote, self.git(repo, 'rev-parse', 'HEAD'))
         scope = side + '_only'
-        stages = route_stages(scope, git_push_enabled=True, deploy_enabled=deployment)
+        stages = route_stages(scope, git_push_enabled=True, deploy_enabled=deployment,
+                              frontend_deploy_enabled=deployment)
         route = {'scope': scope, 'source': 'config', 'tasks': {'backend': [], 'frontend': []},
                  'e2e_enabled': True, 'blockers': [], 'stages': stages}
         self.config_path.write_text(encode(self.config), encoding='utf-8')
@@ -115,7 +116,9 @@ class GitDeliveryWorkerTests(unittest.TestCase):
                           'terminal_step': True}
                 if stage == 'split':
                     result['route'] = route
-                outcome = 'failed' if not accepted and stage.endswith(('.acceptance', '.e2e')) else 'success'
+                failed = (not accepted and stage.endswith(('.acceptance', '.e2e'))
+                          or not unit_test_passed and stage.endswith('.unit_test'))
+                outcome = 'failed' if failed else 'success'
                 conn.execute("""INSERT INTO attempts(attempt_id,item_seq,run_round,stage,retry_number,
                              started_at,ended_at,outcome,result,phase,phase_started_at)
                              VALUES(?,1,1,?,0,'','',?,?,'verify','')""",
@@ -144,11 +147,10 @@ class GitDeliveryWorkerTests(unittest.TestCase):
         self.assertEqual(self.git(first_remote, 'rev-parse', 'refs/heads/AI-development'), first_sha)
         self.assertEqual(self.git(second_remote, 'rev-parse', 'refs/heads/AI-development'), second_sha)
 
-    def test_partial_acceptance_and_integration_push_only_the_verified_repository(self):
+    def test_partial_merge_blocks_push_and_deployment_even_with_a_previous_push_receipt(self):
         self.config['runtime']['split_task_sync'] = True
         repos = self.setup_item('backend', ['smart-geo', 'model-manage-srv'], deployment=True)
-        _, verified_remote, sha = repos['smart-geo']
-        _, pending_remote, _ = repos['model-manage-srv']
+        _, _, sha = repos['smart-geo']
         versions = {key: value[2] for key, value in repos.items()}
         updates = {
             'backend.plan': ('success', {'services': list(repos),
@@ -162,22 +164,29 @@ class GitDeliveryWorkerTests(unittest.TestCase):
                 conn.execute('UPDATE attempts SET outcome=?,result=? WHERE stage=?', (
                     outcome, encode({'evidence': evidence, 'phase': 'verify', 'terminal_step': True,
                                      'summary': stage}), stage))
-        result = self.run_push()
-        self.assertEqual(result.get('next_stage'), 'backend.deploy', result)
-        self.assertEqual(self.git(verified_remote, 'rev-parse', 'refs/heads/AI-development'), sha)
-        missing = subprocess.run(['git', '-C', str(pending_remote), 'show-ref', '--verify', '--quiet',
-                                  'refs/heads/AI-development'], check=False)
-        self.assertNotEqual(missing.returncode, 0)
-        claim = deployment_action('claim', self.marker, self.database, self.config_path)
-        self.assertEqual(set(claim['requests']), {'smart-geo'})
-        self.assertIn('model-manage-srv', claim['skipped'])
-
-    def test_failed_frontend_e2e_blocks_git_push_even_if_code_was_merged(self):
-        self.setup_item('frontend', ['shell-hub'], accepted=False)
         with patch('git_delivery_runner.run_stage') as execute:
             result = run_git_delivery(self.marker, self.database, self.config_path, self.root)
         execute.assert_not_called()
-        self.assertEqual((result['outcome'], result['disposition']), ('skipped', 'close'))
+        self.assertEqual(result['outcome'], 'skipped', result)
+        self.assertEqual(result.get('next_stage'), 'backend.deploy', result)
+        with transaction(self.database) as conn:
+            conn.execute("UPDATE attempts SET outcome='success', result=? WHERE stage='backend.push'", (encode({
+                'evidence': {'repositories': {'smart-geo': {'sha': sha}}},
+                'phase': 'verify', 'terminal_step': True, 'summary': 'Historical partial push',
+            }),))
+        claim = deployment_action('claim', self.marker, self.database, self.config_path)
+        self.assertTrue(claim.get('blocked'), claim)
+        self.assertEqual(claim['requests'], {})
+
+    def test_frontend_push_and_deployment_claim_after_failed_tests_and_successful_merge(self):
+        _, remote, sha = self.setup_item('frontend', ['shell-hub'], accepted=False, unit_test_passed=False,
+                                         deployment=True)['shell-hub']
+        result = self.run_push()
+        self.assertEqual((result['outcome'], result['next_stage']), ('success', 'frontend.deploy'), result)
+        self.assertEqual(self.git(remote, 'rev-parse', 'refs/heads/AI-development'), sha)
+        claim = deployment_action('claim', self.marker, self.database, self.config_path)
+        self.assertFalse(claim.get('blocked'), claim)
+        self.assertEqual(claim['frontend_request']['applications']['shell-hub']['sha'], sha)
 
     @unittest.skipUnless(os.name == 'nt', 'Git delivery uses Windows Job Objects')
     def test_frontend_push_runs_in_controlled_process(self):
@@ -194,8 +203,8 @@ class GitDeliveryWorkerTests(unittest.TestCase):
         self.assertEqual(claim['push_requests'], {})
         self.assertIn('smart-geo', claim['errors'])
 
-    def test_backend_push_requires_the_worker_and_advances_to_deployment(self):
-        self.setup_item('backend', ['smart-geo'], deployment=True)
+    def test_backend_push_requires_the_worker_and_advances_to_deployment_after_failed_tests(self):
+        self.setup_item('backend', ['smart-geo'], accepted=False, unit_test_passed=False, deployment=True)
         with transaction(self.database) as conn:
             item = conn.execute('SELECT * FROM work_items').fetchone()
             data = {'item': {'instance': 'fixture', 'project_id': '1', 'kind': 'story', 'id': '1'},
@@ -206,3 +215,6 @@ class GitDeliveryWorkerTests(unittest.TestCase):
         self.assertEqual(deployment_action('peek', self.marker, self.database, self.config_path)['stage'],
                          'backend.push')
         self.assertEqual(self.run_push()['next_stage'], 'backend.deploy')
+        claim = deployment_action('claim', self.marker, self.database, self.config_path)
+        self.assertFalse(claim.get('blocked'), claim)
+        self.assertIn('smart-geo', claim['requests'])

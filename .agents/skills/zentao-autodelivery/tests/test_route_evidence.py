@@ -76,7 +76,7 @@ class RouteEvidenceTests(unittest.TestCase):
         self.history['backend.plan'] = {'services': ['reports', 'archive']}
         versions = {**self.merged, 'archive': 'c' * 40}
         stages = {
-            'backend.integration': {'evidence': {'merged_versions': versions}},
+            'backend.integration': {'outcome': 'success', 'evidence': {'merged_versions': versions}},
             'backend.push': {'outcome': 'failed', 'terminal_step': True,
                              'evidence': {'repositories': {'reports': {'sha': versions['reports']}}}},
         }

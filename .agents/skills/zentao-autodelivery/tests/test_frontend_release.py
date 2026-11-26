@@ -228,7 +228,7 @@ class FrontendLedgerTests(unittest.TestCase):
         self.config_path.write_text(encode(self.config), encoding='utf-8')
         self.sha = 'a' * 40
 
-    def setup_item(self, seq, *, validated=True):
+    def setup_item(self, seq, *, merged=True):
         marker = f'fixture-{seq}'
         stages = route_stages('frontend_only', frontend_deploy_enabled=True)
         route = {'scope': 'frontend_only', 'source': 'config', 'tasks': {'backend': [], 'frontend': []},
@@ -248,7 +248,7 @@ class FrontendLedgerTests(unittest.TestCase):
                           'phase': 'verify', 'terminal_step': True}
                 if stage == 'split':
                     result['route'] = route
-                failed = stage == 'frontend.e2e' and not validated
+                failed = stage == 'frontend.integration' and not merged
                 conn.execute("""INSERT INTO attempts(attempt_id,item_seq,run_round,stage,retry_number,
                              started_at,ended_at,outcome,result,phase,phase_started_at)
                              VALUES(?,?,1,?,0,'','',?,?,'verify','')""",
@@ -258,8 +258,8 @@ class FrontendLedgerTests(unittest.TestCase):
     def action(self, operation, marker, **kwargs):
         return deployment_action(operation, marker, self.database, self.config_path, **kwargs)
 
-    def test_claim_filters_failed_e2e_and_blocks_direct_agent_attempt(self):
-        marker = self.setup_item(1, validated=False)
+    def test_claim_requires_successful_merge_and_blocks_direct_agent_attempt(self):
+        marker = self.setup_item(1, merged=False)
         with transaction(self.database) as conn:
             item = conn.execute('SELECT * FROM work_items WHERE marker=?', (marker,)).fetchone()
             fields = {'item': {'instance': 'fixture', 'project_id': '1', 'kind': 'story', 'id': '1'},
