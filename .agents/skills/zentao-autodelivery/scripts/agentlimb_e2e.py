@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import closing
+import hashlib
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 import json
 import os
@@ -131,6 +132,41 @@ def candidate_workspace(options, config, branches, versions, supplied):
     return str(workspace)
 
 
+def check_merged_checkout(repository, branch, sha):
+    from branch_check import git
+
+    root = Path(repository).resolve(strict=True)
+    if (Path(git(root, 'rev-parse', '--show-toplevel')).resolve() != root
+            or git(root, 'symbolic-ref', '--quiet', 'HEAD', allowed=(0, 1)) != 'refs/heads/' + branch
+            or git(root, 'rev-parse', 'HEAD') != sha
+            or git(root, '--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no',
+                   '--ignore-submodules=untracked')):
+        raise ValueError('Main workspace must contain the exact, clean merged checkout')
+
+
+def merged_workspace(options, config, branches, versions):
+    root = Path(options['workspace']).resolve(strict=True)
+    applications = config['development']['frontend_bundle']['applications']
+    if not (root / 'package.json').is_file() or not versions or versions.keys() != branches.keys():
+        raise ValueError('Acceptance requires the merged frontend workspace')
+    # The shell serves every child application and must use a committed startup definition.
+    from branch_check import git
+    root_sha = git(root, 'rev-parse', 'HEAD')
+    root_branch = git(root, 'symbolic-ref', '--short', 'HEAD')
+    check_merged_checkout(root, root_branch, root_sha)
+    checkouts = {str(root): {'repository': str(root), 'branch': root_branch, 'sha': root_sha}}
+    for app, sha in versions.items():
+        proof, application = branches[app], applications[app]
+        checkout = (root / application['repository']).resolve(strict=True)
+        branch = application['branch']
+        if (not checkout.is_relative_to(root) or checkout != Path(proof['source_root']).resolve(strict=True)
+                or branch != proof['target_branch']):
+            raise ValueError('Merged checkout must match the configured application and target branch')
+        check_merged_checkout(checkout, branch, sha)
+        checkouts[str(checkout)] = {'repository': str(checkout), 'branch': branch, 'sha': sha}
+    return checkouts
+
+
 def acceptance_setup(config, options, args):
     from deploy_state import DEPLOY_STAGE, configured_targets, deployed_receipt_matches
     from route_execution import read_history
@@ -149,10 +185,20 @@ def acceptance_setup(config, options, args):
     if not route or not attempt or item['state'] != 'running' or effective_stage != 'frontend.e2e':
         raise ValueError('Only the current frontend E2E attempt can run formal acceptance')
     branches = stages['frontend.branch_check']['evidence']['repositories']
-    versions = stages['frontend.coding']['evidence']['versions']
+    if route.get('post_merge_e2e'):
+        if args.candidate_workspace or args.scenario.suffix.lower() != '.json':
+            raise ValueError('Post-merge acceptance requires a JSON scenario on the main workspace')
+        integration = stages.get('frontend.integration', {})
+        if integration.get('outcome') != 'success':
+            raise ValueError('Post-merge acceptance requires successful integration')
+        versions = integration['evidence']['merged_versions']
+        options.update(postMerge=True, startupWorkspace=options['workspace'],
+                       mergedCheckouts=merged_workspace(options, config, branches, versions))
+    else:
+        versions = stages['frontend.coding']['evidence']['versions']
+        options['startupWorkspace'] = candidate_workspace(options, config, branches, versions, args.candidate_workspace)
     if {row['app'] for row in options['resources']} != versions.keys():
         raise ValueError('Candidate resources must identify every changed frontend application')
-    options['startupWorkspace'] = candidate_workspace(options, config, branches, versions, args.candidate_workspace)
     options['candidateVersions'] = versions
     options['candidateBranches'] = branches
     options['attemptId'] = attempt['attempt_id']
@@ -174,6 +220,8 @@ def acceptance_setup(config, options, args):
            for service, receipt in deployment.items()):
         raise ValueError('Deployment versions do not match the common handoff gateway')
     options['gatewayUrl'] = gateway
+    if options.get('postMerge'):
+        options['gatewayHash'] = hashlib.sha256(gateway.rstrip('/').encode()).hexdigest()
     return deployment
 
 
@@ -206,24 +254,83 @@ def http_ready(url):
         connection.close()
 
 
-def prepare_frontend(config, options, startup_log):
+def stop_frontend_ports(ports):
+    port_numbers = ','.join(str(port) for port in sorted(ports))
+    script = f'''
+$ErrorActionPreference = 'Stop'
+$ports = @({port_numbers})
+$listeners = @(Get-NetTCPConnection -State Listen | Where-Object {{ $_.LocalPort -in $ports }})
+foreach ($group in @($listeners | Group-Object OwningProcess)) {{
+    $owner = [int]$group.Name
+    if ($owner -le 4 -or $owner -eq {os.getpid()} -or $owner -eq $PID) {{ throw "Protected listener: $owner" }}
+    $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
+    if ($null -eq $process) {{ continue }}
+    $started = $process.StartTime
+    if (-not (Get-NetTCPConnection -State Listen | Where-Object {{ $_.OwningProcess -eq $owner -and $_.LocalPort -in $ports }})) {{ continue }}
+    $current = Get-Process -Id $owner -ErrorAction SilentlyContinue
+    if ($null -ne $current -and $current.StartTime -eq $started) {{ Stop-Process -InputObject $current -Force }}
+}}
+for ($i = 0; $i -lt 25; $i++) {{
+    if (-not (Get-NetTCPConnection -State Listen | Where-Object {{ $_.LocalPort -in $ports }})) {{
+        ConvertTo-Json -InputObject @($listeners | ForEach-Object {{ @{{port = $_.LocalPort; pid = $_.OwningProcess}} }}) -Compress
+        exit 0
+    }}
+    Start-Sleep -Milliseconds 200
+}}
+throw 'Configured frontend ports remain occupied'
+'''
+    completed = subprocess.run(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+                               check=True, capture_output=True, timeout=30)
+    return json.loads(completed.stdout)
+
+
+def get_port(url):
+    return url.port or (443 if url.scheme == 'https' else 80)
+
+
+def prepare_frontend(config, options, startup_log, *, restart=False):
     origin = urlsplit(options['baseUrl'])
-    entry_port = origin.port or (443 if origin.scheme == 'https' else 80)
+    entry_port = get_port(origin)
     gateway = options.get('gatewayUrl')
     candidate = bool(options.get('startupWorkspace') or gateway)
-    if port_open(origin.hostname, entry_port):
+    post_merge = options.get('postMerge', False)
+    if not post_merge and port_open(origin.hostname, entry_port):
         return ({'mode': 'start-failed', 'reason': 'candidate-port-in-use'} if candidate else {'mode': 'reused'})
 
     extra_ports = browser_config(config).get('preflight_startup_ports', [])
     if options.get('resources'):
         resource_origins = [urlsplit(row['url']) for row in options['resources']]
-        extra_ports = sorted({url.port or (443 if url.scheme == 'https' else 80) for url in resource_origins})
+        extra_ports = sorted({get_port(url) for url in resource_origins})
     if not isinstance(extra_ports, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in extra_ports):
         raise ValueError('Preflight startup ports must be valid TCP port numbers')
+    ports = dict.fromkeys([entry_port, *extra_ports])
     command = config['start_command']
     if not isinstance(command, str) or not command.strip():
         raise ValueError('Preflight requires a frontend start command')
-    if candidate and any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
+    start_options = {}
+    reclaimed = None
+    if post_merge:
+        configured_ports = config.get('startup_ports')
+        if (not isinstance(configured_ports, list) or not configured_ports
+                or any(type(port) is not int or not 1 <= port <= 65535 for port in configured_ports)
+                or not ports.keys() <= set(configured_ports)):
+            raise ValueError('All formal E2E ports must be in the configured startup ports')
+        if (not restart and all(port_open(origin.hostname, port) for port in ports)
+                and http_ready(options['baseUrl'] + options['loginPath'])):
+            return {'mode': 'reused', **({'gateway': gateway} if gateway else {})}
+        try:
+            reclaimed = stop_frontend_ports(sorted(set(configured_ports)))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {'mode': 'start-failed', 'reason': 'frontend-ports-not-released', 'ports': sorted(set(configured_ports))}
+        witness = Path(__file__).with_name('agentlimb_resource_witness.cjs').resolve()
+        environment = dict(os.environ)
+        environment['NODE_OPTIONS'] = f'{environment.get("NODE_OPTIONS", "")} --require="{witness.as_posix()}"'.strip()
+        witness_config = {'origin': options['baseUrl'], 'resources': options.get('resources', [])}
+        if gateway:
+            witness_config['gatewayHash'] = options['gatewayHash']
+        environment['ZENTAO_E2E_WITNESS'] = json.dumps(witness_config)
+        start_options['env'] = environment
+    elif candidate and any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
         return {'mode': 'start-failed', 'reason': 'candidate-port-in-use'}
     if gateway:
         gateway = deployment_gateway(gateway)
@@ -238,13 +345,14 @@ def prepare_frontend(config, options, startup_log):
             # The Windows stage runner owns the candidate process tree.
             process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
                                        cwd=options.get('startupWorkspace', options['workspace']), stdin=subprocess.DEVNULL,
-                                       stdout=output, stderr=subprocess.STDOUT)
+                                       stdout=output, stderr=subprocess.STDOUT, **start_options)
         except OSError:
             return {'mode': 'start-failed', 'reason': 'start-command-unavailable', 'log': str(startup_log)}
     launched = {'pid': process.pid, 'log': str(startup_log)}
+    if reclaimed:
+        launched['released_listeners'] = reclaimed
     if gateway:
         launched['gateway'] = gateway
-    ports = dict.fromkeys([entry_port, *extra_ports])
     deadline = monotonic() + 120
     while monotonic() < deadline:
         if (exit_code := process.poll()) is not None:
@@ -253,6 +361,17 @@ def prepare_frontend(config, options, startup_log):
             return {'mode': 'started', **launched}
         sleep(1)
     return {'mode': 'start-failed', 'reason': 'startup-timeout', **launched}
+
+
+def browser_result(options, args):
+    command = ['node', str(Path(__file__).with_suffix('.cjs'))]
+    try:
+        completed = subprocess.run(command, input=json.dumps(options).encode('utf-8'), capture_output=True,
+                                   timeout=None if args.scenario else 100, cwd=PROJECT_ROOT)
+        report = completed.stdout.splitlines()[-1:]
+        return json.loads(report[0]) if report else {'status': 'blocked', 'stage': 'browser-runner'}
+    except subprocess.TimeoutExpired:
+        return {'status': 'blocked', 'stage': 'browser-timeout'}
 
 
 def run_browser(config, options, args, *, deployment=None):
@@ -267,21 +386,29 @@ def run_browser(config, options, args, *, deployment=None):
         except (OSError, ValueError):
             return {'status': 'blocked', 'stage': 'backend-deployment', 'frontend': frontend,
                     'reason': 'backend-version-unverified'}
-    command = ['node', str(Path(__file__).with_suffix('.cjs'))]
-    try:
-        completed = subprocess.run(command, input=json.dumps(options).encode('utf-8'), capture_output=True,
-                                   timeout=None if args.scenario else 100, cwd=PROJECT_ROOT)
-        report = completed.stdout.splitlines()[-1:]
-        result = json.loads(report[0]) if report else {'status': 'blocked', 'stage': 'browser-runner'}
-    except subprocess.TimeoutExpired:
-        result = {'status': 'blocked', 'stage': 'browser-timeout'}
+    result = browser_result(options, args)
+    if (options.get('postMerge') and frontend and frontend['mode'] == 'reused'
+            and result.get('status') == 'blocked' and not result.get('candidate_resources')
+            and result.get('stage') in ('candidate-resource', 'entry', 'test-data')):
+        fallback_stage = result['stage']
+        frontend = prepare_frontend(config['e2e'], options, args.startup_log, restart=True)
+        frontend['reuse_blocker'] = fallback_stage
+        if frontend['mode'] == 'start-failed':
+            return {'status': 'blocked', 'stage': 'frontend-startup', 'frontend': frontend}
+        result = browser_result(options, args)
     if frontend is not None:
         result['frontend'] = frontend
     if options.get('candidateVersions') and result.get('status') in ('passed', 'failed'):
         from route_evidence import check_candidate
 
         versions = options['candidateVersions']
-        if any(check_candidate(options['candidateBranches'][app], sha) for app, sha in versions.items()):
+        try:
+            if options.get('postMerge'):
+                for checkout in options['mergedCheckouts'].values():
+                    check_merged_checkout(**checkout)
+            elif any(check_candidate(options['candidateBranches'][app], sha) for app, sha in versions.items()):
+                raise ValueError('Candidate changed during acceptance')
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             return {'status': 'blocked', 'stage': 'candidate-version', 'reason': 'candidate-changed-during-acceptance'}
         result['versions'] = versions
     if deployment:
@@ -332,7 +459,7 @@ def main():
             result = run_serialized(config, options, args, deployment)
         if args.scenario:
             result.update(marker=args.marker, attempt_id=options['attemptId'])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
         result = {'status': 'blocked', 'stage': 'runner-configuration'}
     print(json.dumps({'runner': 'agentlimb', **result}, ensure_ascii=False))
     return int(result.get('status') != 'passed')

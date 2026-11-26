@@ -263,6 +263,16 @@ def validate_config(config):
     e2e = require_mapping(config.get('e2e', {}), 'e2e')
     if type(e2e.get('enabled', True)) is not bool:
         raise ValueError('e2e.enabled must be a boolean')
+    if type(e2e.get('after_integration', False)) is not bool:
+        raise ValueError('e2e.after_integration must be a boolean')
+    if e2e.get('after_integration') and e2e.get('enabled', True):
+        ports = e2e.get('startup_ports')
+        if (not isinstance(ports, list) or not ports
+                or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
+                or len(set(ports)) != len(ports)):
+            raise ValueError('e2e.startup_ports must contain unique local TCP ports')
+        require_text(e2e.get('start_command'), 'e2e.start_command')
+        require_mapping(e2e.get('agentlimb'), 'e2e.agentlimb')
     if 'agentlimb' in e2e:
         browser = require_mapping(e2e['agentlimb'], 'e2e.agentlimb')
         require_text(browser.get('browser'), 'e2e.agentlimb.browser')

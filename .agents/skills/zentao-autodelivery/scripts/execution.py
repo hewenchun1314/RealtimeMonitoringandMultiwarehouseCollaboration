@@ -11,9 +11,11 @@ from delivery_scope import material_location, read_material
 from deploy_state import (DEPLOY_STAGE, GIT_PUSH_STAGES, WORKER_STAGES, configured_targets,
                           deployed_receipt_matches, release_locks)
 from desktop_runtime import runtime_check
+from frontend_delivery import acquire_slot, delivery_stage, release_slot
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from material_sync import requirement_checkout, verify_requirement_intent
-from route_evidence import agentlimb_receipt_error, delivery_summary, validate_partial_merge, validate_success
+from route_evidence import (agentlimb_receipt_error, delivery_summary, host_e2e_blocker_error,
+                            validate_partial_merge, validate_success)
 from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
                              stage_evidence, stage_role, stage_task_ids, stages_for, task_scope,
                              unit_test_revision, v2_repair)
@@ -170,6 +172,21 @@ def phase_context(store, item, phase, config_directory):
     scope = task_scope(store, item, stage)
     if scope is not None and stage_task_ids(get_split(store, item), stage):
         context['task_scope'] = scope
+    if item['stage'] == 'frontend.e2e' and (get_split(store, item) or {}).get('post_merge_e2e'):
+        merged = stage_evidence(store, item, 'frontend.integration') or {}
+        if stage == 'frontend.e2e':
+            attempt_id = active_attempt(store, item)['attempt_id']
+            context['host_e2e'] = {'versions': merged.get('merged_versions', {}),
+                                   'request': f'frontend/e2e-{attempt_id}/host-request.json'}
+        elif stage.startswith('frontend.'):
+            current = merged.get('merged_versions', {})
+            bases = merged.get('main_repair_base_versions', current)
+            repositories = (stage_evidence(store, item, 'frontend.branch_check') or {}).get('repositories', {})
+            context['main_frontend_versions'] = current
+            context['main_frontend_repositories'] = {
+                key: {'checkout': proof['source_root'], 'base_commit': bases.get(key), 'sha': current[key]}
+                for key, proof in repositories.items() if key in current
+            }
     if not stage.startswith('backend.'):
         return context
     config = snapshot(item)
@@ -183,6 +200,21 @@ def phase_context(store, item, phase, config_directory):
     if dependencies:
         context['backend_dependencies'] = dependencies
     return context
+
+
+def main_repair_context(store, item, phase, config_directory):
+    if (item['stage'] != 'frontend.e2e' or phase != 'frontend.coding'
+            or not (get_split(store, item) or {}).get('post_merge_e2e')):
+        return {}
+    from development_git import prepare_main_repair
+
+    merged = stage_evidence(store, item, 'frontend.integration') or {}
+    try:
+        proof = prepare_main_repair(store, item, active_attempt(store, item), config_directory,
+                                    merged.get('merged_versions', {}))
+    except (OSError, RuntimeError, ValueError) as error:
+        return {'main_frontend_repair_error': str(error)}
+    return {'main_frontend_repair': proof}
 
 
 def material_sync_required(store, item):
@@ -249,11 +281,14 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
     if routed:
         preparation['route'] = get_split(store, item)
     active = active_attempt(store, item)
+    if delivery_stage(item['stage'], preparation.get('route')) and not acquire_slot(store, item, config_directory):
+        return message('frontend_delivery_busy', stage=item['stage'])
     if active:
         if active['phase'] in WORKER_STAGES and not deployment_worker:
             return message('deployment_worker_required')
         if routed:
             preparation.update(phase_context(store, item, active['phase'], config_directory))
+            preparation.update(main_repair_context(store, item, active['phase'], config_directory))
         return message('attempt_active', attempt_id=active['attempt_id'], deadline_at=active['deadline_at'],
                        phase=active['phase'], retry_number=active['retry_number'],
                        phase_started_at=active['phase_started_at'], **preparation)
@@ -271,6 +306,7 @@ def attempt_start(store, item, data, *, config_directory, deployment_worker=Fals
                                                           retries, store.time, deadline, phase, store.time, encode(history)))
     if routed:
         preparation.update(phase_context(store, item, phase, config_directory))
+        preparation.update(main_repair_context(store, item, phase, config_directory))
     return message('attempt_started', attempt_id=attempt_id, stage=item['stage'], retry_number=retries,
                    started_at=store.time, phase_started_at=store.time, phase=phase, deadline_at=deadline,
                    **preparation)
@@ -307,7 +343,18 @@ def repair_advance(store, item, data, *, config_directory, deployment_worker=Fal
                 return message('evidence_required', reason=str(exc))
             return finish_revision(store, item, trial, receipt, completed)
         else:
-            reason = validate_success(store, item, phase, evidence)
+            main_frontend_repair = (phase == 'frontend.coding' and item['stage'] == 'frontend.e2e'
+                                    and (get_split(store, item) or {}).get('post_merge_e2e'))
+            if main_frontend_repair:
+                from development_git import repair_commit_error
+
+                versions = evidence.get('versions') if isinstance(evidence, dict) else None
+                previous = (stage_evidence(store, item, 'frontend.integration') or {}).get('merged_versions')
+                reason = repair_commit_error(store, item, versions, previous)
+                if not reason:
+                    receipt['frontend_main_repair_versions'] = versions
+            else:
+                reason = validate_success(store, item, phase, evidence)
             if reason:
                 return message('evidence_required', reason=reason)
             reason = task_evidence.prepare_receipt(store, item, phase, evidence, True)
@@ -325,6 +372,11 @@ def repair_advance(store, item, data, *, config_directory, deployment_worker=Fal
     if routed:
         task_evidence.refresh(store, item)
     context = phase_context(store, item, next_phase, config_directory) if routed else {}
+    if routed:
+        context.update(main_repair_context(store, item, next_phase, config_directory))
+    if receipt.get('frontend_main_repair_versions'):
+        enqueue_note(store, item, f'frontend.e2e-repair/{trial["attempt_id"]}/{trial["phase_started_at"]}',
+                     '本单已修复，待复测。' + summary)
     return message('repair_advanced', attempt_id=trial['attempt_id'], phase=next_phase,
                    phase_started_at=store.time, deadline_at=deadline, retry_number=trial['retry_number'], **context)
 
@@ -457,6 +509,11 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                 'merged_versions', 'repositories', 'services', 'task_results', 'verified_tasks')):
             return message('evidence_required', reason='A skipped stage cannot claim execution results')
         evidence = evidence.copy()
+    if (stage == 'frontend.e2e' and phase == 'verify' and not finished and not repair_required
+            and (get_split(store, item) or {}).get('post_merge_e2e')):
+        reason = host_e2e_blocker_error(item, attempt_id, evidence, config_directory, outcome)
+        if reason:
+            return message('evidence_required', reason=reason)
     if stage == 'frontend.e2e' and phase == 'verify' and (finished or repair_required) and config.get('e2e', {}).get('agentlimb'):
         expected = 'passed' if finished else 'failed'
         reason = agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_directory)
@@ -596,6 +653,10 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     result = {'summary': summary, 'evidence': evidence, 'stop_evidence': data.get('stop_evidence'),
               'terminal_step': not retry, 'phase': phase, 'repair_phases': completed_phases,
               'repair_required': repair_required or phase != 'verify'}
+    if not retry and stage == 'frontend.e2e' and (current_route or {}).get('post_merge_e2e'):
+        target = history.get('frontend.integration', {}).get('evidence', {}).get('merged_versions')
+        if target:
+            result['release_versions'] = target
     if recorded_blockers:
         result['task_blockers'] = recorded_blockers
     if routed and not retry and not finished and (phase == 'split' or (repair_required and data.get('contract_changed'))):
@@ -618,6 +679,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         task_evidence.refresh(store, item)
     if not retry and (not next_stage or stage == 'frontend.e2e'):
         release_locks(store, item)
+    if not retry and not next_stage:
+        release_slot(store, item)
 
     operation_id = None
     if retry:
@@ -778,6 +841,7 @@ def complete(store, item, data):
     operation_id = enqueue_note(store, item, 'final', note)
     store.update_item(item, state='completed')
     release_locks(store, item)
+    release_slot(store, item)
     set_dispatch_state(store, dispatch(store, item, data), 'completed')
     return message('completed', conclusion=conclusion, steps=steps, operation_id=operation_id,
                    attachment_id=attachment_id, item=item_identity(item), **extra)

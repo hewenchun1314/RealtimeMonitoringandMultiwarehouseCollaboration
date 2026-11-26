@@ -1,10 +1,14 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { once } = require('node:events');
 const { mkdtempSync, rmSync, writeFileSync } = require('node:fs');
+const { createServer } = require('node:http');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const { runInNewContext } = require('node:vm');
+const { gzipSync } = require('node:zlib');
 const { checkPage, runSession, scenarioResult } = require('../scripts/agentlimb_e2e.cjs');
 
 const profile = {
@@ -85,6 +89,72 @@ test('the runner does not start business assertions on a different candidate ass
   const resources = [{ app: 'shell', url: 'http://localhost:5000/index.js', sha256: 'a'.repeat(64) }];
   await assert.rejects(checkPage(browser, { ...profile, resources }, () => assert.fail('unexpected scenario')),
     { stage: 'candidate-resource', check: 'shell' });
+});
+
+test('post-merge acceptance rejects an old loaded resource even if a new fetch matches', async () => {
+  let url;
+  const digest = 'a'.repeat(64);
+  const oldDigest = 'b'.repeat(64);
+  const browser = {
+    async navigate(value) { url = value; },
+    async evaluate(expression) {
+      if (expression.includes('workArea:')) return { url, workArea: 'QA' };
+      if (expression.includes('arrayBuffer()')) return digest;
+      if (expression.includes('serverTiming')) return { digest: oldDigest };
+      return true;
+    },
+  };
+  const resources = [{ app: 'shell', url: 'http://localhost:5000/index.js', sha256: digest }];
+  await assert.rejects(checkPage(browser, { ...profile, resources, postMerge: true }, () => assert.fail('unexpected scenario')),
+    { stage: 'candidate-resource', check: 'shell' });
+});
+
+test('post-merge acceptance uses the loaded response digest without a second request', async () => {
+  let url;
+  const digest = 'a'.repeat(64);
+  const expectedUrl = 'http://localhost:5000/index.js';
+  const window = { frames: { length: 0 }, performance: {
+    getEntriesByName(target, kind) {
+      assert.equal(target, expectedUrl);
+      assert.equal(kind, 'resource');
+      return [{ serverTiming: [{ name: 'zentao-resource', description: digest }] }];
+    },
+  } };
+  const browser = {
+    async navigate(value) { url = value; },
+    async evaluate(expression) {
+      if (expression.includes('workArea:')) return { url, workArea: 'QA' };
+      if (expression.includes('arrayBuffer()')) assert.fail('separate request');
+      if (expression.includes('serverTiming')) return runInNewContext(expression, { window });
+      return true;
+    },
+  };
+  const resources = [{ app: 'shell', url: expectedUrl, sha256: digest }];
+  const result = await checkPage(browser, { ...profile, resources, postMerge: true }, async () => {});
+  assert.deepEqual(result.candidate_resources, resources);
+});
+
+test('the startup witness fingerprints the decoded bytes of a chunked asset', async () => {
+  const { witnessResponse } = require('../scripts/agentlimb_resource_witness.cjs');
+  const content = Buffer.from('console.log("actual resource")');
+  const compressed = gzipSync(content);
+  const origin = 'http://localhost:5000';
+  const server = createServer((request, response) => {
+    witnessResponse(response, origin);
+    response.writeHead(200, { 'Content-Type': 'text/javascript', 'Content-Encoding': 'gzip' });
+    response.write(compressed.subarray(0, 7));
+    response.end(compressed.subarray(7));
+  }).listen(0, '127.0.0.1');
+  try {
+    await once(server, 'listening');
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/asset.js`);
+    const digest = createHash('sha256').update(content).digest('hex');
+    assert.equal(response.headers.get('server-timing'), `zentao-resource;desc="${digest}"`);
+    assert.equal(response.headers.get('timing-allow-origin'), origin);
+    assert.equal(await response.text(), content.toString());
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('expired local session can submit Chrome autofill without reading credentials', async () => {

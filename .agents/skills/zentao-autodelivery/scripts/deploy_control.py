@@ -9,8 +9,10 @@ from branch_check import valid_target
 from deploy_state import (COMMIT, DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, TAG, WORKER_STAGES,
                           deployed_receipt_matches, frontend_release_config, project_services, release_locks, target_key)
 from execution import active_attempt, attempt_finish, attempt_seed, attempt_start, execution_matches, repair_advance
+from frontend_delivery import acquire_slot, delivery_stage
 from ledger import Ledger, item_identity, message, transaction, validate_config
-from route_evidence import deployment_requirements, git_push_evidence_error, git_push_requirements, push_covers
+from route_evidence import (deployment_requirements, frontend_acceptance_terminal, git_push_evidence_error,
+                            git_push_requirements, push_covers)
 from route_execution import contract_revision_pending, get_split, is_routed, read_history, snapshot
 
 
@@ -96,10 +98,15 @@ def frontend_request(store, item, directory):
         raise ValueError('接口契约变更，等待重新拆分后核验前端发布')
     required = [name for name in route['stages'] if name.startswith('frontend.') and name not in
                 (FRONTEND_DEPLOY_STAGE, 'frontend.push')]
+    post_merge = route.get('post_merge_e2e')
+    if post_merge:
+        required = [name for name in required if name != 'frontend.e2e']
     if any(steps.get(name, {}).get('outcome') != 'success' for name in required):
         raise ValueError('前端发布需要本单前端验证及合回成功')
     planned = steps['frontend.plan']['evidence']['applications']
     versions = steps['frontend.integration']['evidence']['merged_versions']
+    if post_merge and not frontend_acceptance_terminal(route, steps, versions):
+        raise ValueError('前端发布需要最终版本的 E2E 已结束')
     if not planned or set(planned) != versions.keys():
         raise ValueError('前端应用与合回 SHA 清单不一致')
     if not push_covers(store, item, 'frontend.push', versions):
@@ -203,6 +210,8 @@ def claim_deployment(store, item, directory, stage):
     if active and store.conn.execute('SELECT 1 FROM deployment_claims WHERE attempt_id=?',
                                      (active['attempt_id'],)).fetchone():
         return message('deployment_busy', **trial_fields(item, active))
+    if delivery_stage(item['stage'], get_split(store, item)) and not acquire_slot(store, item, directory):
+        return message('deployment_busy', reason='等待前端合回及发布占用释放')
     if stage in GIT_PUSH_STAGES:
         return claim_push(store, item, directory, stage)
     if item['stage'] == FRONTEND_DEPLOY_STAGE:

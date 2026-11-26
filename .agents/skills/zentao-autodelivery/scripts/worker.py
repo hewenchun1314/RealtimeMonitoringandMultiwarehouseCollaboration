@@ -21,6 +21,8 @@ from deploy_state import FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
 from ledger import Ledger, encode, item_identity, transaction, validate_config
 from frontend_release_runner import run_frontend_release
+from frontend_e2e_runner import (frontend_delivery_in_use, frontend_e2e_lock, frontend_queue_owner,
+                                 frontend_waiting, pending_frontend_e2e, run_frontend_e2e)
 from git_delivery_runner import run_git_delivery
 from development_git_runner import pending_development_git, run_development_git
 from stage_runner import recover_job_stop, run_stage, utc_now
@@ -101,6 +103,10 @@ def worker_prompt(operation, item):
         '前后端 branch_prepare、candidate_commit、integration_merge 只登记固定宿主 Git 请求。'
         '返回 host_git_worker_required 时立即结束当前轮次；Windows 启动器确认主进程及任务同步进程均已停止后执行，'
         '随后续接原聊天。恢复后用相同 event_id 和原提交数据读回，或用 host_git_status 按 operation_id 查询。'
+        '新路线前端正式验收取得 host_e2e 后，在回执指定的工单相对路径写 host-request.json，'
+        '包含本次 attempt_id、工单目录相对路径 profile 与 scenario（均为 JSON）及 base_url，并结束本轮。'
+        '宿主执行后从同一目录的 agentlimb.json 读取实际结果，再登记账本原尝试。'
+        '若返回 frontend_delivery_busy，结束本轮等待当前交付单完成。'
         '沙箱内只编辑、构建、测试及只读 Git 核验；禁止自行 fetch、worktree add、commit、checkout 或 merge，禁止跳过原有 hooks。'
         '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
         '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
@@ -188,7 +194,7 @@ def review_handoff_stopped(output, item):
 
 
 def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False, recover_review=None,
-                       recover_material=None, recover_git=None):
+                       recover_material=None, recover_git=None, recover_e2e=None):
     deadline = deadline or utc_now() + timedelta(hours=72)
 
     def peek():
@@ -199,12 +205,30 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     last_deployment = None
     last_material = None
     last_git = None
+    last_e2e = None
     release_key = 'backend_deployment'
     while utc_now() < deadline:
         state = pending['status']
         item = read_item(marker)
         if not item or item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready'):
             return last_turn or {'status': 'worker_released'}
+        if frontend_queue_owner(marker, DATABASE_PATH, CONFIG_PATH) is not None:
+            time.sleep(max(0, min(2, (deadline - utc_now()).total_seconds())))
+            pending = peek()
+            continue
+        e2e = pending_frontend_e2e(marker, DATABASE_PATH, CONFIG_PATH)
+        if e2e['status'] == 'host_e2e_pending':
+            if last_turn.get('status') != 'worker_stopped' and not (recover_e2e and recover_e2e(item)):
+                return {**last_turn, 'status': 'worker_host_e2e_stop_unverified'}
+            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
+                return {**last_turn, 'status': 'worker_host_e2e_blocked',
+                        'frontend_e2e': {'status': 'host_e2e_runtime_blocked'}}
+            last_e2e = run_frontend_e2e(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT)
+            if last_e2e['status'] == 'host_e2e_busy':
+                time.sleep(max(0, min(2, (deadline - utc_now()).total_seconds())))
+            elif last_e2e['status'] not in ('host_e2e_finished', 'host_e2e_inactive', 'host_e2e_not_pending'):
+                return {**last_turn, 'status': 'worker_host_e2e_blocked', 'frontend_e2e': last_e2e}
+            continue
         development_git = pending_development_git(marker, DATABASE_PATH, CONFIG_PATH)
         if development_git['status'] == 'host_git_pending':
             if last_turn.get('status') != 'worker_stopped' and not (recover_git and recover_git(item)):
@@ -276,6 +300,7 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
         if state != 'deployment_not_pending':
             return {**last_turn, 'status': 'worker_deployment_blocked',
                     release_key: {'status': state}}
+        was_waiting = frontend_waiting(marker, DATABASE_PATH, CONFIG_PATH)
         last_turn = worker_result(*launch_chat(item))
         if last_deployment is not None:
             last_turn[release_key] = last_deployment
@@ -283,12 +308,18 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             last_turn['material_sync'] = last_material
         if last_git is not None:
             last_turn['development_git'] = last_git
+        if last_e2e is not None:
+            last_turn['frontend_e2e'] = last_e2e
         if last_turn['status'] != 'worker_stopped':
             return last_turn
         current = read_item(marker)
         if current and current['state'] in ('review_handoff', 'review_wait', 'review_ready'):
             continue
         pending = peek()
+        if (pending_frontend_e2e(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'host_e2e_pending'
+                or frontend_queue_owner(marker, DATABASE_PATH, CONFIG_PATH) is not None
+                or (not was_waiting and frontend_waiting(marker, DATABASE_PATH, CONFIG_PATH))):
+            continue
         if pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'material_sync_pending':
             continue
         if pending_development_git(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'host_git_pending':
@@ -354,7 +385,8 @@ def run(operation, marker, cli):
                 marker, lambda current: launch_turn(cli, operation, current, output, deadline), deadline,
                 recover_deployment=True, recover_review=lambda current: review_handoff_stopped(output, current),
                 recover_material=lambda current: review_handoff_stopped(output, current),
-                recover_git=lambda current: review_handoff_stopped(output, current))
+                recover_git=lambda current: review_handoff_stopped(output, current),
+                recover_e2e=lambda current: review_handoff_stopped(output, current))
         receipt, _ = launch_turn(cli, operation, item, output, deadline)
         if operation == 'prepare':
             return prepared_result(receipt)
@@ -492,6 +524,13 @@ def prepared_result(receipt):
 
 
 def run_e2e_preflight(profile):
+    with frontend_e2e_lock(DATABASE_PATH) as acquired:
+        if not acquired or frontend_delivery_in_use(DATABASE_PATH):
+            return {'status': 'e2e_preflight_busy', 'check': {'stage': 'runner-lock'}}
+        return run_locked_e2e_preflight(profile)
+
+
+def run_locked_e2e_preflight(profile):
     import msvcrt
 
     attempt_id = uuid4().hex
@@ -557,7 +596,8 @@ def main():
                                     'e2e_preflight_blocked', 'e2e_preflight_busy', 'worker_review_stop_unverified',
                                     'worker_git_preflight_blocked', 'git_preflight_failed', 'git_preflight_busy',
                                     'worker_material_stop_unverified', 'worker_material_blocked',
-                                    'worker_host_git_stop_unverified', 'worker_host_git_blocked'))
+                                    'worker_host_git_stop_unverified', 'worker_host_git_blocked',
+                                    'worker_host_e2e_stop_unverified', 'worker_host_e2e_blocked'))
 
 
 if __name__ == '__main__':

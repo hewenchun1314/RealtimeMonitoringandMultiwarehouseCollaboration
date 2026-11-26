@@ -10,7 +10,9 @@ import sqlite3
 import sys
 
 from development_git import validate_operation, operation_history, apply_obligations
-from development_git_effects import DIAGNOSTICS, failed_hooks, failed_hook_args, common_directory, git, integrate, prepare, commit, tracked_dirty, validate_worktree
+from development_git_effects import (DIAGNOSTICS, failed_hooks, failed_hook_args, common_directory,
+                                     git, integrate, prepare, commit, tracked_changes, tracked_dirty,
+                                     validate_main_checkout, validate_worktree)
 from ledger import Ledger, encode, message, transaction
 from material_sync_runner import checkout_lock, load_config, read_json, recover_proof
 from stage_runner import run_stage, utc_now, write_json
@@ -35,7 +37,7 @@ def pending_development_git(marker, database, config_path):
     return message('host_git_not_pending')
 
 
-def verify_result(context, key, result):
+def verify_result(context, key, result, entry=None):
     if result.get('status') != 'verified':
         return
     deadline = context['deadline_at']
@@ -45,6 +47,14 @@ def verify_result(context, key, result):
         if head != result['base_commit'] or tracked_dirty(root, deadline):
             raise ValueError('Prepared worktree changed before host publication')
     elif context['kind'] == 'commit':
+        if proof.get('main_repair'):
+            root, head = validate_main_checkout(proof, deadline)
+            changed = tracked_changes(root, deadline, cached=True) | tracked_changes(root, deadline)
+            if (head != result['candidate'] or changed - set(entry['baseline_dirty'])
+                    or (head != proof['base_commit']
+                        and git(root, 'rev-parse', 'HEAD^', deadline=deadline) != proof['base_commit'])):
+                raise ValueError('The main frontend repair changed before host publication')
+            return
         root, head = validate_worktree(proof, deadline)
         if head != result['candidate'] or tracked_dirty(root, deadline):
             raise ValueError('Candidate changed or became dirty before host publication')
@@ -54,6 +64,13 @@ def verify_result(context, key, result):
         if actual != result['merged'] or git(source, 'merge-base', '--is-ancestor', proof['candidate'], actual,
                                             deadline=deadline, allowed=(0, 1)) is None:
             raise ValueError('Integration result changed before host publication')
+        if proof.get('main_delivery'):
+            ref = 'refs/heads/' + proof['target_branch']
+            if (git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != ref
+                    or tracked_dirty(source, deadline)
+                    or (result.get('target_before') and git(source, 'merge-base', '--is-ancestor',
+                        result['target_before'], actual, deadline=deadline, allowed=(0, 1)) is None)):
+                raise ValueError('The main frontend checkout changed before integration publication')
 
 
 def compute(database, config_path, operation, folder):
@@ -73,7 +90,7 @@ def compute(database, config_path, operation, folder):
         token = DIAGNOSTICS.set(journal / 'git-diagnostics')
         try:
             if saved:
-                verify_result(context, key, saved)
+                verify_result(context, key, saved, request['payload'].get(key))
                 results[key] = saved
             elif context['kind'] == 'prepare':
                 result = prepare(proof, context, key, database, journal, request['payload'].get(key))
@@ -202,7 +219,7 @@ def run_development_git(marker, database, config_path, project_root, *, recover=
                 try:
                     if key not in results:
                         raise ValueError('The host operation did not produce a result before stopping')
-                    verify_result(current['context'], key, results[key])
+                    verify_result(current['context'], key, results[key], current['payload'].get(key))
                 except (OSError, ValueError, KeyError) as error:
                     results[key] = {'status': 'failed', 'reason': str(error)}
             passed = all(x.get('status') == 'verified' for x in results.values())

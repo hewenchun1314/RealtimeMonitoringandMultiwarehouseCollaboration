@@ -20,11 +20,15 @@ class DevelopmentGitTests(unittest.TestCase):
     def setUp(self):
         self.start_side('frontend')
 
-    def start_side(self, side, extra=None, registry=None, key=None):
+    def start_side(self, side, extra=None, registry=None, key=None, *, post_merge=False):
         self.side = side
         self.d = test_route_drills.RouteDrills()
         self.d.setUp()
         self.addCleanup(self.d.doCleanups)
+        if side == 'frontend':
+            self.d.config['e2e']['after_integration'] = post_merge
+            if post_merge:
+                self.d.config['e2e']['agentlimb'] = {'browser': 'Fixture paired browser'}
         if key:
             apps = self.d.config['development']['frontend_bundle']['applications']
             apps[key] = dict(apps[self.d.key])
@@ -635,3 +639,186 @@ class DevelopmentGitTests(unittest.TestCase):
         result = self.host()
         self.assertEqual(result['status'], 'host_git_completed', result)
         self.assertTrue(all(line.startswith('SOURCE|') for line in events.read_text().splitlines()))
+
+    def main_repair_fixture(self):
+        root = self.d.repositories['frontend']
+        (root / 'index.html').write_text('Merged version', encoding='utf-8')
+        (root / 'unrelated.txt').write_text('Originally committed', encoding='utf-8')
+        git(root, 'add', 'index.html', 'unrelated.txt')
+        git(root, 'commit', '-m', 'Fixture merged version')
+        head = git(root, 'rev-parse', 'HEAD')
+        branch = git(root, 'symbolic-ref', '--short', 'HEAD')
+        proof = {'source_root': str(root), 'worktree': str(root), 'target_branch': branch,
+                 'worktree_branch': branch, 'base_commit': head, 'main_repair': True}
+        return root, head, proof
+
+    def commit_main_repair(self, root, head, proof, files, baseline=(), operation='main-repair-fixture'):
+        from development_git import relative_files
+        from development_git_effects import commit
+        context = {'deadline_at': (datetime.now(timezone.utc) + timedelta(seconds=25)).isoformat()}
+        entry = {'expected_head': head, 'message': 'fix: repair failed browser check',
+                 'files': files, 'fingerprints': relative_files(root, files), 'baseline_dirty': list(baseline)}
+        journal = self.d.root / 'commit-journal'
+        journal.mkdir(exist_ok=True)
+        return commit(proof, entry, context, operation, self.d.key, journal)
+
+    def test_main_repair_only_commits_selected_changes_and_keeps_other_index_and_worktree_edits(self):
+        root, head, proof = self.main_repair_fixture()
+        (root / 'unrelated.txt').write_text('Other staged change', encoding='utf-8')
+        git(root, 'add', 'unrelated.txt')
+        (root / 'unrelated.txt').write_text('Other unstaged change', encoding='utf-8')
+        (root / 'index.html').write_text('Corrected behavior', encoding='utf-8')
+        (root / 'new-regression.test').write_text('New fixture', encoding='utf-8')
+        result = self.commit_main_repair(root, head, proof, ['index.html', 'new-regression.test'], ['unrelated.txt'])
+        self.assertEqual(result['status'], 'verified', result)
+        self.assertEqual(git(root, 'rev-parse', 'HEAD'), result['candidate'])
+        self.assertEqual(git(root, 'diff', '--name-only', head, 'HEAD').splitlines(),
+                         ['index.html', 'new-regression.test'])
+        self.assertEqual(git(root, 'show', ':unrelated.txt'), 'Other staged change')
+        self.assertEqual((root / 'unrelated.txt').read_text(), 'Other unstaged change')
+
+    def test_main_repair_rejects_paths_with_overlapping_preexisting_edits(self):
+        root, head, proof = self.main_repair_fixture()
+        (root / 'index.html').write_text('Existing user edits', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'overlap'):
+            self.commit_main_repair(root, head, proof, ['index.html'], ['index.html'])
+        self.assertEqual(git(root, 'rev-parse', 'HEAD'), head)
+        self.assertEqual((root / 'index.html').read_text(), 'Existing user edits')
+
+    def test_main_repair_requires_the_expected_target_branch_in_the_main_checkout(self):
+        root, head, proof = self.main_repair_fixture()
+        git(root, 'switch', '-c', 'another-fixture-branch')
+        (root / 'index.html').write_text('Unexpected branch change', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'target branch'):
+            self.commit_main_repair(root, head, proof, ['index.html'])
+        self.assertEqual(git(root, 'rev-parse', 'HEAD'), head)
+
+    def test_main_repair_rejects_hook_that_tries_to_stage_unrelated_files(self):
+        root, head, proof = self.main_repair_fixture()
+        self.install_hook('pre-commit', 'git add --all\n')
+        (root / 'index.html').write_text('Corrected behavior', encoding='utf-8')
+        (root / 'unrelated.txt').write_text('Other unstaged change', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            self.commit_main_repair(root, head, proof, ['index.html'], ['unrelated.txt'])
+        self.assertEqual(git(root, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(git(root, 'show', ':unrelated.txt'), 'Originally committed')
+        self.assertEqual((root / 'unrelated.txt').read_text(), 'Other unstaged change')
+
+    def test_ledger_repair_updates_target_sha_without_touching_initial_item_branch(self):
+        self.start_side('frontend', post_merge=True)
+        candidate_workspace = self.begin_coding()
+        (candidate_workspace / 'index.html').write_text('<output>approved</output>', encoding='utf-8')
+        (candidate_workspace / 'unrelated.txt').write_text('original', encoding='utf-8')
+        self.candidate(candidate_workspace, files=['index.html', 'unrelated.txt'])
+        self.integration_phase(self.host())
+        self.request('integration_merge')
+        merged = self.host()
+        prior_sha = merged['merged_versions'][self.d.key]
+        self.d.finish('frontend.integration', self.attempt, {
+            'versions': merged['versions'], 'merged_versions': merged['merged_versions'],
+        })
+        self.attempt = self.d.record('attempt_start', stage='frontend.e2e')
+        original = self.d.repositories['frontend']
+        (original / 'unrelated.txt').write_text('independent modification', encoding='utf-8')
+        with patch('execution.agentlimb_receipt_error', return_value=None):
+            failed = self.d.record('attempt_finish', attempt_id=self.attempt['attempt_id'],
+                                   outcome='failed', summary='Fixture found a functional failure',
+                                   repair_required=True, evidence={})
+        self.assertEqual(failed['disposition'], 'retry', failed)
+        self.attempt = self.d.record('attempt_start', stage='frontend.e2e')
+        self.assertEqual(self.attempt['phase'], 'frontend.coding', self.attempt)
+        main = self.attempt['main_frontend_repair']['repositories'][self.d.key]
+        self.assertEqual(main['worktree'], str(original))
+        self.assertEqual(main['expected_head'], prior_sha)
+        self.assertIn('unrelated.txt', main['protected_files'])
+        rejected, _ = self.candidate(original, files=['unrelated.txt'])
+        self.assertIn('overlap', rejected['reason'])
+        (original / 'index.html').write_text('<output>fixed</output>', encoding='utf-8')
+        self.install_hook('post-commit', 'exit 1\n')
+        submitted, _ = self.candidate(original)
+        self.assertEqual(submitted['status'], 'host_git_worker_required', submitted)
+        affected = self.host()
+        self.assertEqual(affected['repositories'][self.d.key]['status'], 'candidate_retest_required', affected)
+        self.install_hook('post-commit', 'exit 0\n')
+        submitted, _ = self.candidate(original, files=[], verification='Rechecked the original repair hook and exact diff')
+        self.assertEqual(submitted['status'], 'host_git_worker_required', submitted)
+        result = self.host()
+        self.assertEqual(result['status'], 'host_git_completed', result)
+        self.assertEqual(affected['repositories'][self.d.key]['candidate'], result['versions'][self.d.key])
+        self.assertEqual(git(candidate_workspace, 'rev-parse', 'HEAD'), prior_sha)
+        self.assertEqual(git(original, 'rev-parse', 'HEAD'), result['versions'][self.d.key])
+        self.assertEqual((original / 'unrelated.txt').read_text(), 'independent modification')
+        reviewed = self.d.record('repair_advance', attempt_id=self.attempt['attempt_id'],
+                                 phase='frontend.coding', summary='Repaired in the main checkout',
+                                 evidence={'versions': result['versions']})
+        self.assertEqual(reviewed['status'], 'repair_advanced', reviewed)
+        self.assertEqual(reviewed['main_frontend_versions'], result['versions'])
+
+    def test_post_merge_frontend_combines_disjoint_queued_changes_in_main_checkout(self):
+        self.start_side('frontend', post_merge=True)
+        candidate_workspace = self.begin_coding()
+        (candidate_workspace / 'index.html').write_text('<output>approved</output>', encoding='utf-8')
+        self.candidate(candidate_workspace)
+        candidate = self.host()['versions'][self.d.key]
+        self.integration_phase({'versions': {self.d.key: candidate}})
+        source = self.d.repositories['frontend']
+        target = git(source, 'symbolic-ref', '--short', 'HEAD')
+        (source / 'first-work-item.txt').write_text('Previous queued item', encoding='utf-8')
+        git(source, 'add', 'first-work-item.txt')
+        git(source, 'commit', '-m', 'Fixture earlier work item')
+        previous = git(source, 'rev-parse', 'HEAD')
+        git(source, 'switch', '-c', 'fixture-local-branch')
+        self.install_hook('post-checkout', 'test -f first-work-item.txt && printf "checked out\\n" > checkout-proof\n')
+        self.request('integration_merge')
+        result = self.host()
+        self.assertEqual(result['status'], 'host_git_completed', result)
+        self.assertEqual(git(source, 'symbolic-ref', '--short', 'HEAD'), target)
+        parents = git(source, 'rev-list', '--parents', '-n', '1', 'HEAD').split()
+        self.assertEqual(parents, [result['merged_versions'][self.d.key], previous, candidate])
+        self.assertTrue((source / 'checkout-proof').is_file())
+        self.assertEqual((source / 'index.html').read_text(), '<output>approved</output>')
+        self.assertEqual((source / 'first-work-item.txt').read_text(), 'Previous queued item')
+
+    def test_post_merge_frontend_preflights_conflicts_without_touching_main_checkout(self):
+        self.start_side('frontend', post_merge=True)
+        candidate_workspace = self.begin_coding()
+        (candidate_workspace / 'index.html').write_text('<output>approved</output>', encoding='utf-8')
+        self.candidate(candidate_workspace)
+        self.integration_phase(self.host())
+        source = self.d.repositories['frontend']
+        (source / 'index.html').write_text('Conflicting earlier work item', encoding='utf-8')
+        git(source, 'add', 'index.html')
+        git(source, 'commit', '-m', 'Fixture conflicting earlier work item')
+        before = git(source, 'rev-parse', 'HEAD')
+        self.request('integration_merge')
+        result = self.host()
+        self.assertEqual(result['status'], 'host_git_failed', result)
+        self.assertIn('conflict', result['repositories'][self.d.key]['reason'])
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
+        self.assertEqual(git(source, 'status', '--porcelain'), '')
+
+    def test_post_merge_frontend_rechecks_failed_original_checkout_hook_on_retry(self):
+        self.start_side('frontend', post_merge=True)
+        candidate_workspace = self.begin_coding()
+        (candidate_workspace / 'index.html').write_text('<output>approved</output>', encoding='utf-8')
+        self.candidate(candidate_workspace)
+        result = self.host()
+        self.integration_phase(result)
+        source = self.d.repositories['frontend']
+        target = git(source, 'symbolic-ref', '--short', 'HEAD')
+        before = git(source, 'rev-parse', 'HEAD')
+        git(source, 'switch', '-c', 'fixture-local-branch')
+        hook = self.install_hook('post-checkout', 'printf "%s\\n" "$*" >> checkout-arguments\nexit 1\n')
+        self.request('integration_merge')
+        failed = self.host()
+        self.assertEqual(failed['status'], 'host_git_failed', failed)
+        self.assertEqual(failed['repositories'][self.d.key]['failed_hooks'], ['post-checkout'])
+        self.assertEqual(git(source, 'symbolic-ref', '--short', 'HEAD'), target)
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), before)
+        hook.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> checkout-arguments\n', encoding='utf-8', newline='\n')
+        self.request('integration_merge')
+        repaired = self.host()
+        self.assertEqual(repaired['status'], 'host_git_completed', repaired)
+        original, retried = (source / 'checkout-arguments').read_text().splitlines()
+        self.assertEqual(original, retried)
+        self.assertEqual(git(source, 'rev-parse', 'HEAD'), result['versions'][self.d.key])

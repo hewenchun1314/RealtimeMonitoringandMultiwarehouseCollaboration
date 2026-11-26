@@ -228,11 +228,11 @@ class FrontendLedgerTests(unittest.TestCase):
         self.config_path.write_text(encode(self.config), encoding='utf-8')
         self.sha = 'a' * 40
 
-    def setup_item(self, seq, *, validated=True):
+    def setup_item(self, seq, *, validated=True, post_merge=False):
         marker = f'fixture-{seq}'
-        stages = route_stages('frontend_only', frontend_deploy_enabled=True)
+        stages = route_stages('frontend_only', frontend_deploy_enabled=True, post_merge_e2e=post_merge)
         route = {'scope': 'frontend_only', 'source': 'config', 'tasks': {'backend': [], 'frontend': []},
-                 'e2e_enabled': True, 'blockers': [], 'stages': stages}
+                 'e2e_enabled': True, 'blockers': [], 'stages': stages, 'post_merge_e2e': post_merge}
         before = {'split': {}, 'frontend.plan': {'applications': ['shell-hub']},
                   'frontend.integration': {'merged_versions': {'shell-hub': self.sha}}}
         with transaction(self.database) as conn:
@@ -249,6 +249,8 @@ class FrontendLedgerTests(unittest.TestCase):
                 if stage == 'split':
                     result['route'] = route
                 failed = stage == 'frontend.e2e' and not validated
+                if stage == 'frontend.e2e' and post_merge:
+                    result['release_versions'] = {'shell-hub': self.sha}
                 conn.execute("""INSERT INTO attempts(attempt_id,item_seq,run_round,stage,retry_number,
                              started_at,ended_at,outcome,result,phase,phase_started_at)
                              VALUES(?,?,1,?,0,'','',?,?,'verify','')""",
@@ -272,6 +274,13 @@ class FrontendLedgerTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual(result['status'], 'attempt_finished')
         self.assertEqual((result['outcome'], result['disposition']), ('skipped', 'close'))
+
+    def test_post_merge_terminal_e2e_failure_still_claims_frontend_deployment(self):
+        marker = self.setup_item(1, validated=False, post_merge=True)
+        claimed = self.action('claim', marker)
+        self.assertEqual(claimed['status'], 'deployment_claimed', claimed)
+        self.assertIsNone(claimed['blocked'])
+        self.assertEqual(claimed['frontend_request']['applications']['shell-hub']['sha'], self.sha)
 
     def test_runner_records_harbor_receipt_and_unlocks_repository(self):
         marker = self.setup_item(1)

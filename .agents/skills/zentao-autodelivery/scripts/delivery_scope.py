@@ -24,7 +24,7 @@ def project_mode(development):
 
 
 def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_deploy_enabled=False,
-                 git_push_enabled=False):
+                 git_push_enabled=False, post_merge_e2e=False):
     if scope not in SCOPES.values():
         raise ValueError('Unknown delivery scope')
     stages = list(PREFIX)
@@ -38,9 +38,12 @@ def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_depl
         stages.append('handoff')
     if scope in ('frontend_only', 'fullstack'):
         stages.extend('frontend.' + step for step in SIDE_STEPS)
+        if post_merge_e2e:
+            stages.append('frontend.integration')
         if e2e_enabled:
             stages.append('frontend.e2e')
-        stages.append('frontend.integration')
+        if not post_merge_e2e:
+            stages.append('frontend.integration')
         if git_push_enabled:
             stages.append('frontend.push')
         if frontend_deploy_enabled:

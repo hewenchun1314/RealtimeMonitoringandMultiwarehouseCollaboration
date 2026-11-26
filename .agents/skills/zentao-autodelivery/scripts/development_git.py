@@ -2,17 +2,37 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
+import sqlite3
+import subprocess
 
 from backend_dependencies import backend_services, writable_dependencies
-from branch_check import branch_context, planned_applications, source_workspace, valid_target
+from branch_check import branch_context, git, is_repo_root, planned_applications, source_workspace, valid_target
 from execution import active_attempt, execution_matches
 from ledger import Ledger, encode, item_identity, message, require_text, transaction
-from route_execution import snapshot, stage_evidence, task_scope
+from route_execution import get_split, snapshot, stage_evidence, task_scope
 
 ACTIONS = {'branch_prepare': 'prepare', 'candidate_commit': 'commit', 'integration_merge': 'integrate'}
 COMMIT = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+
+
+def is_main_frontend_repair(item, phase, route):
+    return bool(item['stage'] == 'frontend.e2e' and phase == 'frontend.coding'
+                and route and route.get('post_merge_e2e'))
+
+
+def overlapping_paths(selected, dirty):
+    def parts(value):
+        return PurePosixPath(os.path.normcase(value).replace('\\', '/')).parts
+
+    reserved = [parts(path) for path in dirty]
+    for path in selected:
+        current = parts(path)
+        if any(current[:len(other)] == other or other[:len(current)] == current for other in reserved):
+            return True
+    return False
 
 
 def active_context(store, data, directory, kind):
@@ -32,6 +52,17 @@ def active_context(store, data, directory, kind):
     side = stage.split('.')[0] if '.' in stage else 'frontend'
     scoped = '.' in stage
     admitted = snapshot(item)
+    frontend_route = get_split(store, item) if scoped and side == 'frontend' else None
+    main_repair = kind == 'commit' and is_main_frontend_repair(item, trial['phase'], frontend_route)
+    main_integration = (kind == 'integrate' and frontend_route and frontend_route.get('post_merge_e2e'))
+    merged = {}
+    if main_repair or main_integration:
+        from frontend_delivery import owns_slot
+
+        if not owns_slot(store, item, directory):
+            raise ValueError('The main frontend Git operation requires the current delivery lock')
+    if main_repair:
+        merged = (stage_evidence(store, item, 'frontend.integration') or {}).get('merged_versions', {})
     plan_name = side + '.plan' if scoped else 'plan'
     plan = stage_evidence(store, item, plan_name)
     keys = planned_applications(plan, side)
@@ -97,16 +128,118 @@ def active_context(store, data, directory, kind):
             # registered ownership proof, rather than the new round number,
             # identifies the checkout that already holds the tested candidate.
             sources[key].update(proof)
+        if main_repair:
+            sha = merged.get(key)
+            if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
+                raise ValueError('The main frontend repair requires a verified merged SHA per repository')
+            sources[key].update(main_repair=True, worktree=str(source), worktree_branch=target['branch'], base_commit=sha)
         if kind == 'integrate':
             sha = coding.get('versions', {}).get(key)
             if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
                 raise ValueError('Integration requires a recorded coding candidate for every repository')
             sources[key]['candidate'] = sha
+            if main_integration:
+                sources[key].update(main_delivery=True, verify_after_merge='frontend.e2e' in frontend_route['stages'])
     return {'item': item_identity(item), 'item_seq': item['seq'], 'marker': item['marker'],
             'request_id': item['request_id'], 'chat_id': item['chat_id'], 'attempt_id': trial['attempt_id'],
             'phase': trial['phase'], 'phase_started_at': trial['phase_started_at'],
             'deadline_at': trial['deadline_at'], 'kind': kind, 'side': side,
             'repositories': sources}, item, trial
+
+
+def main_repair_baseline(store, item_seq, key, proof):
+    row = store.conn.execute('''SELECT dirty FROM frontend_main_repair_baselines
+        WHERE item_seq=? AND repository=? AND target_ref=? AND base_commit=?''',
+        (item_seq, proof['source_root'], proof['target_branch'], proof['base_commit'])).fetchone()
+    if row is None:
+        raise ValueError('Capture the main frontend repair baseline before editing ' + key)
+    return json.loads(row['dirty'])
+
+
+def dirty_paths(root):
+    result = subprocess.run(['git', '-C', str(root), '--no-optional-locks', 'status', '--porcelain=v1',
+                             '-z', '--no-renames', '--untracked-files=all', '--ignore-submodules=untracked'],
+                            capture_output=True, text=True, encoding='utf-8', timeout=5, check=True)
+    paths = [line[3:] for line in result.stdout.split('\0') if line]
+    if any(line[:2] in ('DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU') for line in result.stdout.split('\0')):
+        raise ValueError('The main frontend checkout has unresolved Git conflicts')
+    return sorted(paths)
+
+
+def check_main_ref(proof, sha):
+    root = Path(proof['source_root'])
+    target = 'refs/heads/' + proof['target_branch']
+    if (not is_repo_root(root) or git(root, 'symbolic-ref', '--quiet', 'HEAD', allowed=(0, 1)) != target
+            or git(root, 'rev-parse', '--verify', target) != sha):
+        raise ValueError('The main frontend checkout is no longer at the exact target branch and revision')
+    return root
+
+
+def prepare_main_repair(store, item, trial, config_directory, previous_versions):
+    """Record pre-existing edits once for a merged baseline, including retries."""
+    binding = {key: item[key] for key in ('request_id', 'chat_id')}
+    data = {**binding, 'item': item_identity(item), 'attempt_id': trial['attempt_id'], 'phase': trial['phase']}
+    context, _, _ = active_context(store, data, config_directory, 'commit')
+    proofs = context['repositories']
+    if set(proofs) != set(previous_versions) or any(
+            not proof.get('main_repair') or proof['base_commit'] != previous_versions[key]
+            for key, proof in proofs.items()):
+        raise ValueError('The main repair does not match the effective merged repository versions')
+    store.conn.execute('''CREATE TABLE IF NOT EXISTS frontend_main_repair_baselines (
+        item_seq INTEGER NOT NULL REFERENCES work_items(seq), repository TEXT NOT NULL,
+        target_ref TEXT NOT NULL, base_commit TEXT NOT NULL, dirty TEXT NOT NULL,
+        PRIMARY KEY (item_seq, repository, target_ref, base_commit))''')
+    repos = {}
+    for key, proof in proofs.items():
+        root = proof['source_root']
+        ref = proof['target_branch']
+        sha = proof['base_commit']
+        row = store.conn.execute('''SELECT dirty FROM frontend_main_repair_baselines
+            WHERE item_seq=? AND repository=? AND target_ref=? AND base_commit=?''',
+            (item['seq'], root, ref, sha)).fetchone()
+        if row is None:
+            try:
+                dirty = dirty_paths(check_main_ref(proof, sha))
+            except subprocess.SubprocessError as error:
+                raise ValueError('Read the main frontend checkout status before starting repair') from error
+            store.conn.execute('INSERT INTO frontend_main_repair_baselines VALUES (?,?,?,?,?)',
+                               (item['seq'], root, ref, sha, encode(dirty)))
+        else:
+            dirty = json.loads(row['dirty'])
+        repos[key] = {'worktree': root, 'target_branch': ref, 'expected_head': sha, 'protected_files': dirty}
+    return {'repositories': repos}
+
+
+def repair_commit_error(store, item, versions, previous_versions):
+    """Require a bound host commit receipt and an unchanged target ref per app."""
+    if not isinstance(versions, dict) or versions.keys() != previous_versions.keys():
+        return 'The main repair must declare all per-application target revisions'
+    branches = (stage_evidence(store, item, 'frontend.branch_check') or {}).get('repositories', {})
+    rows = store.conn.execute('''SELECT g.*, a.run_round FROM development_git_operations g
+        JOIN attempts a ON a.attempt_id=g.attempt_id
+        WHERE g.item_seq=? AND g.kind='commit' AND a.stage='frontend.e2e' AND a.run_round=? AND g.result IS NOT NULL''',
+        (item['seq'], item['run_round'])).fetchall()
+    evidence = {}
+    for row in rows:
+        request = json.loads(row['request'])['context']
+        result = json.loads(row['result']).get('repositories', {})
+        for key, receipt in result.items():
+            proof = request['repositories'][key]
+            if (proof.get('main_repair') is True and proof['base_commit'] == previous_versions.get(key)
+                    and receipt.get('status') == 'verified'):
+                evidence[key] = receipt.get('candidate')
+    for key, sha in versions.items():
+        if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
+            return 'The main repairs require exact Git commit revisions'
+        if sha != previous_versions[key] and evidence.get(key) != sha:
+            return f'Main frontend repair for {key} requires a verified host Git commit receipt'
+        try:
+            check_main_ref(branches[key], sha)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            return str(error)
+    if versions == previous_versions:
+        return 'A successful main frontend repair must update at least one target revision'
+    return None
 
 
 def relative_files(root, files):
@@ -139,7 +272,8 @@ def operation_history(conn, database, context, exclude=None):
                             (context['item_seq'], context['kind'])):
         if row['operation_id'] == exclude:
             continue
-        previous = json.loads(row['request'])['context']
+        saved_request = json.loads(row['request'])
+        previous = saved_request['context']
         if previous['marker'] != context['marker']:
             continue
         repositories = {}
@@ -163,6 +297,9 @@ def operation_history(conn, database, context, exclude=None):
                 value['failed_hooks'] = [p.stem for p in failed]
                 value['failed_hook_args'] = {p.stem: p.read_bytes().decode('utf-8').rstrip('\0').split('\0') for p in failed}
             if value is not None:
+                if old.get('main_repair') and context['kind'] == 'commit':
+                    entry = saved_request['payload'][key]
+                    value = {**value, 'repair_files': entry.get('confirmed_files', entry['files'])}
                 repositories[key] = value
         history.append({'repositories': repositories})
     return history
@@ -221,11 +358,30 @@ def request_host_git(database, config, data, now, directory):
                     message_text = require_text(entry.get('message'), 'message')
                     if '\x00' in message_text or len(message_text) > 10000:
                         raise ValueError('Invalid commit message')
-                    root = Path(context['repositories'][key]['worktree']).resolve()
+                    proof = context['repositories'][key]
+                    root = Path(proof['worktree']).resolve()
                     files = relative_files(root, entry.get('files'))
+                    if proof.get('main_repair'):
+                        normalized = {PurePosixPath(path).as_posix(): digest for path, digest in files.items()}
+                        if len(normalized) != len(files) or len({os.path.normcase(path) for path in normalized}) != len(files):
+                            raise ValueError('Repair paths must resolve to unique literal files')
+                        files = normalized
                     payload[key] = {'expected_head': entry['expected_head'], 'message': message_text,
                                     'files': list(files), 'fingerprints': files,
                                     'verification': entry.get('verification', '')}
+                    if proof.get('main_repair'):
+                        baseline = main_repair_baseline(store, item['seq'], key, proof)
+                        if overlapping_paths(files, baseline):
+                            raise ValueError('Requested repair files overlap pre-existing main checkout changes')
+                        if entry['expected_head'] != proof['base_commit']:
+                            previous_repair = next((h['repositories'][key] for h in reversed(history)
+                                                   if key in h['repositories']
+                                                   and h['repositories'][key].get('candidate') == entry['expected_head']
+                                                   and h['repositories'][key].get('status') == 'candidate_retest_required'), None)
+                            if files or not previous_repair or not str(entry.get('verification', '')).strip():
+                                raise ValueError('Main repair requires the merged base or a known host commit awaiting verification')
+                            payload[key]['confirmed_files'] = previous_repair['repair_files']
+                        payload[key]['baseline_dirty'] = baseline
                 context['repositories'] = {key: context['repositories'][key] for key in commits}
             if kind == 'integrate':
                 payload = {'verification': data.get('verification', '')}
@@ -240,7 +396,7 @@ def request_host_git(database, config, data, now, directory):
             conn.execute('INSERT INTO development_git_operations(operation_id,item_seq,attempt_id,phase,kind,request,created_at) VALUES (?,?,?,?,?,?,?)',
                          (operation, item['seq'], context['attempt_id'], context['phase'], kind, encode(request), store.time))
             return message('host_git_worker_required', operation_id=operation)
-        except (KeyError, TypeError, ValueError, OSError) as error:
+        except (KeyError, TypeError, ValueError, OSError, sqlite3.Error) as error:
             return message('host_git_rejected', reason=str(error))
 
 

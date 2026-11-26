@@ -129,13 +129,33 @@ function exactText(selector, text) {
 }
 
 function scenarioResult(error) {
-  if (error instanceof AssertionError) return { status: 'failed', stage: 'acceptance', repair_required: true };
+  const cases = Array.isArray(error.scenario_cases) ? { scenario_cases: error.scenario_cases } : {};
+  if (error instanceof AssertionError) return { status: 'failed', stage: 'acceptance', repair_required: true,
+    ...(error.check ? { check: error.check } : {}), ...cases };
   return { status: 'blocked', stage: error.stage || 'scenario', repair_required: false,
-    ...(error.check ? { check: error.check } : {}) };
+    ...(error.check ? { check: error.check } : {}), ...cases };
+}
+
+function loadedDigest(target, expectedGateway) {
+  const frames = [window];
+  const observed = new Set();
+  for (const frame of frames) {
+    try {
+      for (let index = 0; index < frame.frames.length; index += 1) frames.push(frame.frames[index]);
+      for (const entry of frame.performance.getEntriesByName(target, 'resource')) {
+        const timing = entry.serverTiming.find(metric => metric.name === 'zentao-resource');
+        const gateway = entry.serverTiming.find(metric => metric.name === 'zentao-gateway');
+        observed.add(expectedGateway && gateway?.description !== expectedGateway ? null : timing?.description || null);
+      }
+    } catch {
+      // A different-origin frame has its own inaccessible timing timeline.
+    }
+  }
+  return observed.size ? { digest: observed.size === 1 ? [...observed][0] : null } : null;
 }
 
 async function checkPage(browser, options, scenario) {
-  const { baseUrl, loginPath, platformPath, entryPath, workArea, username, checks, resources } = options;
+  const { baseUrl, loginPath, platformPath, entryPath, workArea, username, checks, resources, postMerge } = options;
   if (!checks?.length) throw new Blocked('test-data-profile');
   const platform = new URL(platformPath, baseUrl).href;
   const login = new URL(loginPath, baseUrl).href;
@@ -212,30 +232,45 @@ async function checkPage(browser, options, scenario) {
     passedChecks.push(name);
   }
 
-  const verifiedResources = [];
-  for (const { app, url, sha256 } of resources || []) {
-    const target = JSON.stringify(url);
-    await until(() => browser.evaluate(`performance.getEntriesByName(${target}, 'resource').length > 0`), 'candidate-resource', app);
-    const actual = await browser.evaluate(`(async () => {
-      const response = await fetch(${target}, { cache: 'no-store', redirect: 'error' });
-      if (!response.ok) return null;
-      return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', await response.arrayBuffer())),
-        byte => byte.toString(16).padStart(2, '0')).join('');
-    })()`);
-    if (actual !== sha256) throw new Blocked('candidate-resource', app);
-    verifiedResources.push({ app, url, sha256 });
-  }
+  const verifyResources = async () => {
+    const verified = [];
+    for (const { app, url, sha256 } of resources || []) {
+      const target = JSON.stringify(url);
+      let actual;
+      if (postMerge) {
+        const gateway = JSON.stringify(options.gatewayHash || '');
+        const measurement = await until(() => browser.evaluate(`(${loadedDigest})(${target},${gateway})`), 'candidate-resource', app);
+        actual = measurement.digest;
+      } else {
+        await until(() => browser.evaluate(`performance.getEntriesByName(${target}, 'resource').length > 0`), 'candidate-resource', app);
+        actual = await browser.evaluate(`(async () => {
+          const response = await fetch(${target}, { cache: 'no-store', redirect: 'error' });
+          if (!response.ok) return null;
+          return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', await response.arrayBuffer())),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+        })()`);
+      }
+      if (actual !== sha256) throw new Blocked('candidate-resource', app);
+      verified.push({ app, url, sha256 });
+    }
+    return verified;
+  };
+  const verifiedResources = await verifyResources();
+  let scenarioCases;
   if (scenario) {
+    let scenarioError;
     try {
-      await scenario({ browser });
+      scenarioCases = await scenario({ browser, ...(postMerge ? { verifyResources } : {}) });
     } catch (error) {
-      await authenticatedLocation();
-      return { ...scenarioResult(error), checks: passedChecks, candidate_resources: verifiedResources };
+      scenarioError = error;
     }
     await authenticatedLocation();
+    if (postMerge) await verifyResources();
+    if (scenarioError) return { ...scenarioResult(scenarioError), checks: passedChecks, candidate_resources: verifiedResources };
   }
   return { status: 'passed', stage: scenario ? 'acceptance' : 'preflight', checks: passedChecks,
     ...(foregroundRetry ? { foreground_retry: true } : {}),
+    ...(Array.isArray(scenarioCases) ? { scenario_cases: scenarioCases } : {}),
     ...(scenario ? { candidate_resources: verifiedResources } : {}) };
 }
 
@@ -288,8 +323,16 @@ async function main() {
   const options = JSON.parse(readFileSync(0, 'utf8'));
   const client = connect(options);
   try {
-    const scenario = options.scenario ? require(options.scenario) : undefined;
-    if (options.scenario && typeof scenario !== 'function') throw new Blocked('scenario-profile');
+    let scenario;
+    if (options.scenario) {
+      try {
+        scenario = options.postMerge ? require('./agentlimb_scenario.cjs').loadScenario(options.scenario) : require(options.scenario);
+      } catch (error) {
+        if (error instanceof TypeError && options.postMerge) throw new Blocked('scenario-profile');
+        throw error;
+      }
+      if (typeof scenario !== 'function') throw new Blocked('scenario-profile');
+    }
     await client.initialize();
     return await runSession(client.call, options, scenario);
   } catch (error) {

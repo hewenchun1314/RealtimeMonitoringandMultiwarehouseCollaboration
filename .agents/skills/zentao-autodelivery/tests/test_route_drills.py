@@ -48,6 +48,7 @@ class RouteDrills(unittest.TestCase):
         self.config.pop('backend_dependencies', None)
         self.config.get('e2e', {}).pop('enabled', None)
         self.config.get('e2e', {}).pop('agentlimb', None)
+        self.config.get('e2e', {}).pop('after_integration', None)
         # These drills end at integration. The frontend publisher has its own worker tests.
         self.config['development']['frontend_bundle'].pop('deployment', None)
         self.config['development']['allowed_requirement_types'] = ['frontend_only']

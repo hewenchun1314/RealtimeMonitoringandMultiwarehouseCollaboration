@@ -13,7 +13,7 @@ from contextlib import closing
 import subprocess
 
 from branch_check import inspect_repository, is_repo_root, source_refs
-from development_git import relative_files
+from development_git import overlapping_paths, relative_files
 from stage_runner import write_json
 
 DIAGNOSTICS = ContextVar('host_git_diagnostics', default=None)
@@ -34,7 +34,7 @@ def diagnostic(process):
 
 
 
-def git(root, *args, deadline, allowed=(0,), env=None):
+def git(root, *args, deadline, allowed=(0,), env=None, raw=False):
     budget = (datetime.fromisoformat(deadline) - datetime.now(timezone.utc)).total_seconds()
     if budget <= 0:
         raise ValueError('The original host Git deadline elapsed')
@@ -50,7 +50,7 @@ def git(root, *args, deadline, allowed=(0,), env=None):
     if process.returncode not in allowed:
         raise ValueError('Git operation failed (exit ' + str(process.returncode) + '); hooks/checks remain enabled'
                          + ('; diagnostics: ' + log if log else ''))
-    return process.stdout.strip() if process.returncode == 0 else None
+    return (process.stdout if raw else process.stdout.strip()) if process.returncode == 0 else None
 
 
 def common_directory(source, deadline):
@@ -94,7 +94,7 @@ def validate_worktree(proof, deadline):
 
 
 @contextmanager
-def hooks(root, journal, deadline):
+def hooks(root, journal, deadline, *, selected_files=None):
     """Observe real hook exit codes, including post hooks Git itself ignores."""
     actual = Path(git(root, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks', deadline=deadline))
     wrappers = journal / 'hook-forwarders'
@@ -110,13 +110,20 @@ def hooks(root, journal, deadline):
         for hook in actual.iterdir():
             if not hook.is_file() or hook.name.endswith('.sample') or not os.access(hook, os.X_OK):
                 continue
+            guard = ''
+            if selected_files is not None and hook.name in ('pre-commit', 'prepare-commit-msg', 'commit-msg'):
+                exclusions = ' '.join(shlex.quote(':(exclude,top,literal)' + file) for file in selected_files)
+                guard = ('if [ "$status" = 0 ]; then\n'
+                         '  (unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS; '
+                         'git diff --cached --quiet -- . ' + exclusions + ')\n'
+                         '  status=$?\nfi\n')
             script = ("#!/bin/sh\n"
                       "if [ \"$ZENTAO_PARENT_GIT_CONFIG_PRESENT\" = 1 ]; then\n"
                       "  export GIT_CONFIG_PARAMETERS=\"$ZENTAO_PARENT_GIT_CONFIG_PARAMETERS\"\n"
                       "else unset GIT_CONFIG_PARAMETERS; fi\n"
                       + 'printf \'%s\\0\' "$@" > ' + shlex.quote((reports / (hook.name + '.args')).as_posix()) + '\n'
                       + shlex.quote(hook.resolve().as_posix()) + ' "$@"\n'
-                      + 'status=$?\nprintf \"%s\\n\" "$status" > '
+                      + 'status=$?\n' + guard + 'printf \"%s\\n\" "$status" > '
                       + shlex.quote((reports / (hook.name + '.exit')).as_posix()) + '\nexit "$status"\n')
             wrapper = wrappers / hook.name
             wrapper.write_text(script, encoding='utf-8', newline='\n')
@@ -249,7 +256,87 @@ def prepare(proof, context, key, database, journal, payload=None):
     return inspected
 
 
+def validate_main_checkout(proof, deadline):
+    root = Path(proof['source_root'])
+    ref = 'refs/heads/' + proof['target_branch']
+    if (Path(proof['worktree']) != root or not is_repo_root(root)
+            or git(root, 'symbolic-ref', '--quiet', 'HEAD', allowed=(0, 1), deadline=deadline) != ref):
+        raise ValueError('The main checkout is not on the configured target branch')
+    return root, git(root, 'rev-parse', '--verify', ref, deadline=deadline)
+
+
+def tracked_changes(root, deadline, *, cached=False):
+    args = ('--cached',) if cached else ()
+    return set(git(root, 'diff', *args, '--name-only', '--no-renames', '--ignore-submodules=untracked', '-z',
+                   deadline=deadline, raw=True).split('\0')) - {''}
+
+
+def committed_paths(root, before, after, deadline):
+    return set(git(root, 'diff', '--name-only', '--no-renames', '-z', before, after,
+                   deadline=deadline, raw=True).split('\0')) - {''}
+
+
+def main_commit(proof, entry, context, operation, key, journal):
+    deadline = context['deadline_at']
+    root, head = validate_main_checkout(proof, deadline)
+    selected = entry['files']
+    baseline = set(entry['baseline_dirty'])
+    if overlapping_paths(selected, baseline):
+        raise ValueError('Requested repair files overlap pre-existing main checkout changes')
+    ensure_hooks(root, root, deadline)
+    marker = 'Codex-Host-Git: ' + operation + '/' + key
+    effect = journal / 'commit.json'
+    if head != entry['expected_head']:
+        body = git(root, 'log', '-1', '--format=%B', deadline=deadline)
+        parent = git(root, 'rev-parse', 'HEAD^', deadline=deadline)
+        if not effect.is_file() or marker not in body.splitlines() or parent != entry['expected_head']:
+            raise ValueError('The main checkout HEAD changed outside this host operation')
+        return {'status': 'candidate_retest_required', 'candidate': head, 'failed_hooks': failed_hooks(journal),
+                'reason': 'Recovered a repair commit; verify hooks and rerun checks on this SHA'}
+    if relative_files(root, selected) != entry['fingerprints']:
+        raise ValueError('Requested repair files changed after the sandbox request')
+    staged = tracked_changes(root, deadline, cached=True)
+    unstaged = tracked_changes(root, deadline)
+    if (staged | unstaged) - set(selected) - baseline:
+        raise ValueError('Unexpected tracked or staged changes outside the repair files require reconciliation')
+    if not selected:
+        if entry.get('needs_retest') and not str(entry.get('verification', '')).strip():
+            raise ValueError('Rerun checks and supply verification before confirming this repair')
+        if head != proof['base_commit'] and (git(root, 'rev-parse', 'HEAD^', deadline=deadline) != proof['base_commit']
+                or committed_paths(root, proof['base_commit'], head, deadline) - set(entry.get('confirmed_files', []))):
+            raise ValueError('The recorded repair does not exclusively cover its authorized paths and base')
+        rerun_post_hooks(root, entry.get('failed_hooks', []), journal, deadline, entry.get('failed_hook_args'))
+        if (tracked_changes(root, deadline, cached=True) | tracked_changes(root, deadline)) - baseline:
+            return {'status': 'candidate_retest_required', 'candidate': head,
+                    'reason': 'The original hook added tracked changes; reconcile and rerun checks'}
+        return {'status': 'verified', 'candidate': head}
+    untracked = set(git(root, 'ls-files', '--others', '--exclude-standard', '-z', deadline=deadline, raw=True).split('\0'))
+    if new_files := sorted(set(selected) & untracked):
+        git(root, 'add', '--intent-to-add', '--', *new_files, deadline=deadline)
+    write_json(effect, {'expected_head': head, 'files': selected, 'marker': marker})
+    try:
+        with hooks(root, journal, deadline, selected_files=selected) as (opts, env):
+            git(root, '--literal-pathspecs', *opts, 'commit', '--only', '-m', entry['message'], '-m', marker,
+                '--', *selected, deadline=deadline, env=env)
+    except (ValueError, subprocess.TimeoutExpired):
+        _, after = validate_main_checkout(proof, deadline)
+        if after == head:
+            raise
+        return {'status': 'candidate_retest_required', 'candidate': after,
+                'reason': 'The repair commit took effect but a hook or post-commit check failed; rerun checks',
+                'failed_hooks': failed_hooks(journal)}
+    _, after = validate_main_checkout(proof, deadline)
+    if (git(root, 'rev-parse', 'HEAD^', deadline=deadline) != head
+            or committed_paths(root, head, after, deadline) - set(selected) or relative_files(root, selected) != entry['fingerprints']
+            or (tracked_changes(root, deadline, cached=True) | tracked_changes(root, deadline)) - baseline):
+        return {'status': 'candidate_retest_required', 'candidate': after,
+                'reason': 'A hook changed the planned repair; reconcile files and rerun checks'}
+    return {'status': 'verified', 'candidate': after}
+
+
 def commit(proof, entry, context, operation, key, journal):
+    if proof.get('main_repair'):
+        return main_commit(proof, entry, context, operation, key, journal)
     deadline = context['deadline_at']
     root, head = validate_worktree(proof, deadline)
     ensure_hooks(Path(proof['source_root']), root, deadline)
@@ -311,6 +398,81 @@ def commit(proof, entry, context, operation, key, journal):
     return {'status': 'verified', 'candidate': after}
 
 
+def integrate_main(source, proof, tip, checked, journal, key, deadline, payload):
+    candidate = proof['candidate']
+    branch = 'refs/heads/' + proof['target_branch']
+    if checked and checked != [source]:
+        raise ValueError('The target branch is checked out outside the main frontend workspace')
+    if tracked_dirty(source, deadline):
+        raise ValueError('The main frontend checkout has tracked or staged edits; preserve and reconcile them')
+    contained = git(source, 'merge-base', '--is-ancestor', candidate, tip, deadline=deadline, allowed=(0, 1)) is not None
+    fast_forward = git(source, 'merge-base', '--is-ancestor', tip, candidate, deadline=deadline, allowed=(0, 1)) is not None
+    prediction = None
+    if not contained and not fast_forward:
+        if not proof['verify_after_merge']:
+            raise ValueError('A divergent frontend target must have post-merge verification enabled')
+        prediction = git(source, 'merge-tree', '--write-tree', '--no-messages', tip, candidate,
+                         deadline=deadline, allowed=(0, 1))
+        if prediction is None:
+            raise ValueError('The queued candidate conflicts with the current target; resolve and review it before merging')
+    effect = journal / 'integration.json'
+    earlier_effect = effect.is_file()
+    planned = {'target': branch, 'candidate': candidate, 'before': tip, 'worktree': str(source)}
+    if not checked:
+        ensure_hooks(source, source, deadline, checkout=tip)
+        write_json(effect, {**planned, 'phase': 'checkout'})
+        with hooks(source, journal, deadline) as (opts, env):
+            git(source, *opts, 'switch', '--no-guess', '--no-overwrite-ignore', '--', proof['target_branch'],
+                deadline=deadline, env=env)
+    prior_failed = payload.get('failed_hooks', {}).get(key) or failed_hooks(journal)
+    if not contained:
+        prior_failed = [name for name in prior_failed if name == 'post-checkout']
+    if prior_failed:
+        ensure_hooks(source, source, deadline)
+        rerun_post_hooks(source, prior_failed, journal, deadline,
+                         payload.get('failed_hook_args', {}).get(key) or failed_hook_args(journal), checkout_source=source)
+    if (git(source, 'symbolic-ref', '--quiet', 'HEAD', deadline=deadline, allowed=(0, 1)) != branch
+            or git(source, 'rev-parse', 'HEAD', deadline=deadline) != tip or tracked_dirty(source, deadline)):
+        raise ValueError('The main target checkout or iteration baseline changed; reconcile before integration')
+    if contained:
+        if (earlier_effect or key in payload.get('needs_retest', [])) and not str(payload.get('verification', '')).strip():
+            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': tip,
+                    'worktree': str(source), 'reason': 'Verify interrupted integration and retest this merged revision'}
+        return {'status': 'verified', 'candidate': candidate, 'merged': tip}
+    write_json(effect, {**planned, 'phase': 'merge', 'prediction': prediction})
+    ensure_hooks(source, source, deadline)
+    try:
+        with hooks(source, journal, deadline) as (opts, env):
+            strategy = ['--ff-only'] if fast_forward else ['--no-ff', '--no-edit']
+            git(source, *opts, 'merge', *strategy, '--no-autostash', '--no-overwrite-ignore', candidate,
+                deadline=deadline, env=env)
+    except (ValueError, subprocess.TimeoutExpired):
+        merged = git(source, 'rev-parse', branch, deadline=deadline)
+        if git(source, 'merge-base', '--is-ancestor', candidate, merged, deadline=deadline, allowed=(0, 1)) is not None:
+            return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
+                    'worktree': str(source), 'reason': 'Merge took effect but a check failed; reconcile and retest',
+                    'failed_hooks': failed_hooks(journal)}
+        # An original hook may reject a predicted-clean merge before commit.
+        # Abort only if the operation owns the untouched predicted index/tree.
+        if (prediction and merged == tip
+                and git(source, 'rev-parse', '--verify', 'MERGE_HEAD', deadline=deadline, allowed=(0, 128)) == candidate
+                and not tracked_changes(source, deadline)
+                and git(source, 'write-tree', deadline=deadline) == prediction):
+            git(source, 'merge', '--abort', deadline=deadline)
+        raise
+    merged = git(source, 'rev-parse', branch, deadline=deadline)
+    if fast_forward:
+        correct_tree = merged == candidate
+    else:
+        correct_tree = (git(source, 'rev-list', '--parents', '-n', '1', merged, deadline=deadline).split()
+                        == [merged, tip, candidate]
+                        and git(source, 'rev-parse', merged + '^{tree}', deadline=deadline) == prediction)
+    if not correct_tree or tracked_dirty(source, deadline):
+        return {'status': 'integration_retest_required', 'candidate': candidate, 'merged': merged,
+                'worktree': str(source), 'reason': 'The main integration tree or index differs; reconcile and retest'}
+    return {'status': 'verified', 'candidate': candidate, 'merged': merged, 'target_before': tip}
+
+
 def integrate(proof, context, operation, key, journal, database, payload):
     deadline = context['deadline_at']
     source = Path(proof['source_root'])
@@ -325,6 +487,8 @@ def integrate(proof, context, operation, key, journal, database, payload):
         tip = git(source, 'rev-parse', '--verify', remote, deadline=deadline)
         git(source, 'branch', '--', proof['target_branch'], tip, deadline=deadline)
     checked = [Path(x['worktree']).resolve() for x in inventory(source, deadline) if x.get('branch') == branch]
+    if proof.get('main_delivery'):
+        return integrate_main(source, proof, tip, checked, journal, key, deadline, payload)
     worktrees_root = database.resolve().parent / 'worktrees'
     temporary = worktrees_root / (proof['worktree_branch'].split('/')[-1] + '-integration') / key
     if temporary.resolve() != temporary or not temporary.is_relative_to(worktrees_root):

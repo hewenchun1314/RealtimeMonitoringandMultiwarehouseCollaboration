@@ -53,6 +53,72 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result['status'], 'worker_host_git_stop_unverified')
         host.assert_not_called()
 
+    def test_frontend_host_e2e_handoff_yields_the_same_chat_to_fixed_runner(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'frontend.e2e'}
+        marker = 'HNF-' + '1' * 20
+        calls = []
+
+        def chat(current):
+            self.assertIs(current, item)
+            calls.append('chat')
+            return {'receipt_path': 'chat', 'stop_confirmed': True, 'outcome': 'success'}, None
+        def pending(*_):
+            return {'status': 'host_e2e_pending' if calls == ['chat'] else 'host_e2e_not_pending'}
+        def host(*_):
+            calls.append('e2e')
+            return {'status': 'host_e2e_finished', 'receipt': 'agentlimb.json'}
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}), \
+                patch.object(worker, 'frontend_queue_owner', return_value=None, create=True), \
+                patch.object(worker, 'pending_frontend_e2e', side_effect=pending, create=True), \
+                patch.object(worker, 'run_frontend_e2e', side_effect=host, create=True), \
+                patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}):
+            result = worker.dispatch_work_item(marker, chat)
+        self.assertEqual(calls, ['chat', 'e2e', 'chat'])
+        self.assertEqual(result['frontend_e2e']['receipt'], 'agentlimb.json')
+
+    def test_frontend_host_e2e_leaves_processes_alone_when_prior_stop_unknown(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'frontend.e2e'}
+        with patch.object(worker, 'read_item', return_value=item), \
+                patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}), \
+                patch.object(worker, 'frontend_queue_owner', return_value=None, create=True), \
+                patch.object(worker, 'pending_frontend_e2e', return_value={'status': 'host_e2e_pending'}, create=True), \
+                patch.object(worker, 'run_frontend_e2e', create=True) as host:
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, lambda _: self.fail('must not resume'))
+        self.assertEqual(result['status'], 'worker_host_e2e_stop_unverified')
+        host.assert_not_called()
+
+    def test_frontend_wait_record_resumes_once_when_owner_releases_at_turn_end(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'frontend.integration'}
+        calls = []
+
+        def chat(current):
+            self.assertIs(current, item)
+            calls.append('chat')
+            return {'receipt_path': 'chat', 'stop_confirmed': True, 'outcome': 'success'}, None
+        with (
+            patch.object(worker, 'read_item', return_value=item),
+            patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}),
+            patch.object(worker, 'frontend_queue_owner', return_value=None),
+            patch.object(worker, 'frontend_waiting', side_effect=[False, True, True]),
+            patch.object(worker, 'pending_frontend_e2e', return_value={'status': 'host_e2e_not_pending'}),
+        ):
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, chat)
+        self.assertEqual(calls, ['chat', 'chat'])
+        self.assertEqual(result['status'], 'worker_stopped')
+
+    def test_frontend_preflight_waits_while_work_item_owns_live_delivery(self):
+        from contextlib import nullcontext
+
+        with (
+            patch.object(worker, 'frontend_e2e_lock', return_value=nullcontext(True)),
+            patch.object(worker, 'frontend_delivery_in_use', return_value=True),
+            patch.object(worker, 'run_locked_e2e_preflight') as preflight,
+        ):
+            result = worker.run_e2e_preflight(None)
+        self.assertEqual(result['status'], 'e2e_preflight_busy')
+        preflight.assert_not_called()
+
     def deployment_route(self, peek, deployments, chat_outcomes):
         item = {'state': 'running', 'chat_id': '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'}
         calls = []

@@ -276,6 +276,8 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
             response = actions[action](store, item, data, config_directory=config_directory)
         else:
             response = actions[action](store, item, data)
+        if response['status'] == 'frontend_delivery_busy':
+            return response
         if dingtalk_enabled(config) and response['status'] in ('started', 'completed'):
             enqueue_notification(store, item, response)
         conn.execute('INSERT INTO events(event_id,request,response) VALUES(?,?,?)',

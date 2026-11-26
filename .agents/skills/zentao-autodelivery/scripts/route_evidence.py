@@ -37,7 +37,16 @@ def agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_
         receipt = json.loads(receipt_path.read_text(encoding='utf-8-sig'))
     except (OSError, ValueError):
         return 'AgentLimb receipt could not be read'
-    versions = (stage_evidence(store, item, 'frontend.coding') or {}).get('versions')
+    route = get_split(store, item)
+    versions = frontend_acceptance_versions(store, item, route)
+    if (route or {}).get('post_merge_e2e'):
+        expected_path = root / 'frontend' / f'e2e-{attempt_id}' / 'agentlimb.json'
+        host = receipt.get('host_run', {}) if isinstance(receipt, dict) else {}
+        stop = host.get('stop_evidence', {}) if isinstance(host, dict) else {}
+        if (receipt_path != expected_path or not isinstance(host, dict) or host.get('stop_confirmed') is not True
+                or not isinstance(stop, dict) or type(stop.get('owned_processes_active_after_stop')) is not int
+                or stop['owned_processes_active_after_stop'] != 0):
+            return 'Provide the verified Windows host receipt with tested process cleanup for this E2E attempt'
     if (not isinstance(receipt, dict) or receipt.get('runner') != 'agentlimb' or receipt.get('marker') != item['marker']
             or receipt.get('attempt_id') != attempt_id or receipt.get('status') != expected
             or receipt.get('stage') != 'acceptance' or not commit_map(versions) or receipt.get('versions') != versions):
@@ -47,8 +56,58 @@ def agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_
             or any(not isinstance(row, dict) or not nonblank(row.get('app')) for row in resources)
             or {row['app'] for row in resources} != versions.keys()):
         return 'AgentLimb receipt must include checks and observed resources for every candidate application'
+    if (route or {}).get('post_merge_e2e') and any(
+        not nonblank(row.get('url')) or not isinstance(row.get('sha256'), str)
+        or not re.fullmatch(r'[0-9a-f]{64}', row['sha256']) for row in resources
+    ):
+        return 'Host E2E must attest resource addresses and SHA-256 digests observed by the browser'
+    if (route or {}).get('post_merge_e2e'):
+        cases = receipt.get('scenario_cases')
+        if (not isinstance(cases, list) or not cases or any(
+                not isinstance(case, dict) or not nonblank(case.get('name'))
+                or case.get('status') not in ('passed', 'failed', 'blocked') for case in cases
+        ) or len({case['name'] for case in cases}) != len(cases)):
+            return 'Host E2E must record all declared business scenario outcomes'
+        states = {case['status'] for case in cases}
+        if (expected == 'passed' and states != {'passed'}) or (expected == 'failed' and 'failed' not in states):
+            return 'The formal E2E result must agree with recorded business case outcomes'
     if expected == 'failed' and receipt.get('repair_required') is not True:
         return 'Only a confirmed AgentLimb business assertion failure can trigger code repair'
+
+
+def host_e2e_blocker_error(item, attempt_id, evidence, config_directory, outcome):
+    """Keep an active host attempt separate from a terminal environment blocker."""
+    if config_directory is None:
+        return 'A formal E2E attempt needs its project evidence directory'
+    folder = config_directory.parent / '.local' / 'zentao-delivery' / 'items' / item['marker'] / 'frontend'
+    folder = folder / f'e2e-{attempt_id}'
+    request = folder / 'host-request.json'
+    receipt_path = folder / 'agentlimb.json'
+    try:
+        if not request.is_file() and not (folder / 'host-run').exists() and not receipt_path.is_file():
+            if outcome in ('skipped', 'timed_out'):
+                return None
+            blocker = evidence.get('e2e_blocker', {}) if isinstance(evidence, dict) else {}
+            if (isinstance(blocker, dict) and nonblank(blocker.get('stage')) and nonblank(blocker.get('reason'))
+                    and blocker.get('cases') == 'not-run'):
+                return None
+            return 'Record the E2E blocker, reason and cases not run, or provide the completed host receipt'
+        receipt = json.loads(receipt_path.read_text(encoding='utf-8-sig'))
+        if (not isinstance(receipt, dict) or receipt.get('attempt_id') != attempt_id
+                or receipt.get('marker') != item['marker'] or receipt.get('runner') != 'agentlimb'):
+            return 'The active Windows E2E request requires its matching host receipt'
+        if (folder / 'host-run' / attempt_id / 'e2e-host').exists():
+            host = receipt.get('host_run')
+            if (not isinstance(host, dict) or host.get('stop_confirmed') is not True
+                    or (host.get('stop_evidence') or {}).get('owned_processes_active_after_stop') != 0):
+                return 'Finish the Windows host E2E and confirm that its processes stopped'
+        if receipt.get('status') == 'blocked':
+            return None
+        if receipt.get('status') == 'failed':
+            return 'Record the confirmed business assertion with repair_required and the formal E2E receipt'
+        return 'The recorded E2E outcome must match the completed host receipt'
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 'Wait for the Windows host E2E result and process cleanup before finishing the attempt'
 
 
 def check_candidate(proof, candidate):
@@ -117,16 +176,36 @@ def repository_evidence(store, item, side, stage, evidence):
         candidate = stage_evidence(store, item, side + '.coding') or {}
         if versions != candidate.get('versions') or not commit_map(merged) or merged.keys() != targets.keys():
             return 'Merge evidence must cover the recorded candidates and every target repository'
+    route = get_split(store, item)
+    post_merge = side == 'frontend' and (route or {}).get('post_merge_e2e')
+    defer_page_checks = post_merge and 'frontend.e2e' in route['stages']
+    effective = (stage_evidence(store, item, 'frontend.integration') or {}) if post_merge else {}
     try:
         for key, proof in targets.items():
             if stage == 'integration':
-                reason = check_merge(proof, versions[key], merged[key], nonblank(evidence.get('merged_verification')))
+                reverified = defer_page_checks or nonblank(evidence.get('merged_verification'))
+                reason = check_merge(proof, versions[key], merged[key], reverified)
+            elif post_merge and (stage == 'e2e' or effective.get('main_workspace_repair')):
+                reason = check_merged_commit(proof, versions[key], versions[key])
             else:
                 reason = check_candidate(proof, versions[key])
             if reason:
                 return f'{key}: {reason}'
     except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
         return f'Git evidence could not be verified: {error}'
+
+
+def frontend_acceptance_versions(store, item, route):
+    if (route or {}).get('post_merge_e2e'):
+        return (stage_evidence(store, item, 'frontend.integration') or {}).get('merged_versions')
+    return (stage_evidence(store, item, 'frontend.coding') or {}).get('versions')
+
+
+def frontend_acceptance_terminal(route, stages, merged):
+    if 'frontend.e2e' not in route['stages']:
+        return True
+    e2e = stages.get('frontend.e2e', {})
+    return e2e.get('terminal_step') is True and e2e.get('release_versions') == merged
 
 
 def git_push_requirements(store, item, stage):
@@ -149,6 +228,17 @@ def git_push_requirements(store, item, stage):
     branches = history[side + '.branch_check']['evidence'].get('repositories', {})
     if not planned or not commit_map(merged) or not merged.keys() <= set(planned) or branches.keys() != set(planned):
         return {}, {}, {}, 'Git 推送需要一致的计划、分支核验及合回 SHA'
+    if side == 'frontend' and route.get('post_merge_e2e'):
+        if integration.get('outcome') != 'success' or merged.keys() != set(planned):
+            return {}, {}, {}, '前端推送需要全部计划应用的成功合回回执'
+        if not frontend_acceptance_terminal(route, history, merged):
+            return {}, {}, {}, '前端 E2E、返工和复测须结束，且回执须对应最终合回版本'
+        unaffected = {name: entry for name, entry in history.items() if name not in ('frontend.e2e', stage)}
+        blockers = blocked_tasks(route, unaffected)
+        mapping = plan.get('task_repositories', {})
+        held = {key: '同一仓库仍有合回或交付前置任务受阻' for task in blockers
+                for key in mapping.get(task, [])}
+        return {key: sha for key, sha in merged.items() if key not in held}, branches, held, None
     acceptance_stage = 'backend.acceptance' if side == 'backend' else 'frontend.e2e'
     skip_e2e = acceptance_stage not in route['stages']
     acceptance = history.get(acceptance_stage, {})
@@ -359,7 +449,9 @@ def validate_success(store, item, stage, evidence, *, task_blockers=None):
         return repository_evidence(store, item, side, name, evidence)
     if name in ('unit_test', 'code_review', 'acceptance', 'e2e'):
         candidate = stage_evidence(store, item, side + '.coding') or {}
-        if not commit_map(evidence.get('versions')) or evidence['versions'] != candidate.get('versions'):
+        expected_versions = (frontend_acceptance_versions(store, item, get_split(store, item))
+                             if name == 'e2e' else candidate.get('versions'))
+        if not commit_map(evidence.get('versions')) or evidence['versions'] != expected_versions:
             return 'Verify the exact set of current candidate versions'
         if not nonblank(evidence.get('verification')):
             return 'Provide the command, observed result or verification evidence reference'

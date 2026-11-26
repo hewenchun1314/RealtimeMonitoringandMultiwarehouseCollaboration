@@ -21,10 +21,29 @@ def invalidate_repaired_outputs(stages, phase, route):
     order = route['stages']
     side = phase.partition('.')[0]
     for stage in order[order.index(phase) + 1:]:
+        if stage == 'frontend.integration' and route.get('post_merge_e2e'):
+            continue
         if (stage.partition('.')[0] == side or
                 (side in ('backend', 'handoff') and stage in (
                     'handoff', 'frontend.e2e', 'frontend.integration', 'frontend.push', FRONTEND_DEPLOY_STAGE))):
             stages.pop(stage, None)
+
+
+def replay_main_repair(stages, route, versions):
+    """Keep the original integration attempt and advance its effective target versions."""
+    if not (route or {}).get('post_merge_e2e'):
+        return
+    merged = stages['frontend.integration']
+    for name in ('frontend.unit_test', 'frontend.code_review', 'frontend.e2e', 'frontend.push', FRONTEND_DEPLOY_STAGE):
+        stages.pop(name, None)
+    previous = merged['evidence']['merged_versions']
+    bases = (merged['evidence'].get('main_repair_base_versions', previous)
+             if previous == versions else previous)
+    stages['frontend.integration'] = {**merged, 'evidence': {
+        **merged['evidence'], 'versions': versions, 'merged_versions': versions,
+        'task_changed_merges': [], 'main_workspace_repair': True,
+        'main_repair_base_versions': bases,
+    }}
 
 
 def read_history(store, item):
@@ -50,6 +69,8 @@ def read_history(store, item):
             if phase['phase'] == 'split':
                 route = phase['route']
                 stages = {name: receipt for name, receipt in stages.items() if name == 'material_check'}
+            elif phase.get('frontend_main_repair_versions'):
+                replay_main_repair(stages, route, phase['frontend_main_repair_versions'])
             else:
                 invalidate_repaired_outputs(stages, phase['phase'], route)
             stages[phase['phase']] = {'stage': phase['phase'], 'outcome': 'success',
@@ -69,6 +90,8 @@ def read_history(store, item):
                  'ended_at': record['ended_at'], 'retries': record['retry_number']}
         if 'terminal_step' in result:
             entry['terminal_step'] = result['terminal_step']
+        if 'release_versions' in result:
+            entry['release_versions'] = result['release_versions']
         if result.get('task_blockers'):
             entry['task_blockers'] = result['task_blockers']
         if result.get('contract_revision_pending'):
@@ -178,7 +201,10 @@ def split_result(store, item, evidence, *, revision=False):
     config = snapshot(item)
     route = resolve_split(config, {**evidence, 'material': reviewed['material']})
     route['e2e_enabled'] = config.get('e2e', {}).get('enabled', True)
+    if config.get('e2e', {}).get('after_integration') is True and route['scope'] != 'backend_only':
+        route['post_merge_e2e'] = True
     route['stages'] = list(route_stages(route['scope'], e2e_enabled=route['e2e_enabled'],
+                                       post_merge_e2e=route.get('post_merge_e2e', False),
                                        deploy_enabled=bool(configured_targets(config)),
                                        frontend_deploy_enabled=frontend_release_config(config).get('enabled', False),
                                        git_push_enabled=config.get('runtime', {}).get('git_push_enabled', False)))
@@ -211,7 +237,8 @@ def v2_repair(stage, data, route):
         phases.append(owner + '.code_review')
     if name == 'integration':
         acceptance = owner + ('.e2e' if owner == 'frontend' else '.acceptance')
-        if acceptance in route['stages']:
+        if (acceptance in route['stages'] and
+                not (owner == 'frontend' and route.get('post_merge_e2e'))):
             phases.append(acceptance)
     if joint and owner == 'backend':
         phases.extend(('backend.acceptance', 'backend.integration'))

@@ -183,5 +183,5 @@ def deployed_receipt_matches(receipt, service, sha, target):
 
 
 def release_locks(store, item, *, tags_only=False):
-    where = " AND scope='tag'" if tags_only else ''
+    where = " AND scope='tag'" if tags_only else " AND scope!='frontend-delivery'"
     store.conn.execute('DELETE FROM deployment_locks WHERE item_seq=?' + where, (item['seq'],))

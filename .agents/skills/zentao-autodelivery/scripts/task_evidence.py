@@ -76,7 +76,7 @@ def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_b
     """Validate and enrich a receipt before the existing transaction records the stage."""
     import task_sync
     from branch_check import git
-    from route_evidence import repository_evidence
+    from route_evidence import frontend_acceptance_versions, repository_evidence
     from route_execution import blocked_tasks, handoff_tasks, read_history, stage_evidence
 
     if not task_sync.enabled(item):
@@ -111,7 +111,8 @@ def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_b
     # still contribute independent passed tasks, so they need the same version checks.
     if not success and leaf in ('e2e', 'acceptance') and evidence.get('task_results'):
         coding = stage_evidence(store, item, side + '.coding') or {}
-        if not coding or coding.get('versions') != evidence.get('versions'):
+        expected = frontend_acceptance_versions(store, item, route) if leaf == 'e2e' else coding.get('versions')
+        if not expected or expected != evidence.get('versions'):
             return 'Partial acceptance must use the current candidate versions'
         if (leaf == 'e2e' and route['scope'] == 'fullstack'
                 and (handoff_tasks(route) - blocked.keys() or stage_evidence(store, item, 'handoff'))):
@@ -136,7 +137,8 @@ def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_b
         evidence['task_changed_merges'] = changed
         reviews = evidence.get('merged_task_verification', {})
         plan = stage_evidence(store, item, side + '.plan') or {}
-        return validate_merge_tests(plan.get('task_repositories', {}), changed, reviews, success)
+        defer = side == 'frontend' and route.get('post_merge_e2e') and 'frontend.e2e' in route['stages']
+        return validate_merge_tests(plan.get('task_repositories', {}), changed, reviews, success and not defer)
     return None
 
 
@@ -148,7 +150,7 @@ def _receipt(stages, stage, *, partial=False):
     return {}
 
 
-def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
+def _side_result(stages, side, task, facts, previous, *, skip_e2e=False, post_merge=False):
     plan = _receipt(stages, side + '.plan').get('task_repositories', {})
     repositories = plan.get(task, [])
     if not repositories:
@@ -156,7 +158,9 @@ def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
     test_stage = side + ('.e2e' if side == 'frontend' else '.acceptance')
     test = _receipt(stages, test_stage, partial=True)
     result = test.get('task_results', {}).get(task, {})
-    current = _receipt(stages, side + '.coding').get('versions', {})
+    merged = _receipt(stages, side + '.integration', partial=True)
+    current = (merged.get('merged_versions', {}) if post_merge and side == 'frontend' and not skip_e2e
+               else _receipt(stages, side + '.coding').get('versions', {}))
     versions = {key: current.get(key) for key in repositories}
     prior = previous.get(side, {})
     if prior.get('versions') != versions or set(prior.get('repositories', [])) != set(repositories):
@@ -174,13 +178,17 @@ def _side_result(stages, side, task, facts, previous, *, skip_e2e=False):
             component.update({k: prior[k] for k in ('acceptance', 'tested', 'verified_at', 'backend_versions')
                               if k in prior})
     facts[side] = component
-    merged = _receipt(stages, side + '.integration', partial=True)
     for key in repositories:
         merged_sha = merged.get('merged_versions', {}).get(key)
-        if merged_sha and versions[key] and merged.get('versions', {}).get(key) == versions[key]:
+        same_tree = merged.get('versions', {}).get(key) == versions[key]
+        verified_after_merge = post_merge and side == 'frontend' and not skip_e2e
+        if merged_sha and versions[key] and (verified_after_merge or same_tree):
             component['merged'][key] = merged_sha
-            component['merge_tested'][key] = (key not in merged.get('task_changed_merges', [])
-                                               or bool(merged.get('merged_task_verification', {}).get(task)))
+            component['merge_tested'][key] = (
+                component.get('tested', {}).get(key) == merged_sha if verified_after_merge
+                else key not in merged.get('task_changed_merges', []) or
+                bool(merged.get('merged_task_verification', {}).get(task))
+            )
     if skip_e2e:
         unit = _receipt(stages, side + '.unit_test').get('versions', {})
         review = _receipt(stages, side + '.code_review').get('versions', {})
@@ -255,7 +263,8 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
             if any(previous.get(field) != value for field, value in facts.items()):
                 previous = {}
             skip_e2e = side == 'frontend' and not e2e_enabled
-            reason = _side_result(stages, side, key, facts, previous, skip_e2e=skip_e2e)
+            reason = _side_result(stages, side, key, facts, previous, skip_e2e=skip_e2e,
+                                  post_merge=route.get('post_merge_e2e', False))
             if not reason:
                 reason = _push_result(route, stages, side, facts)
             if side == 'backend' and not reason and DEPLOY_STAGE in route.get('stages', []):
@@ -279,7 +288,8 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
                     if not current_joint:
                         reason = '等待有效的前后端版本联合验收'
                     elif side == 'backend':
-                        reason = _side_result(stages, 'frontend', key, facts, previous)
+                        reason = _side_result(stages, 'frontend', key, facts, previous,
+                                              post_merge=route.get('post_merge_e2e', False))
                         if not reason:
                             reason = _push_result(route, stages, 'frontend', facts)
             if skip_e2e:
