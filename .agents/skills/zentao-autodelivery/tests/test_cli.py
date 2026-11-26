@@ -59,6 +59,7 @@ class WorkflowCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = json.loads(CONFIG.read_text(encoding='utf-8'))
             config['monitor']['enabled'] = True
+            config['development']['max_concurrent_items'] = 1
             config.setdefault('runtime', {})['desktop_project_id'] = 'test-project'
             config_path = Path(directory) / 'config.json'
             config_path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')

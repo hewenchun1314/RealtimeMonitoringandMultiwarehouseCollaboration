@@ -80,6 +80,18 @@ def worker_prompt(operation, item):
     binding = {'item': identity, 'request_id': item['request_id'], 'chat_id': item['chat_id']}
     source_context = ''
     admitted = json.loads(item['config_snapshot'] or '{}')
+    streamlined_bug = (item['kind'] == 'bug' and admitted.get('workflow_version') == 2
+                       and admitted.get('runtime', {}).get('streamlined_bugs') is True)
+    route_context = (
+        '本单使用简化 Bug 流程。按 references/stages.md 的「简化 Bug 流程」由主聊天完成接单核对并登记路线。'
+        '编码阶段提交同一候选版本的单测证据。独立验证按 code_review 与验收依次存证，复用同一份派发内容和已有验证证据。'
+        '发现明确阻断时按本阶段回执收尾，双端交接及合回按账本顺序推进。'
+        if streamlined_bug else
+        '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
+        '新路线工单通过评审和拆分后，依次处理账本返回的每个阶段。当前阶段缺少必要输入或没有可处理的任务时，'
+        '用 attempt_finish 的 outcome=skipped 记录本阶段核对结果并继续；实际运行失败记 failed。'
+        '跨端依赖须验证交接；交接受阻时按账本继续独立的前端任务。旧工单沿用原阶段。'
+    )
     if admitted.get('zentao', {}).get('scope_mode') == 'project_or_product':
         with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
             source = conn.execute('SELECT source FROM work_item_sources WHERE item_seq=?', (item['seq'],)).fetchone()
@@ -107,16 +119,13 @@ def worker_prompt(operation, item):
         '沙箱内只编辑、构建、测试及只读 Git 核验；禁止自行 fetch、worktree add、commit、checkout 或 merge，禁止跳过原有 hooks。'
         '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
         '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
-        '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
+        f'{route_context}'
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
         '按同名后端服务列入计划并使用核验过的工单工作树。前端使用已配置业务后端的契约。'
         '若账本进入 backend.push、frontend.push、backend.deploy 或 frontend.deploy（含返工分段），'
         '结束当前轮次，Windows 执行器会接手并续接原会话。'
         '各阶段按 task_scope.active 派发，按编号记录 task_blockers 与证据。'
-        '新路线工单通过评审和拆分后，依次处理账本返回的每个阶段。当前阶段缺少必要输入或没有可处理的任务时，'
-        '用 attempt_finish 的 outcome=skipped 记录本阶段核对结果并继续；实际运行失败记 failed。'
-        '跨端依赖须验证交接；交接受阻时按账本继续独立的前端任务。旧工单沿用原阶段。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )
 

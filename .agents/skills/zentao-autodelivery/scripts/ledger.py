@@ -315,7 +315,7 @@ def validate_config(config):
         require_text(entry.get('branch'), 'integration worktree branch')
         require_text(entry.get('path'), 'integration worktree path')
     for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync',
-                'git_push_enabled'):
+                'git_push_enabled', 'streamlined_bugs'):
         if key in runtime and type(runtime[key]) is not bool:
             raise ValueError(f'runtime.{key} must be a boolean')
     if runtime.get('sync_requirement_before_review'):

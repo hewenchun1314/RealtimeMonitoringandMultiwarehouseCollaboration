@@ -12,6 +12,16 @@
 
 合回最终失败、超时或仅部分成功时，工单以「阻断」收尾，后续推送和部署标记为跳过。保留已合回仓库的实际 SHA 和未合回仓库的原因，供恢复时核对。
 
+## 简化 Bug 流程
+
+领取快照启用 `runtime.streamlined_bugs` 的 Bug 使用本节。Story 和已领取的旧 Bug 使用后续章节中的原流程。
+
+1. `material_check` 由主会话直接核对原单。成功回执提供 `detail`（原单复现详情）、`repositories`（按 `frontend` 或 `backend` 列出已配置且允许修改的应用键或服务键）和 `acceptance`（可复验的条件数组）。例如缺陷 #6 的 `repositories` 为 `{"frontend":["tet-smart-log"]}`，验收填写四个刷新图标消失及四张图正常初始显示。跨端额外提供 `interface_contract`，并用 `depends_on_backend` 记录实际依赖，缺省为 `true`。待确认的仓库或材料以失败和具体原因登记。账本直接生成后续路线。
+2. 主会话按 `branch_check` 准备工作树。本端开发 Agent 在 `coding` 定位根因、修复并运行相关测试，保留现有编码时限。宿主返回候选 SHA 后，核对测试对应提交内容，用 `evidence.versions` 和 `evidence.unit_test` 登记同一候选及通过的测试命令、结果或证据路径。发现 hooks 改动了测试时的文件，复验后再登记。
+3. 每端把代码审查和回归交给同一个独立验证责任方，使用 `validation_stages` 准备一份派发内容并复用证据。账本依次保存 `code_review` 与 `backend.acceptance` 或 `frontend.e2e`，各回执都绑定对应候选 SHA。前端回归使用已配置的浏览器验收路径。`verified_tasks` 使用账本生成的 `frontend` 或 `backend` 编号。跨端页面回归还要核对交接中的 `backend_versions`。
+4. 跨端默认 `handoff_mode:"candidate"`。先完成后端本端验证，从后端候选版本启动联调服务并登记接口调用证据，再用前端候选完成联合验收，之后合回两端。只有共享环境可用于联调时，在接单时使用 `handoff_mode:"deployed"`，后端本端验证后依次执行受控合回及已配置的推送、部署，再向前端交接核验过的地址和版本。交接继续提交 `backend/handoff.md`、`backend_versions`、`environment` 和 `verification`，配置部署时同时提交实际发布回执和网关核验。若返工发现契约变化，主会话在账本返回的 `split` 修订分段重新提交接单范围，按更新路线复验。
+5. 适用验收通过后，由宿主合回并执行已配置的推送、发布、部署和版本核验。验收最终失败或受环境阻塞时以「待验证」收尾，按账本回写失败证据和待恢复事项。合回最终失败以「阻断」收尾；已经发生的合回或部署如实写入回执。
+
 ## 新领取的工单
 
 当 Story 领取快照启用 `runtime.split_task_sync`，拆分 Agent 按任务编号同步禅道 Task。相同拆分项跨修订保留编号，新增独立要求另用新编号。每端沿正常研发路径提交以下补充证据。
