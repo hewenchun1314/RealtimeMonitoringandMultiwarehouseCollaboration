@@ -70,8 +70,6 @@
 
 逐仓 `candidate_retest_required` / `integration_retest_required` 表示已有 Git 效果仍需确认。核对真实 SHA、保留 hooks 改动、清理并重跑受影响验证，再用新事件提供非空 `verification`；候选确认使用当前 `expected_head`、`files:[]`。失败的原 hooks 还须由宿主实际重跑通过，文字证明不能替代。`host_git_busy`、`host_git_stop_unverified`、`host_git_recovery_required` 时由启动器对账原进程和日志，不另起 Git 或更换事件绕过。`host_git_rejected` / `host_git_inactive` 表示绑定、阶段、截止时间或授权无效，不能作为阶段成功证据。详见[分支流程](branches.md)。
 
-`host_git_retest_required` 表示一或多个仓库返回了 `integration_candidate_ready`。按逐仓回执的独立工作树及整合 SHA 复验，通过后以新事件调用 `integration_merge`，传 `verified_integration_candidates`（仓库键到整合 SHA）及非空 `verification`。混合结果也要按逐仓状态处理。`integration_conflict` 返回冲突路径，保留已成功仓库的合回结果。
-
 ### 工单动作
 
 改变账本的通用事件请求提供 `action`、稳定的 `event_id` 和 `item`。重复提交同一逻辑事件时保留原事件 ID 和原数据。收到带 `replayed:true` 的回执时核对当前账本，按已发生的原操作继续。`material_sync` 用 `attempt_id` 保存成功回执。`branch_inspect` 和 `runtime_check` 是只读操作。以下为各操作另外需要的字段。

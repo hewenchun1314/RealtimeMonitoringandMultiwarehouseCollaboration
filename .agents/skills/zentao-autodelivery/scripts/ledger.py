@@ -305,15 +305,6 @@ def validate_config(config):
         side, _, name = target.partition(':')
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
-    integration_worktrees = require_mapping(runtime.get('worker_git_integration_worktrees', {}),
-                                            'runtime.worker_git_integration_worktrees')
-    for target, entry in integration_worktrees.items():
-        side, _, name = require_text(target, 'integration worktree key').partition(':')
-        if side not in ('backend', 'frontend') or not name:
-            raise ValueError('runtime.worker_git_integration_worktrees requires backend:service or frontend:application')
-        entry = require_mapping(entry, 'integration worktree')
-        require_text(entry.get('branch'), 'integration worktree branch')
-        require_text(entry.get('path'), 'integration worktree path')
     for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync',
                 'git_push_enabled'):
         if key in runtime and type(runtime[key]) is not bool:

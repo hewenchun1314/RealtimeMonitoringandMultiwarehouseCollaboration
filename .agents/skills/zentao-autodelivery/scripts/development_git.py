@@ -102,13 +102,6 @@ def active_context(store, data, directory, kind):
             if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
                 raise ValueError('Integration requires a recorded coding candidate for every repository')
             sources[key]['candidate'] = sha
-            authorization_key = side + ':' + key
-            registered = [runtime.get('worker_git_integration_worktrees', {}).get(authorization_key)
-                          for runtime in registries]
-            if all(entry and entry['branch'] == target['branch'] for entry in registered):
-                admitted_path, live_path = [(directory / entry['path']).resolve() for entry in registered]
-                if admitted_path == live_path:
-                    sources[key]['integration_worktree'] = str(live_path)
     return {'item': item_identity(item), 'item_seq': item['seq'], 'marker': item['marker'],
             'request_id': item['request_id'], 'chat_id': item['chat_id'], 'attempt_id': trial['attempt_id'],
             'phase': trial['phase'], 'phase_started_at': trial['phase_started_at'],
@@ -189,11 +182,6 @@ def apply_obligations(request, history):
             entry.update(needs_retest=previous.get('status') == 'candidate_retest_required',
                          failed_hooks=previous.get('failed_hooks', []), failed_hook_args=previous.get('failed_hook_args', {}))
     else:
-        payload['prepared_candidates'] = {
-            key: prepared for key in context['repositories']
-            if (prepared := next((h['repositories'][key] for h in reversed(history)
-                                  if h['repositories'].get(key, {}).get('status') == 'integration_candidate_ready'),
-                                 None)) is not None}
         payload.update(needs_retest=[key for key, value in latest.items() if value.get('status') == 'integration_retest_required'],
                        failed_hooks={key: value['failed_hooks'] for key, value in latest.items() if value.get('failed_hooks')},
                        failed_hook_args={key: value.get('failed_hook_args', {}) for key, value in latest.items()})
@@ -212,8 +200,6 @@ def request_host_git(database, config, data, now, directory):
                 raise ValueError('Only repositories in the successful plan can be selected')
             operation = hashlib.sha256(encode([context['attempt_id'], context['phase'], kind, event]).encode()).hexdigest()
             submission = {key: data.get(key) for key in ('commits', 'application', 'service', 'verification')}
-            if 'verified_integration_candidates' in data:
-                submission['verified_integration_candidates'] = data['verified_integration_candidates']
             old = conn.execute('SELECT * FROM development_git_operations WHERE operation_id=?', (operation,)).fetchone()
             if old:
                 previous = validate_operation(store, old, directory)
@@ -242,14 +228,7 @@ def request_host_git(database, config, data, now, directory):
                                     'verification': entry.get('verification', '')}
                 context['repositories'] = {key: context['repositories'][key] for key in commits}
             if kind == 'integrate':
-                verified = data.get('verified_integration_candidates', {})
-                verification = data.get('verification', '')
-                if (not isinstance(verified, dict) or not verified.keys() <= context['repositories'].keys()
-                        or any(not isinstance(sha, str) or not COMMIT.fullmatch(sha) for sha in verified.values())):
-                    raise ValueError('Provide verified integration candidate SHAs for registered repositories')
-                if verified:
-                    require_text(verification, 'verification')
-                payload = {'verification': verification, 'verified_integration_candidates': verified}
+                payload = {'verification': data.get('verification', '')}
             request = {'context': context, 'payload': payload, 'submission': submission}
             apply_obligations(request, history)
             # One outstanding request per phase keeps batches and their stop

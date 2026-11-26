@@ -205,14 +205,8 @@ def run_development_git(marker, database, config_path, project_root, *, recover=
                     verify_result(current['context'], key, results[key])
                 except (OSError, ValueError, KeyError) as error:
                     results[key] = {'status': 'failed', 'reason': str(error)}
-            statuses = {x.get('status') for x in results.values()}
-            if statuses == {'verified'}:
-                status = 'host_git_completed'
-            elif statuses <= {'verified', 'integration_candidate_ready'}:
-                status = 'host_git_retest_required'
-            else:
-                status = 'host_git_failed'
-            result = message(status, operation_id=operation,
+            passed = all(x.get('status') == 'verified' for x in results.values())
+            result = message('host_git_completed' if passed else 'host_git_failed', operation_id=operation,
                              repositories=results, runner_receipt=proof['receipt_path'])
             if context['kind'] == 'commit':
                 result['versions'] = {k: v['candidate'] for k, v in results.items() if v.get('status') == 'verified'}

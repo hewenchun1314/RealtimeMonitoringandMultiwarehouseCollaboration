@@ -25,15 +25,9 @@ unit_test 只能验证已登记候选。需要改代码或补测试时，以 fai
 
 ## 合回与恢复
 
-主聊天在 integration（含返工分段）调用 `record integration_merge` 并结束本轮。宿主从成功 coding 证据读取候选并核对配置目标。如果目标分支已检出，宿主可在源工作树或项目登记且干净的合回工作树推进分支。如果目标分支尚未检出，使用本单拥有的临时工作树。
+主聊天在 integration（含返工分段）调用 `record integration_merge` 并结束本轮。宿主从成功 coding 证据读取候选，核对干净工作树与配置目标，仅快进或确认已包含。源仓库不在目标分支时使用本单拥有的短固定路径临时工作树，保留源分支。目标在另一个用户工作树检出或源/合回树有跟踪及暂存改动时保留现场。分叉需要单独的受控历史处理路径，当前固定操作集不执行该处理；不能在沙箱自行 rebase/cherry-pick，也不能用普通 coding 提交声称解决祖先关系。
 
-项目可在 `runtime.worker_git_integration_worktrees` 按 `backend:<服务>` 或 `frontend:<应用>` 登记 `{"branch":"AI-development","path":"../实际检出目录"}`。相对路径以项目配置文件所在目录为基准。登记必须与工单快照及当前配置一致，实际路径必须属于同一个 Git 仓库并检出该目标分支。其他工作树占用、已登记工作树存在未提交内容时保留现场。
-
-多个工单可用各自的候选分支同时开发。目标分支先被其他工单推进时，宿主在本单的独立工作树从最新目标提交合并候选，运行原 hooks，并返回逐仓 `integration_candidate_ready`。回执包括 `worktree`、`integration_base` 和 `integration_candidate`。继续使用原 integration 尝试，在该工作树核对确切 HEAD，复验受影响的构建、测试及业务用例，保存证据。复验通过后以新事件提交 `verified_integration_candidates: {"仓库键":"整合提交 SHA"}` 和非空 `verification`。宿主再次核对基线和 SHA 后才快进。目标再次推进时重新生成候选并复验。准备阶段的提交不属于 `merged_versions`。合回回执保留 `verification_worktree`，其中的验证日志和产物可供回读。
-
-遇到 `integration_conflict`，用回执中的冲突路径登记受阻任务并保留其他仓库已合回的结果。原分支停在当前目标提交，原候选仍在工单工作树。根据任务和证据安排返工。沙箱继续只执行读取、构建及测试。
-
-成功返回候选 `versions` 和实际 `merged_versions`；部分失败保留逐仓结果。`integration_retest_required` 先清理、复验实际 SHA，再以新事件和非空 `verification` 确认；失败原 post hook 会实际重跑。最终树与候选不同时，阶段收尾应提交同一整合 SHA 的 `merged_verification` 及按受影响任务 ID 登记的 `merged_task_verification`。
+成功返回候选 `versions` 和实际 `merged_versions`；部分失败保留逐仓结果。`integration_retest_required` 先清理、复验实际 SHA，再以新事件和非空 `verification` 确认；失败原 post hook 会实际重跑。最终树与候选不同时，继续满足 `merged_verification` 和任务复验要求。
 
 宿主按 canonical common Git directory 串行化源仓库与 linked worktree。停止不明时保留占用，不启动另一种操作或另一个工单；恢复重新查询原命名 Job Object。稳定效果日志、提交标识及逐仓结果用于恢复 stdout/回执丢失、提交已生效和批次部分完成，不能重复提交或删除用户工作树。稳定结果只属于原绑定、尝试、分段和截止时间，不能推进新尝试。真实失败按原阶段重试规则登记，保留具体仓库、hooks 诊断路径和恢复条件。
 

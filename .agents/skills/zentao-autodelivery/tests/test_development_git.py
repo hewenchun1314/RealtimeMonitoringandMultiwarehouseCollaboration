@@ -20,7 +20,7 @@ class DevelopmentGitTests(unittest.TestCase):
     def setUp(self):
         self.start_side('frontend')
 
-    def start_side(self, side, extra=None, registry=None, key=None, integration_worktree=None, parallel=False):
+    def start_side(self, side, extra=None, registry=None, key=None):
         self.side = side
         self.d = test_route_drills.RouteDrills()
         self.d.setUp()
@@ -31,16 +31,7 @@ class DevelopmentGitTests(unittest.TestCase):
             self.d.key = key
         if registry is not None:
             self.d.config['runtime']['worker_git_write_repositories'] = registry
-        if parallel:
-            self.d.config['development']['max_concurrent_items'] = 2
-        if integration_worktree:
-            self.d.config['runtime']['worker_git_integration_worktrees'] = {
-                f'{side}:{self.d.key}': {'branch': 'AI-development', 'path': integration_worktree}}
         self.d.begin_drill(side + '_only', '纯前端' if side == 'frontend' else '纯后端', extra_backend=extra)
-        self.prepare_plan(extra)
-
-    def prepare_plan(self, extra=None):
-        side = self.side
         for stage in ('material_check', 'split', side + '.design', side + '.plan'):
             attempt = self.d.record('attempt_start', stage=stage)
             evidence = self.d.evidence(stage, attempt)
@@ -58,7 +49,7 @@ class DevelopmentGitTests(unittest.TestCase):
     def host(self):
         from development_git_runner import run_development_git
         with closing(sqlite3.connect(self.d.database)) as conn:
-            marker = conn.execute('SELECT marker FROM work_items WHERE item_id=?', (self.d.item['id'],)).fetchone()[0]
+            marker = conn.execute('SELECT marker FROM work_items WHERE item_id=17').fetchone()[0]
         return run_development_git(marker, self.d.database, self.config_path, self.d.root, recover=True)
 
     def test_branch_prepare_is_a_status_only_batch_handoff(self):
@@ -139,32 +130,6 @@ class DevelopmentGitTests(unittest.TestCase):
         merged = self.host()
         self.assertEqual(merged['status'], 'host_git_completed', merged)
         self.assertEqual(merged['merged_versions'], result['versions'])
-
-    def test_integration_fast_forwards_an_absorbed_submodule_main_worktree(self):
-        source = self.d.repositories['frontend']
-        parent = source.parent
-        base = git(source, 'rev-parse', 'HEAD')
-        git(parent, 'init', '-b', 'main')
-        git(parent, 'config', '-f', '.gitmodules', 'submodule.frontend.path', source.name)
-        git(parent, 'config', '-f', '.gitmodules', 'submodule.frontend.url', './frontend')
-        git(parent, 'update-index', '--add', '--cacheinfo', f'160000,{base},{source.name}')
-        git(parent, 'submodule', 'absorbgitdirs', '--', source.name)
-        self.assertTrue((source / '.git').is_file())
-
-        root = self.begin_coding()
-        delivered = '<output>approved</output>\n'
-        (root / 'index.html').write_text(delivered)
-        self.candidate(root)
-        candidate = self.host()
-        self.assertEqual(candidate['status'], 'host_git_completed', candidate)
-        self.integration_phase(candidate)
-        self.request('integration_merge')
-        merged = self.host()
-
-        self.assertEqual(merged['status'], 'host_git_completed', merged)
-        self.assertEqual(merged['merged_versions'], candidate['versions'])
-        self.assertEqual(git(source, 'rev-parse', 'HEAD'), candidate['versions'][self.d.key])
-        self.assertEqual((source / 'index.html').read_text(), delivered)
 
     def test_failed_precommit_returns_real_diagnostics_and_can_be_fixed(self):
         root = self.begin_coding()
@@ -358,136 +323,6 @@ class DevelopmentGitTests(unittest.TestCase):
         self.assertEqual(blocked['status'], 'host_git_failed')
         self.assertIn('another user worktree', blocked['repositories'][self.d.key]['reason'])
         self.assertEqual(git(user, 'rev-parse', 'HEAD'), before)
-
-    def parallel_candidates(self, *, conflict=False, integration_worktree=None, second_kind='story'):
-        self.start_side('frontend', integration_worktree=integration_worktree, parallel=True)
-        source = self.d.repositories['frontend']
-        other = DevelopmentGitTests()
-        self.addCleanup(other.doCleanups)
-        other.side = self.side
-        other.d = test_route_drills.RouteDrills()
-        other.d.setUp()
-        other.addCleanup(other.d.doCleanups)
-        other.d.root, other.d.database, other.d.config = self.d.root, self.d.database, self.d.config
-        other.d.repositories = self.d.repositories
-        other.d.now = self.d.now
-        other.d.item.update(id='18', kind=second_kind)
-        other.d.binding['chat_id'] = 'local-route-drill-18'
-        other.d.admit(baseline=False)
-        other.prepare_plan()
-        first_tree, other_tree = self.begin_coding(), other.begin_coding()
-        base = git(source, 'rev-parse', 'HEAD')
-        self.assertEqual(git(first_tree, 'rev-parse', 'HEAD'), base)
-        self.assertEqual(git(other_tree, 'rev-parse', 'HEAD'), base)
-        for case, tree, label in ((self, first_tree, 'A'), (other, other_tree, 'B')):
-            text = f'<output>{label}</output>\n' if conflict else '<output>approved</output>\n'
-            (tree / 'index.html').write_text(text)
-            (tree / f'{label}.txt').write_text(label)
-            case.candidate(tree, files=['index.html', f'{label}.txt'])
-            saved = case.host()
-            case.assertEqual(saved['status'], 'host_git_completed', saved)
-            case.integration_phase(saved)
-        if integration_worktree:
-            git(source, 'switch', '--detach')
-            target = self.d.root / integration_worktree
-            git(source, 'worktree', 'add', str(target), 'AI-development')
-            pending_edit = target / 'pending.txt'
-            pending_edit.write_text('keep this user edit')
-            self.request('integration_merge')
-            dirty = self.host()
-            self.assertIn('authorized integration checkout is dirty', dirty['repositories'][self.d.key]['reason'])
-            self.assertEqual(pending_edit.read_text(), 'keep this user edit')
-            self.assertEqual(git(target, 'rev-parse', 'HEAD'), base)
-            pending_edit.unlink()
-        self.request('integration_merge')
-        first = self.host()
-        self.assertEqual(first['status'], 'host_git_completed', first)
-        return other, source, first
-
-    def test_parallel_work_items_integrate_in_order_using_authorized_checkout(self):
-        other, source, first = self.parallel_candidates(integration_worktree='release-checkout')
-        key = self.d.key
-        branch = 'refs/heads/AI-development'
-        first_sha = first['merged_versions'][key]
-        other.request('integration_merge')
-        staged = other.host()
-        entry = staged['repositories'][key]
-        self.assertEqual(entry['status'], 'integration_candidate_ready', staged)
-        self.assertEqual(staged['merged_versions'], {})
-        self.assertEqual(git(source, 'rev-parse', branch), first_sha)
-        checkout = Path(entry['worktree'])
-        self.assertEqual((checkout / 'A.txt').read_text(), 'A')
-        self.assertEqual((checkout / 'B.txt').read_text(), 'B')
-        verified = entry['integration_candidate']
-        self.assertEqual(git(checkout, 'rev-parse', 'HEAD'), verified)
-        other.request('integration_merge', verification='Both files checked',
-                      verified_integration_candidates={key: first_sha})
-        wrong = other.host()
-        self.assertEqual(wrong['repositories'][key]['status'], 'integration_candidate_ready', wrong)
-        self.assertEqual(git(source, 'rev-parse', branch), first_sha)
-        # A target advance invalidates even a correct SHA from the earlier validation.
-        authorized = self.d.root / 'release-checkout'
-        git(authorized, 'commit', '--allow-empty', '-m', 'Advance target before promotion')
-        advanced = git(authorized, 'rev-parse', 'HEAD')
-        other.request('integration_merge', verification='Both files checked',
-                      verified_integration_candidates={key: verified})
-        refreshed = other.host()
-        replacement = refreshed['repositories'][key]
-        self.assertEqual(replacement['status'], 'integration_candidate_ready', refreshed)
-        self.assertEqual(replacement['integration_base'], advanced)
-        self.assertEqual(git(authorized, 'rev-parse', 'HEAD'), advanced)
-        self.assertNotEqual(replacement['integration_candidate'], verified)
-        verified = replacement['integration_candidate']
-        checkout = Path(replacement['worktree'])
-        self.assertEqual(git(checkout, 'rev-parse', 'HEAD'), verified)
-        self.assertEqual((checkout / 'A.txt').read_text(), 'A')
-        self.assertEqual((checkout / 'B.txt').read_text(), 'B')
-        evidence_file = checkout / 'verification.log'
-        evidence_file.write_text('Both files checked on the combined commit')
-        other.request('integration_merge', verification='Both files checked on the new integration candidate',
-                      verified_integration_candidates={key: verified})
-        merged = other.host()
-        self.assertEqual(merged['status'], 'host_git_completed', merged)
-        self.assertEqual(merged['merged_versions'], {key: verified})
-        self.assertEqual(git(source, 'rev-parse', branch), verified)
-        self.assertEqual((authorized / 'A.txt').read_text(), 'A')
-        self.assertEqual((authorized / 'B.txt').read_text(), 'B')
-        self.assertEqual(evidence_file.read_text(), 'Both files checked on the combined commit')
-        for case, receipt, evidence in ((self, first, {}), (other, merged, {'merged_verification': 'Both files checked'})):
-            finished = case.d.finish('frontend.integration', case.attempt,
-                                     {k: receipt[k] for k in ('versions', 'merged_versions')} | evidence)
-            self.assertEqual(finished.get('outcome'), 'success', finished)
-
-    def test_parallel_work_items_leave_target_at_first_merge_when_second_conflicts(self):
-        other, source, first = self.parallel_candidates(conflict=True)
-        other.request('integration_merge')
-        result = other.host()
-        entry = result['repositories'][self.d.key]
-        self.assertEqual(entry['status'], 'integration_conflict', result)
-        self.assertEqual(entry['conflicts'], ['index.html'])
-        self.assertEqual(result['merged_versions'], {})
-        self.assertEqual(git(source, 'rev-parse', 'HEAD'), first['merged_versions'][self.d.key])
-        self.assertEqual((source / 'index.html').read_text(), '<output>A</output>\n')
-
-    def test_story_and_bug_share_parallel_slots_and_integrate_in_order(self):
-        bug, source, story = self.parallel_candidates(second_kind='bug')
-        key = self.d.key
-        self.assertEqual(git(source, 'rev-parse', 'HEAD'), story['merged_versions'][key])
-        bug.request('integration_merge')
-        staged = bug.host()
-        self.assertEqual(staged['status'], 'host_git_retest_required', staged)
-        prepared = staged['repositories'][key]
-        checkout = Path(prepared['worktree'])
-        combined = prepared['integration_candidate']
-        self.assertEqual(git(checkout, 'rev-parse', 'HEAD'), combined)
-        self.assertEqual((checkout / 'A.txt').read_text(), 'A')
-        self.assertEqual((checkout / 'B.txt').read_text(), 'B')
-        bug.request('integration_merge', verification='Verified Story and Bug files on the combined commit',
-                    verified_integration_candidates={key: combined})
-        merged = bug.host()
-        self.assertEqual(merged['status'], 'host_git_completed', merged)
-        self.assertEqual(merged['merged_versions'], {key: combined})
-        self.assertEqual(git(source, 'rev-parse', 'HEAD'), combined)
 
     def test_live_git_write_registry_revocation_blocks_public_and_queued_host_operations(self):
         key = 'frontend:aggregation-platform'

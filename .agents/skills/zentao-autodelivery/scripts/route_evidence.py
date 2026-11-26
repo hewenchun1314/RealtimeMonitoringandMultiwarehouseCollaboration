@@ -66,33 +66,15 @@ def check_candidate(proof, candidate):
         return 'Candidate does not match the item branch in the registered repository'
 
 
-def recorded_host_merge(store, item, key, proof, candidate, merged):
-    rows = store.conn.execute(
-        "SELECT request,result FROM development_git_operations WHERE item_seq=? AND kind='integrate' AND result IS NOT NULL",
-        (item['seq'],))
-    for row in rows:
-        registered = json.loads(row['request'])['context']['repositories'].get(key, {})
-        receipt = json.loads(row['result']).get('repositories', {}).get(key, {})
-        if (registered.get('source_root') == proof['source_root']
-                and registered.get('target_branch') == proof['target_branch']
-                and registered.get('candidate') == candidate
-                and (receipt.get('status'), receipt.get('candidate'), receipt.get('merged'))
-                == ('verified', candidate, merged)):
-            return True
-    return False
-
-
-def check_merged_commit(proof, candidate, merged, *, recorded=False):
+def check_merged_commit(proof, candidate, merged):
     source = proof['source_root']
     actual = git(source, 'rev-parse', '--verify', 'refs/heads/' + proof['target_branch'])
-    if ((merged != actual and (not recorded or
-                              git(source, 'merge-base', '--is-ancestor', merged, actual, allowed=(0, 1)) is None))
-            or git(source, 'merge-base', '--is-ancestor', candidate, merged, allowed=(0, 1)) is None):
+    if merged != actual or git(source, 'merge-base', '--is-ancestor', candidate, actual, allowed=(0, 1)) is None:
         return 'Merged version must be the actual target tip and contain the candidate'
 
 
-def check_merge(proof, candidate, merged, reverified, *, recorded=False):
-    reason = check_merged_commit(proof, candidate, merged, recorded=recorded)
+def check_merge(proof, candidate, merged, reverified):
+    reason = check_merged_commit(proof, candidate, merged)
     if reason:
         return reason
     source = proof['source_root']
@@ -117,9 +99,7 @@ def validate_partial_merge(store, item, stage, evidence):
         return 'Partial merge receipts must identify registered repositories and their recorded candidates'
     try:
         for key, sha in merged.items():
-            proof = targets[key]
-            recorded = recorded_host_merge(store, item, key, proof, versions[key], sha)
-            reason = check_merged_commit(proof, versions[key], sha, recorded=recorded)
+            reason = check_merged_commit(targets[key], versions[key], sha)
             if reason:
                 return f'{key}: {reason}'
     except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
@@ -140,9 +120,7 @@ def repository_evidence(store, item, side, stage, evidence):
     try:
         for key, proof in targets.items():
             if stage == 'integration':
-                recorded = recorded_host_merge(store, item, key, proof, versions[key], merged[key])
-                reason = check_merge(proof, versions[key], merged[key], nonblank(evidence.get('merged_verification')),
-                                     recorded=recorded)
+                reason = check_merge(proof, versions[key], merged[key], nonblank(evidence.get('merged_verification')))
             else:
                 reason = check_candidate(proof, versions[key])
             if reason:
