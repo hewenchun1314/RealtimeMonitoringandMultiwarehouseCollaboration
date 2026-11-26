@@ -12,7 +12,7 @@ from backend_dependencies import backend_services, writable_dependencies
 from branch_check import branch_context, git, is_repo_root, planned_applications, source_workspace, valid_target
 from execution import active_attempt, execution_matches
 from ledger import Ledger, encode, item_identity, message, require_text, transaction
-from route_execution import get_split, snapshot, stage_evidence, task_scope
+from route_execution import get_split, repository_plan, snapshot, stage_evidence, task_scope
 
 ACTIONS = {'branch_prepare': 'prepare', 'candidate_commit': 'commit', 'integration_merge': 'integrate'}
 COMMIT = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
@@ -63,11 +63,10 @@ def active_context(store, data, directory, kind):
             raise ValueError('The main frontend Git operation requires the current delivery lock')
     if main_repair:
         merged = (stage_evidence(store, item, 'frontend.integration') or {}).get('merged_versions', {})
-    plan_name = side + '.plan' if scoped else 'plan'
-    plan = stage_evidence(store, item, plan_name)
+    plan = repository_plan(store, item, side) if scoped else stage_evidence(store, item, 'plan')
     keys = planned_applications(plan, side)
     if not keys:
-        raise ValueError('Host Git requires a successful plan for this side')
+        raise ValueError('Host Git requires confirmed repositories for this side')
     if kind == 'integrate' and scoped:
         scope = task_scope(store, item, stage)
         if scope and scope['blocked']:

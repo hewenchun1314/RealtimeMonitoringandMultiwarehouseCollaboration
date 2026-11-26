@@ -316,7 +316,7 @@ def validate_config(config):
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
     for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync',
-                'git_push_enabled'):
+                'git_push_enabled', 'streamlined_bug_intake'):
         if key in runtime and type(runtime[key]) is not bool:
             raise ValueError(f'runtime.{key} must be a boolean')
     if runtime.get('sync_requirement_before_review'):

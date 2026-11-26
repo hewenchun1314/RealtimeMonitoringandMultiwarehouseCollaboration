@@ -204,7 +204,15 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
     def evidence(self, stage, attempt):
         if stage == 'material_check':
             if self.item['kind'] == 'bug':
-                return {'detail': 'The status page repeats its empty-state title.'}
+                evidence = {'detail': 'The status page repeats its empty-state title.'}
+                if self.config['runtime'].get('streamlined_bug_intake'):
+                    evidence.update(repositories={side: [self.key] for side in self.repositories},
+                                    acceptance=['Status reads approved'])
+                    if len(self.repositories) == 2:
+                        evidence['acceptance'] = {'backend': ['API status is approved'],
+                                                  'frontend': ['Page displays the approved status']}
+                        evidence['interface_contract'] = 'GET /status.json -> {"status":"approved"}'
+                return evidence
             return {'path': 'requirements/17/intent.md'}
         if stage == 'split':
             return self.split()
@@ -287,7 +295,7 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
         return self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='success',
                            summary=stage, evidence=evidence, **fields)
 
-    def drill(self, scope, mark):
+    def drill(self, scope, mark, *, streamlined=False):
         self.begin_drill(scope, mark)
         completed = []
         stage = 'material_check'
@@ -295,6 +303,8 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             self.assertNotIn(stage, completed)
             attempt = self.record('attempt_start', stage=stage)
             self.assertEqual(attempt['status'], 'attempt_started', attempt)
+            if streamlined and stage == 'material_check':
+                self.assertEqual(attempt['role'], '主工单 Agent')
             evidence = self.evidence(stage, attempt)
             if stage == 'handoff':
                 # The backend is already merged. Waking the same chat must only
@@ -311,11 +321,13 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             self.assertEqual(result['status'], 'attempt_finished', (stage, result))
             completed.append(stage)
             stage = result['next_stage']
-        expected = ['material_check', 'split']
+        expected = ['material_check'] if streamlined else ['material_check', 'split']
         for side in self.repositories:
             acceptance = 'e2e' if side == 'frontend' else 'acceptance'
-            expected.extend(side + '.' + s for s in ('design', 'plan', 'branch_check', 'coding', 'unit_test',
-                                                      'code_review', acceptance, 'integration'))
+            if not streamlined:
+                expected.extend((side + '.design', side + '.plan'))
+            expected.extend(side + '.' + s for s in ('branch_check', 'coding', 'unit_test', 'code_review',
+                                                      acceptance, 'integration'))
             if side == 'backend' and scope == 'fullstack':
                 expected.append('handoff')
         self.assertEqual(completed, expected)
@@ -346,6 +358,74 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
 
     def test_fullstack_backend_then_frontend(self):
         self.drill('fullstack', '前后端')
+
+    def test_fullstack_bug_goes_from_intake_to_branch_preparation(self):
+        self.item['kind'] = 'bug'
+        self.config['runtime']['streamlined_bug_intake'] = True
+        self.drill('fullstack', '', streamlined=True)
+
+    def test_story_retains_full_flow_with_bug_option_enabled(self):
+        self.config['runtime']['streamlined_bug_intake'] = True
+        self.drill('frontend_only', '')
+
+    def test_bug_contract_revision_returns_to_branch_preparation(self):
+        from ledger import Ledger, transaction
+        from route_execution import read_history
+
+        self.item['kind'] = 'bug'
+        self.config['runtime']['streamlined_bug_intake'] = True
+        self.begin_drill('fullstack', '')
+        stage = 'material_check'
+        while stage != 'frontend.e2e':
+            attempt = self.record('attempt_start', stage=stage)
+            result = self.finish(stage, attempt, self.evidence(stage, attempt))
+            self.assertEqual(result['status'], 'attempt_finished', result)
+            stage = result['next_stage']
+
+        attempt = self.record('attempt_start', stage=stage)
+        failure = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
+                              summary='The API contract changed', repair_required=True, contract_changed=True)
+        self.assertEqual(failure['disposition'], 'retry', failure)
+        repair = self.record('attempt_start', stage=stage)
+        self.assertEqual((repair['phase'], repair['role']), ('split', '主工单 Agent'))
+        intake = self.evidence('material_check', repair)
+        intake['interface_contract'] += ' version 2'
+        backend_only = {**intake, 'repositories': {'backend': [self.key]},
+                        'acceptance': intake['acceptance']['backend']}
+        rejected = self.record('repair_advance', attempt_id=repair['attempt_id'], phase='split',
+                               summary='Drop frontend validation', evidence=backend_only)
+        self.assertEqual(rejected['status'], 'evidence_required', rejected)
+        result = self.record('repair_advance', attempt_id=repair['attempt_id'], phase='split',
+                             summary='Checked the changed API contract', evidence=intake)
+        self.assertEqual((result['status'], result['next_stage'], result['run_round']),
+                         ('route_revised', 'backend.branch_check', 2))
+        with transaction(self.database) as conn:
+            ledger = Ledger(conn, self.config, self.now)
+            route, history = read_history(ledger, ledger.find_item(self.item))
+            self.assertEqual(route['tasks']['backend'][0]['acceptance'], intake['acceptance']['backend'])
+            self.assertEqual(route['tasks']['frontend'][0]['acceptance'], intake['acceptance']['frontend'])
+            self.assertEqual(route['interface_contract'], intake['interface_contract'])
+            self.assertNotIn('backend.integration', history)
+
+    def test_bug_intake_keeps_post_merge_e2e_order_and_rejects_unknown_target(self):
+        from route_execution import get_split
+        from ledger import Ledger
+
+        self.item['kind'] = 'bug'
+        self.config['runtime'].update(streamlined_bug_intake=True, git_push_enabled=True)
+        self.config['e2e'].update(after_integration=True, agentlimb={'browser': 'Drill'})
+        self.begin_drill('frontend_only', '')
+        attempt = self.record('attempt_start', stage='material_check')
+        evidence = self.evidence('material_check', attempt)
+        wrong = {**evidence, 'repositories': {'frontend': ['unknown']}}
+        self.assertEqual(self.finish('material_check', attempt, wrong)['status'], 'evidence_required')
+        self.assertEqual(self.finish('material_check', attempt, evidence)['next_stage'], 'frontend.branch_check')
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            route = get_split(Ledger(conn, self.config, self.now), conn.execute('SELECT * FROM work_items').fetchone())
+        self.assertEqual(route['stages'], ['material_check', 'frontend.branch_check', 'frontend.coding',
+                                          'frontend.unit_test', 'frontend.code_review', 'frontend.integration',
+                                          'frontend.e2e', 'frontend.push'])
 
     def check_unavailable_e2e_continues_to_release_checks(self):
         from development_git_runner import run_development_git
@@ -402,6 +482,7 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
 
     def test_bug_continues_to_release_checks_after_e2e_failure(self):
         self.item['kind'] = 'bug'
+        self.config['runtime']['streamlined_bugs'] = True
         self.check_unavailable_e2e_continues_to_release_checks()
 
     def test_story_continues_to_release_checks_after_e2e_failure(self):

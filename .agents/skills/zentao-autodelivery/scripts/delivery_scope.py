@@ -9,7 +9,8 @@ from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE
 
 
 SCOPES = {'纯前端': 'frontend_only', '纯后端': 'backend_only', '前后端': 'fullstack'}
-SIDE_STEPS = ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review')
+DELIVERY_STEPS = ('branch_check', 'coding', 'unit_test', 'code_review')
+SIDE_STEPS = ('design', 'plan', *DELIVERY_STEPS)
 PREFIX = ('material_check', 'split')
 
 
@@ -24,12 +25,13 @@ def project_mode(development):
 
 
 def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_deploy_enabled=False,
-                 git_push_enabled=False, post_merge_e2e=False):
+                 git_push_enabled=False, post_merge_e2e=False, streamlined_intake=False):
     if scope not in SCOPES.values():
         raise ValueError('Unknown delivery scope')
-    stages = list(PREFIX)
+    stages = ['material_check'] if streamlined_intake else list(PREFIX)
+    side_steps = DELIVERY_STEPS if streamlined_intake else SIDE_STEPS
     if scope in ('backend_only', 'fullstack'):
-        stages.extend('backend.' + step for step in (*SIDE_STEPS, 'acceptance', 'integration'))
+        stages.extend('backend.' + step for step in (*side_steps, 'acceptance', 'integration'))
         if git_push_enabled:
             stages.append('backend.push')
         if deploy_enabled:
@@ -37,7 +39,7 @@ def route_stages(scope, *, e2e_enabled=True, deploy_enabled=False, frontend_depl
     if scope == 'fullstack':
         stages.append('handoff')
     if scope in ('frontend_only', 'fullstack'):
-        stages.extend('frontend.' + step for step in SIDE_STEPS)
+        stages.extend('frontend.' + step for step in side_steps)
         if post_merge_e2e:
             stages.append('frontend.integration')
         if e2e_enabled:

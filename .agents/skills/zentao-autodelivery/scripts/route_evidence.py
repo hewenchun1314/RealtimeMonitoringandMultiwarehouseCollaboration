@@ -10,7 +10,7 @@ from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, F
                           configured_targets, deployed_receipt_matches, frontend_release_config,
                           mcp_rollout_matches, release_verification)
 from route_execution import (blocked_tasks, contract_revision_pending, get_split, handoff_tasks,
-                             read_history, snapshot, stage_evidence)
+                             read_history, repository_plan, snapshot, stage_evidence)
 from task_evidence import verified_task_merge
 
 
@@ -217,17 +217,20 @@ def git_push_requirements(store, item, stage):
         return {}, {}, {}, '工单未启用该端 Git 推送'
     if contract_revision_pending(history):
         return {}, {}, {}, '接口契约变更，等待重新拆分后核验 Git 推送'
-    for step in ('plan', 'branch_check', 'coding', 'unit_test', 'code_review'):
+    required = ('branch_check', 'coding', 'unit_test', 'code_review')
+    if side + '.plan' in route['stages']:
+        required = ('plan', *required)
+    for step in required:
         name = side + '.' + step
         if history.get(name, {}).get('outcome') != 'success':
             return {}, {}, {}, f'Git 推送缺少成功的 {name} 回执'
-    plan = history[side + '.plan']['evidence']
+    plan = repository_plan(store, item, side, history=(route, history))
     planned = planned_applications(plan, side)
     integration = history.get(side + '.integration', {})
     merged = (integration.get('evidence') or {}).get('merged_versions')
     branches = history[side + '.branch_check']['evidence'].get('repositories', {})
     if not planned or not commit_map(merged) or not merged.keys() <= set(planned) or branches.keys() != set(planned):
-        return {}, {}, {}, 'Git 推送需要一致的计划、分支核验及合回 SHA'
+        return {}, {}, {}, 'Git 推送需要一致的目标仓库、分支核验及合回 SHA'
     if side == 'frontend' and route.get('post_merge_e2e'):
         if integration.get('outcome') != 'success' or merged.keys() != set(planned):
             return {}, {}, {}, '前端推送需要全部计划应用的成功合回回执'
@@ -299,16 +302,16 @@ def pushed_backend_versions(route, stages, versions):
 
 
 def deployment_requirements(store, item):
-    plan = stage_evidence(store, item, 'backend.plan')
+    route, history = read_history(store, item)
+    plan = repository_plan(store, item, 'backend', history=(route, history))
     services = planned_applications(plan, 'backend')
     if not services:
-        return {}, [], {}, '缺少经过确认的后端服务计划'
+        return {}, [], {}, '缺少经过确认的后端服务清单'
     targets = configured_targets(snapshot(item))
     selected = {key: targets[key] for key in services if key in targets}
     skipped = [key for key in services if key not in targets]
     if not selected:
         return selected, skipped, {}, None
-    route, history = read_history(store, item)
     if 'backend.push' in route.get('stages', ()):
         integration = history.get('backend.integration', {})
         merged = (integration.get('evidence') or {}).get('merged_versions') or {}
@@ -344,7 +347,9 @@ def handoff_error(store, item, evidence):
     blockers = route.get('handoff_blockers', route['blockers'])
     if blockers:
         return 'Backend handoff is blocked: ' + ', '.join(blockers)
-    prerequisites = ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review')
+    prerequisites = ('branch_check', 'coding', 'unit_test', 'code_review')
+    if 'intake_repository_plan' not in route:
+        prerequisites = ('design', 'plan', *prerequisites)
     git_delivery = 'backend.push' in route.get('stages', ())
     if not git_delivery:
         prerequisites += ('acceptance', 'integration')

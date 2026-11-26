@@ -25,7 +25,7 @@
 
 | 阶段 | 负责人 | 操作和成功证据 |
 | --- | --- | --- |
-| `material_check` | 主会话、评审 Agent | Story 先按[需求材料同步](#需求材料同步)同步仓库，再核对实际目录并提交 `evidence.path`，例如 `requirements/ZT-123/intent.md`，相对需求工作区。Bug 提交原单复现详情 `evidence.detail`。账本解析材料正文并保留摘要和原标记。需求文件确实缺失时以 `failed` 和 `material_file_status:"missing"` 提交。 |
+| `material_check` | 主会话、评审 Agent | Story 先按[需求材料同步](#需求材料同步)同步仓库，再核对实际目录并提交 `evidence.path`，例如 `requirements/ZT-123/intent.md`，相对需求工作区。Bug 提交原单复现详情 `evidence.detail`，新 Bug 按[接单核对](#bug-接单核对)同时登记仓库和验收条件。账本解析材料正文并保留摘要和原标记。需求文件确实缺失时以 `failed` 和 `material_file_status:"missing"` 提交。 |
 | `split` | 拆分 Agent | 项目单端设置决定实际范围。项目支持两端时优先用文档标记，缺标记再根据代码、接口与验收条件研判；双端配置中标记非法或矛盾时记录歧义。写 `split.md` 和结构化任务证据，格式见[账本命令](workflow-cli.md)。将超出范围的验收条件写入 `blockers`。 |
 | `<端>.design`、`<端>.plan` | 本端开发 Agent | 按拆分清单在本轮的 `frontend/` 或 `backend/` 写 `design.md`、`plan.md`。设计附文件证据，计划登记非空且唯一的应用键数组 `applications` 或服务键数组 `services`。 |
 | `<端>.branch_check` | 主会话 | 按[分支核验](branches.md)准备并实地核对每个目标仓库的 worktree，提交完整 `repositories`。 |
@@ -39,9 +39,17 @@
 | `frontend.deploy` | Windows 工单启动器和前端部署 Agent | 核验前端 Git 远端已包含合回 SHA，核对本地停服，从固定 SHA 打包并读回 Harbor 摘要。配置 Rancher 时继续更新并核验新 Ready Pod。详见[前端镜像发布](frontend-release.md)。 |
 | `handoff` | 主会话 | 仅跨端运行。后端合回后读取联调文档、独立验收和实际环境版本，提交[交接证据](backend.md)。交接失败后记录依赖交接的任务，按账本继续独立的前端任务。 |
 
-端内返工依次完成修复、单测、复审或重验。联合验收发现后端缺陷时注明责任端，按同一尝试中账本返回的分段修复并再次交接，使用新版本跑受影响的联合验收。涉及任务或接口约定变化时，由拆分 Agent 更新任务并说明依据。主会话收尾以有效版本、实际验收和所有必需任务为准；安全合回成功的事实与未解决的验收项分别记账。
+端内返工依次完成修复、单测、复审或重验。联合验收发现后端缺陷时注明责任端，按同一尝试中账本返回的分段修复并再次交接，使用新版本跑受影响的联合验收。涉及任务或接口约定变化时，按阶段回执指定的角色更新范围并说明依据。主会话收尾以有效版本、实际验收和所有必需任务为准；安全合回成功的事实与未解决的验收项分别记账。
 
 编码、单测、审查和验收登记成功时，账本会读回工单工作树的 HEAD、已跟踪文件和暂存区。单测发现需要修订时，普通单测失败的 `repair_required:true` 生成同端 coding→verify 序列；返工中单测失败则回到紧邻的同端 coding，保留此前有效历史。新 coding 回执使旧版本的下游证据失效，单测、审查和验收按新 SHA 重跑。跨轮恢复先复核保留的历史。hooks 自动改文件、提交后检查失败或回执丢失按[候选恢复](branches.md#编码与候选提交)处理，不能直接登记旧版本成功。主工作区中用户已有的改动须保留。
+
+### Bug 接单核对
+
+领取快照开启 `runtime.streamlined_bug_intake` 的 Bug 由主会话直接执行 `material_check`。按接单回执确认本轮执行角色。省略独立材料评审、拆分、设计和计划，复用现有的分支准备、编码、单测、独立审查、验收、合回和发布。已领取的工单按原配置快照执行。
+
+- 成功回执填写 `detail`（原 Bug 的复现、预期和实际结果）、`repositories`（按 `frontend` 或 `backend` 列出配置中的应用键或服务键）和 `acceptance`（可复验的条件数组）。例如，前端仓库清单为 `{"frontend":["tet-smart-log"]}`。无法确认所需材料或目标仓库时，以实际失败或阻断及证据登记。
+- 跨端回执填写 `interface_contract`。存在前端对后端的依赖时填写 `depends_on_backend:true`，可独立交付时填写 `false`。省略时按存在依赖处理。每端验收项有差异时，用 `acceptance.frontend`、`acceptance.backend` 分别登记数组。账本生成对应的 `frontend`、`backend` 验收编号，后续回执仍用该端有效任务编号及实际版本。
+- 开发 Agent 在修复记录中写明根因和影响范围。返工中需要修订契约时，账本保留原有修订分段，由主会话用同一接单格式更新仓库和验收范围，随后重新核验受影响的工作树。
 
 ## 代码审查
 

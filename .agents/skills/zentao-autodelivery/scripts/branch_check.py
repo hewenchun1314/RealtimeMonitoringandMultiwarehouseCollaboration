@@ -23,19 +23,25 @@ def planned_applications(evidence, side='frontend'):
 
 
 def branch_context(store, item):
+    from route_execution import is_streamlined_bug, repository_plan
+
     snapshot = json.loads(item['config_snapshot'])
     side, separator, _ = item['stage'].partition('.')
     legacy = not separator
     side = 'frontend' if legacy else side
     bundle = snapshot['development'].get(f'{side}_bundle', {})
     targets = backend_services(snapshot) if side == 'backend' else bundle.get('applications', {})
-    plan_stage = 'plan' if legacy else f'{side}.plan'
-    plan = store.conn.execute('''SELECT result,outcome FROM attempts WHERE item_seq=? AND stage=?
-                                 ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
-                              (item['seq'], plan_stage)).fetchone()
-    applications = []
-    if plan and plan['result'] and (legacy or plan['outcome'] == 'success'):
-        applications = planned_applications(json.loads(plan['result']).get('evidence'), side) or []
+    evidence = None
+    if is_streamlined_bug(item):
+        evidence = repository_plan(store, item, side)
+    else:
+        plan_stage = 'plan' if legacy else f'{side}.plan'
+        plan = store.conn.execute('''SELECT result,outcome FROM attempts WHERE item_seq=? AND stage=?
+                                     ORDER BY run_round DESC,retry_number DESC LIMIT 1''',
+                                  (item['seq'], plan_stage)).fetchone()
+        if plan and plan['result'] and (legacy or plan['outcome'] == 'success'):
+            evidence = json.loads(plan['result']).get('evidence')
+    applications = planned_applications(evidence, side) or []
     workspace = snapshot.get('workspaces', {}).get(side)
     suffix = '' if legacy else f'-{side}'
     context = {'bundle': bundle.get('name', side), 'workspace': workspace,

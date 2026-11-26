@@ -2,6 +2,8 @@
 
 import json
 
+from backend_dependencies import backend_services
+from branch_check import planned_applications, valid_target
 from delivery_scope import resolve_split, route_stages
 from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, configured_targets, frontend_release_config
 from ledger import workflow_stages
@@ -13,6 +15,13 @@ def snapshot(item):
 
 def is_routed(item):
     return snapshot(item).get('workflow_version') == 2
+
+
+def is_streamlined_bug(item):
+    if 'kind' not in item.keys() or item['kind'] != 'bug':
+        return False
+    config = snapshot(item)
+    return config.get('workflow_version') == 2 and config.get('runtime', {}).get('streamlined_bug_intake') is True
 
 
 def invalidate_repaired_outputs(stages, phase, route):
@@ -82,7 +91,8 @@ def read_history(store, item):
         result = json.loads(record['result'])
         if result.get('route_revision'):
             continue
-        if record['outcome'] == 'success' and stage == 'split':
+        route_stage = stage == 'split' or (stage == 'material_check' and is_streamlined_bug(item))
+        if record['outcome'] == 'success' and route_stage and 'route' in result:
             route = result['route']
         outcome = 'failed' if record['outcome'] == 'timed_out' else record['outcome']
         entry = {'stage': stage, 'outcome': outcome,
@@ -114,8 +124,7 @@ def contract_revision_pending(stages):
     return any(receipt.get('contract_revision_pending') for receipt in stages.values())
 
 
-def stage_evidence(store, item, stage):
-    _, stages = read_history(store, item)
+def successful_evidence(stages, stage):
     if stage.endswith(('.plan', '.coding')) and contract_revision_pending(stages):
         return None
     step = stages.get(stage)
@@ -124,11 +133,27 @@ def stage_evidence(store, item, stage):
     return None
 
 
+def stage_evidence(store, item, stage):
+    _, stages = read_history(store, item)
+    return successful_evidence(stages, stage)
+
+
+def repository_plan(store, item, side, *, history=None):
+    route, stages = read_history(store, item) if history is None else history
+    if is_streamlined_bug(item):
+        if route and not contract_revision_pending(stages):
+            return route['intake_repository_plan'].get(side)
+        return None
+    return successful_evidence(stages, side + '.plan')
+
+
 def stages_for(store, item, route=None):
     if not is_routed(item):
         return workflow_stages(snapshot(item)['development'])
     route = route or get_split(store, item)
-    return route['stages'] if route else ('material_check', 'split')
+    if route:
+        return route['stages']
+    return ('material_check',) if is_streamlined_bug(item) else ('material_check', 'split')
 
 
 def handoff_tasks(route):
@@ -199,7 +224,18 @@ def split_result(store, item, evidence, *, revision=False):
     if not isinstance(evidence, dict):
         raise ValueError('Split evidence must be an object')
     config = snapshot(item)
-    route = resolve_split(config, {**evidence, 'material': reviewed['material']})
+    if is_streamlined_bug(item):
+        route = bug_intake_route(config, evidence, reviewed['material'])
+    else:
+        route = configure_route(config, resolve_split(config, {**evidence, 'material': reviewed['material']}))
+    if revision:
+        previous = get_split(store, item)
+        if not previous or previous['scope'] != route['scope']:
+            raise ValueError('A repair must remain within the admitted route')
+    return route
+
+
+def configure_route(config, route):
     route['e2e_enabled'] = config.get('e2e', {}).get('enabled', True)
     if config.get('e2e', {}).get('after_integration') is True and route['scope'] != 'backend_only':
         route['post_merge_e2e'] = True
@@ -207,12 +243,49 @@ def split_result(store, item, evidence, *, revision=False):
                                        post_merge_e2e=route.get('post_merge_e2e', False),
                                        deploy_enabled=bool(configured_targets(config)),
                                        frontend_deploy_enabled=frontend_release_config(config).get('enabled', False),
-                                       git_push_enabled=config.get('runtime', {}).get('git_push_enabled', False)))
-    if revision:
-        previous = get_split(store, item)
-        if not previous or previous['scope'] != route['scope']:
-            raise ValueError('A repair must remain within the admitted route')
+                                       git_push_enabled=config.get('runtime', {}).get('git_push_enabled', False),
+                                       streamlined_intake='intake_repository_plan' in route))
     return route
+
+
+def bug_intake_route(config, evidence, material):
+    if not isinstance(evidence, dict):
+        raise ValueError('Bug intake evidence must be an object')
+    repositories = evidence.get('repositories')
+    if not isinstance(repositories, dict) or not repositories or repositories.keys() - {'frontend', 'backend'}:
+        raise ValueError('Bug intake requires configured frontend or backend repositories')
+    configured = {
+        'frontend': config['development'].get('frontend_bundle', {}).get('applications', {}),
+        'backend': backend_services(config),
+    }
+    acceptance = evidence.get('acceptance')
+    if isinstance(acceptance, dict) and acceptance.keys() != repositories.keys():
+        raise ValueError('Per-side acceptance must match the sides in Bug repositories')
+    plans = {}
+    tasks = {}
+    for side, keys in repositories.items():
+        field = 'services' if side == 'backend' else 'applications'
+        plan = {field: keys}
+        if not planned_applications(plan, side) or any(not valid_target(configured[side].get(key)) for key in keys):
+            raise ValueError(f'Bug intake requires valid configured {side} repositories')
+        plans[side] = {**plan, 'task_repositories': {side: keys}}
+        criteria = acceptance[side] if isinstance(acceptance, dict) else acceptance
+        tasks[side] = {'id': side, 'description': f'{side} Bug 修复', 'acceptance': criteria}
+    fullstack = len(tasks) == 2
+    depends = evidence.get('depends_on_backend', fullstack)
+    if type(depends) is not bool or (depends and not fullstack):
+        raise ValueError('Only a cross-side Bug can have a frontend dependency on backend changes')
+    if depends:
+        tasks['frontend']['depends_on'] = ['backend']
+        tasks['backend']['joint_acceptance'] = True
+        plans['frontend']['task_repositories']['backend'] = plans['frontend']['applications']
+    scope = 'fullstack' if fullstack else next(iter(tasks)) + '_only'
+    route = resolve_split(config, {**evidence, 'material': material, 'ai_scope': scope,
+                                  'rationale': 'Bug 接单已核对目标仓库和验收条件',
+                                  'tasks': {side: [task] for side, task in tasks.items()}})
+    if route['scope'] != scope:
+        raise ValueError('Bug repositories must match the configured or declared delivery scope')
+    return configure_route(config, {**route, 'intake_repository_plan': plans})
 
 
 def v2_repair(stage, data, route):

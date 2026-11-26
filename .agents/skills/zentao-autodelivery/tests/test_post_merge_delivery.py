@@ -43,6 +43,12 @@ class PostMergeDeliveryTests(unittest.TestCase):
             self.assertTrue(git_push_requirements(None, {}, 'frontend.push')[-1])
 
     def test_started_e2e_gate_and_terminal_blocker_on_the_production_ledger(self):
+        self.check_started_e2e_gate_and_terminal_blocker('story')
+
+    def test_streamlined_bug_push_checks_use_intake_repositories(self):
+        self.check_started_e2e_gate_and_terminal_blocker('bug')
+
+    def check_started_e2e_gate_and_terminal_blocker(self, kind):
         from contextlib import closing
         from route_execution import read_history
         from test_route_drills import RouteDrills
@@ -50,8 +56,9 @@ class PostMergeDeliveryTests(unittest.TestCase):
         drill = RouteDrills()
         self.addCleanup(drill.doCleanups)
         drill.setUp()
+        drill.item['kind'] = kind
         drill.config['e2e'].update(after_integration=True, agentlimb={'browser': 'test'})
-        drill.config['runtime']['git_push_enabled'] = True
+        drill.config['runtime'].update(git_push_enabled=True, streamlined_bug_intake=True)
         drill.begin_drill('frontend_only', None)
         stage = 'material_check'
         while stage != 'frontend.e2e':

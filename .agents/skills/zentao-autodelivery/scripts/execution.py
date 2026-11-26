@@ -16,9 +16,9 @@ from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_
 from material_sync import requirement_checkout, verify_requirement_intent
 from route_evidence import (agentlimb_receipt_error, delivery_summary, host_e2e_blocker_error,
                             validate_partial_merge, validate_success)
-from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
-                             stage_evidence, stage_role, stage_task_ids, stages_for, task_scope,
-                             unit_test_revision, v2_repair)
+from route_execution import (blocked_tasks, bug_intake_route, get_split, is_routed, is_streamlined_bug,
+                             read_history, repository_plan, snapshot, split_result, stage_evidence, stage_role,
+                             stage_task_ids, stages_for, task_scope, unit_test_revision, v2_repair)
 import task_evidence
 
 
@@ -169,6 +169,8 @@ def phase_deadline(store, item, phase):
 def phase_context(store, item, phase, config_directory):
     stage = item['stage'] if phase == 'verify' else phase
     context = {'role': stage_role(stage)}
+    if stage in ('material_check', 'split') and is_streamlined_bug(item):
+        context.update(role='主工单 Agent', bug_intake_required=True)
     scope = task_scope(store, item, stage)
     if scope is not None and stage_task_ids(get_split(store, item), stage):
         context['task_scope'] = scope
@@ -194,7 +196,7 @@ def phase_context(store, item, phase, config_directory):
         return context
     services = None
     if stage not in ('backend.design', 'backend.plan'):
-        plan = stage_evidence(store, item, 'backend.plan')
+        plan = repository_plan(store, item, 'backend')
         services = set(planned_applications(plan, 'backend') or [])
     dependencies = dependency_context(config, config_directory, services)
     if dependencies:
@@ -415,7 +417,7 @@ def finish_revision(store, item, trial, receipt, completed):
         store.update_item(item, state='closing', conclusion='阻断', stage='split', run_round=next_round)
         next_stage = None
     else:
-        next_stage = stages_for(store, item, route)[2]
+        next_stage = stages_for(store, item, route)[1 if is_streamlined_bug(item) else 2]
         store.update_item(item, stage=next_stage, run_round=next_round)
     return message('route_revised', attempt_id=trial['attempt_id'], next_stage=next_stage,
                    run_round=next_round, route=route)
@@ -586,6 +588,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                 if stage == 'material_check':
                     material = read_material(config, config_directory, item['kind'], evidence)
                     evidence = {**evidence, 'material': material}
+                    if is_streamlined_bug(item):
+                        route = bug_intake_route(config, evidence, material)
                 else:
                     route = split_result(store, item, evidence)
             except (ValueError, OSError) as exc:
@@ -628,7 +632,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         existing = blocked_tasks(current_route, history)
         if not finished and stage in GIT_PUSH_STAGES:
             side = stage.split('.')[0]
-            plan = stage_evidence(store, item, side + '.plan') or {}
+            plan = repository_plan(store, item, side, history=(current_route, history)) or {}
             pushed = (evidence or {}).get('repositories', {})
             recorded_blockers.update({
                 key: '待核验远端代码：' + '、'.join(sorted(set(repositories) - pushed.keys()))
@@ -638,7 +642,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         if not finished and stage == 'handoff':
             recorded_blockers.update({key: summary for key in stage_tasks - existing.keys() - recorded_blockers.keys()})
         if not finished and stage == DEPLOY_STAGE and not recorded_blockers:
-            plan = stage_evidence(store, item, 'backend.plan') or {}
+            plan = repository_plan(store, item, 'backend', history=(current_route, history)) or {}
             merged = (stage_evidence(store, item, 'backend.integration') or {}).get('merged_versions', {})
             receipts = (evidence or {}).get('services', {})
             targets = configured_targets(config)

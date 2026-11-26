@@ -13,7 +13,7 @@ from frontend_delivery import acquire_slot, delivery_stage
 from ledger import Ledger, item_identity, message, transaction, validate_config
 from route_evidence import (deployment_requirements, frontend_acceptance_terminal, git_push_evidence_error,
                             git_push_requirements, push_covers)
-from route_execution import contract_revision_pending, get_split, is_routed, read_history, snapshot
+from route_execution import contract_revision_pending, get_split, is_routed, read_history, repository_plan, snapshot
 
 
 def pending_worker_stage(store, item):
@@ -103,7 +103,8 @@ def frontend_request(store, item, directory):
         required = [name for name in required if name != 'frontend.e2e']
     if any(steps.get(name, {}).get('outcome') != 'success' for name in required):
         raise ValueError('前端发布需要本单前端验证及合回成功')
-    planned = steps['frontend.plan']['evidence']['applications']
+    plan = repository_plan(store, item, 'frontend', history=(route, steps))
+    planned = (plan or {}).get('applications', [])
     versions = steps['frontend.integration']['evidence']['merged_versions']
     if post_merge and not frontend_acceptance_terminal(route, steps, versions):
         raise ValueError('前端发布需要最终版本的 E2E 已结束')
