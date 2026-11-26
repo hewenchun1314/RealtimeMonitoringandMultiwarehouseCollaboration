@@ -427,7 +427,7 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
                                           'frontend.unit_test', 'frontend.code_review', 'frontend.integration',
                                           'frontend.e2e', 'frontend.push'])
 
-    def check_unavailable_e2e_continues_to_release_checks(self):
+    def check_unavailable_e2e_continues_to_release_checks(self, *, intake_next_stage):
         from development_git_runner import run_development_git
         from frontend_release_runner import run_frontend_release
         from git_delivery_runner import run_git_delivery
@@ -442,6 +442,8 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             attempt = self.record('attempt_start', stage=stage)
             result = self.finish(stage, attempt, self.evidence(stage, attempt))
             self.assertEqual(result['status'], 'attempt_finished', result)
+            if stage == 'material_check':
+                self.assertEqual(result['next_stage'], intake_next_stage)
             stage = result['next_stage']
 
         attempt = self.record('attempt_start', stage=stage)
@@ -482,11 +484,11 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
 
     def test_bug_continues_to_release_checks_after_e2e_failure(self):
         self.item['kind'] = 'bug'
-        self.config['runtime']['streamlined_bugs'] = True
-        self.check_unavailable_e2e_continues_to_release_checks()
+        self.config['runtime']['streamlined_bug_intake'] = True
+        self.check_unavailable_e2e_continues_to_release_checks(intake_next_stage='frontend.branch_check')
 
     def test_story_continues_to_release_checks_after_e2e_failure(self):
-        self.check_unavailable_e2e_continues_to_release_checks()
+        self.check_unavailable_e2e_continues_to_release_checks(intake_next_stage='split')
 
     def test_independent_frontend_is_verified_and_merged_after_backend_blocker(self):
         self.begin_drill('fullstack', '前后端')
