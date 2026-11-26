@@ -9,8 +9,7 @@ from backend_dependencies import backend_services, writable_dependencies
 from branch_check import branch_context, planned_applications, source_workspace, valid_target
 from execution import active_attempt, execution_matches
 from ledger import Ledger, encode, item_identity, message, require_text, transaction
-from route_evidence import bug_merge_error
-from route_execution import repository_plan, snapshot, stage_evidence, task_scope
+from route_execution import snapshot, stage_evidence, task_scope
 
 ACTIONS = {'branch_prepare': 'prepare', 'candidate_commit': 'commit', 'integration_merge': 'integrate'}
 COMMIT = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
@@ -33,13 +32,12 @@ def active_context(store, data, directory, kind):
     side = stage.split('.')[0] if '.' in stage else 'frontend'
     scoped = '.' in stage
     admitted = snapshot(item)
-    plan = repository_plan(store, item, side) if scoped else stage_evidence(store, item, 'plan')
+    plan_name = side + '.plan' if scoped else 'plan'
+    plan = stage_evidence(store, item, plan_name)
     keys = planned_applications(plan, side)
     if not keys:
         raise ValueError('Host Git requires a successful plan for this side')
     if kind == 'integrate' and scoped:
-        if reason := bug_merge_error(store, item, side):
-            raise ValueError(reason)
         scope = task_scope(store, item, stage)
         if scope and scope['blocked']:
             if not scope['active']:

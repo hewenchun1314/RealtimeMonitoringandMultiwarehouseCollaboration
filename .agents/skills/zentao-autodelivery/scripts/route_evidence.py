@@ -9,8 +9,8 @@ from branch_check import git, planned_applications
 from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, GIT_PUSH_STAGES, TAG,
                           configured_targets, deployed_receipt_matches, frontend_release_config,
                           mcp_rollout_matches, release_verification)
-from route_execution import (blocked_tasks, contract_revision_pending, get_split, handoff_tasks, is_streamlined_bug,
-                             read_history, repository_plan, snapshot, stage_evidence)
+from route_execution import (blocked_tasks, contract_revision_pending, get_split, handoff_tasks,
+                             read_history, snapshot, stage_evidence)
 
 
 def nonblank(value):
@@ -157,13 +157,11 @@ def git_push_requirements(store, item, stage):
         return {}, {}, {}, '工单未启用该端 Git 推送'
     if contract_revision_pending(history):
         return {}, {}, {}, '接口契约变更，等待重新拆分后核验 Git 推送'
-    streamlined = is_streamlined_bug(item)
-    steps = ('branch_check', 'coding') if streamlined else ('plan', 'branch_check', 'coding')
-    for step in steps:
+    for step in ('plan', 'branch_check', 'coding'):
         name = side + '.' + step
         if history.get(name, {}).get('outcome') != 'success':
             return {}, {}, {}, f'Git 推送缺少成功的 {name} 回执'
-    plan = route['repository_plan'].get(side) if streamlined else history[side + '.plan']['evidence']
+    plan = history[side + '.plan']['evidence']
     planned = planned_applications(plan, side)
     integration = history.get(side + '.integration', {})
     if integration.get('outcome') != 'success':
@@ -207,8 +205,7 @@ def pushed_backend_versions(route, stages, versions):
 
 
 def deployment_requirements(store, item):
-    plan = (repository_plan(store, item, 'backend') if is_streamlined_bug(item)
-            else stage_evidence(store, item, 'backend.plan'))
+    plan = stage_evidence(store, item, 'backend.plan')
     services = planned_applications(plan, 'backend')
     if not services:
         return {}, [], {}, '缺少经过确认的后端服务计划'
@@ -253,20 +250,9 @@ def handoff_error(store, item, evidence):
     blockers = route.get('handoff_blockers', route['blockers'])
     if blockers:
         return 'Backend handoff is blocked: ' + ', '.join(blockers)
-    streamlined = is_streamlined_bug(item)
-    prerequisites = (('branch_check', 'coding', 'code_review', 'acceptance') if streamlined else
-                     ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review'))
+    prerequisites = ('design', 'plan', 'branch_check', 'coding', 'unit_test', 'code_review')
     git_delivery = 'backend.push' in route.get('stages', ())
-    if streamlined and route['handoff_mode'] == 'candidate':
-        if reason := bug_verification_error(store, item, 'backend'):
-            return reason
-        versions = stage_evidence(store, item, 'backend.coding')['versions']
-        if versions != evidence.get('backend_versions') or evidence.get('deployment'):
-            return 'Bug handoff must identify the verified backend candidates served in the test environment'
-        return handoff_document_error(store, item, evidence)
-    if streamlined:
-        prerequisites += ('integration',)
-    elif not git_delivery:
+    if not git_delivery:
         prerequisites += ('acceptance', 'integration')
     for name in prerequisites:
         if not stage_evidence(store, item, 'backend.' + name):
@@ -309,10 +295,6 @@ def handoff_error(store, item, evidence):
             if (evidence.get('deployment') != receipts or not isinstance(gateway, str)
                     or gateways != {gateway.rstrip('/')}):
                 return 'Handoff must carry the verified deployment receipts and a common gateway'
-    return handoff_document_error(store, item, evidence)
-
-
-def handoff_document_error(store, item, evidence):
     if not all(nonblank(evidence.get(key)) for key in ('environment', 'verification', 'document')):
         return 'Supply the handoff document, callable environment and observed call evidence'
     database = Path(store.conn.execute('PRAGMA database_list').fetchone()[2])
@@ -325,40 +307,6 @@ def handoff_document_error(store, item, evidence):
             return f'Provide the current handoff document at {expected}'
     except (OSError, UnicodeError, RuntimeError, ValueError) as error:
         return f'Handoff document unavailable: {error}'
-
-
-def bug_verification_error(store, item, side):
-    candidate = stage_evidence(store, item, side + '.coding') or {}
-    acceptance = side + ('.e2e' if side == 'frontend' else '.acceptance')
-    required = (side + '.code_review', acceptance)
-    versions = candidate.get('versions')
-    if not commit_map(versions) or not nonblank(candidate.get('unit_test')):
-        return f'Bug {side} candidate requires passing unit-test evidence'
-    for stage in required:
-        verified = stage_evidence(store, item, stage) or {}
-        if verified.get('versions') != versions:
-            return f'Bug merge requires successful {stage} for the same candidate'
-
-
-def bug_merge_error(store, item, side):
-    if not is_streamlined_bug(item):
-        return None
-    if reason := bug_verification_error(store, item, side):
-        return reason
-    route = get_split(store, item)
-    if route['scope'] != 'fullstack' or (side == 'backend' and route['handoff_mode'] == 'deployed'):
-        return None
-    if reason := bug_verification_error(store, item, 'frontend'):
-        return reason
-    e2e = stage_evidence(store, item, 'frontend.e2e') or {}
-    handoff = stage_evidence(store, item, 'handoff') or {}
-    versions = handoff.get('backend_versions')
-    if not commit_map(versions) or e2e.get('backend_versions') != versions:
-        return 'Bug merge requires joint acceptance on the handed-off backend versions'
-    if route['handoff_mode'] == 'candidate':
-        backend = stage_evidence(store, item, 'backend.coding') or {}
-        if versions != backend.get('versions'):
-            return 'Bug merge requires joint acceptance on the current backend candidates'
 
 
 def validate_success(store, item, stage, evidence, *, task_blockers=None):
@@ -404,10 +352,6 @@ def validate_success(store, item, stage, evidence, *, task_blockers=None):
         return None
     side, _, name = stage.partition('.')
     if name in ('coding', 'integration'):
-        if name == 'coding' and is_streamlined_bug(item) and not nonblank(evidence.get('unit_test')):
-            return 'Provide passing unit-test commands and results for the bug candidate'
-        if name == 'integration' and (reason := bug_merge_error(store, item, side)):
-            return reason
         return repository_evidence(store, item, side, name, evidence)
     if name in ('unit_test', 'code_review', 'acceptance', 'e2e'):
         candidate = stage_evidence(store, item, side + '.coding') or {}
@@ -430,7 +374,7 @@ def validate_success(store, item, stage, evidence, *, task_blockers=None):
             return 'Acceptance must identify all verified task IDs for this side'
         if name == 'e2e' and route['scope'] == 'fullstack':
             handoff = stage_evidence(store, item, 'handoff') or {}
-            if (not is_streamlined_bug(item) and not handoff and (blocked or 'handoff' in stages)
+            if (not handoff and (blocked or 'handoff' in stages)
                     and not (handoff_tasks(route) - blocked.keys())):
                 return None
             if not handoff or evidence.get('backend_versions') != handoff.get('backend_versions'):

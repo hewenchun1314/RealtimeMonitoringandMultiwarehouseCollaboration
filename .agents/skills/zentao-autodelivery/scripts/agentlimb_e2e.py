@@ -156,8 +156,7 @@ def acceptance_setup(config, options, args):
     options['candidateVersions'] = versions
     options['candidateBranches'] = branches
     options['attemptId'] = attempt['attempt_id']
-    if (route['scope'] != 'fullstack' or DEPLOY_STAGE not in route['stages']
-            or route.get('handoff_mode') == 'candidate'):
+    if route['scope'] != 'fullstack' or DEPLOY_STAGE not in route['stages']:
         return {}
     deployed = stages.get(DEPLOY_STAGE, {})
     if deployed.get('outcome') != 'success':

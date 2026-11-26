@@ -347,96 +347,7 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
     def test_fullstack_backend_then_frontend(self):
         self.drill('fullstack', '前后端')
 
-    def streamlined_bug(self, scope, *, handoff_mode='candidate'):
-        self.item['kind'] = 'bug'
-        self.config['runtime']['streamlined_bugs'] = True
-        self.begin_drill(scope, '')
-        self.stage = 'material_check'
-        self.bug_detail = {
-            'detail': 'The status page repeats its empty-state title.',
-            'repositories': {side: [self.key] for side in self.repositories},
-            'acceptance': ['Status reads approved'],
-        }
-        if scope == 'fullstack':
-            self.bug_detail.update(handoff_mode=handoff_mode,
-                                   interface_contract='GET /status.json -> {"status":"approved"}')
-
-    def bug_step(self):
-        stage = self.stage
-        attempt = self.record('attempt_start', stage=stage)
-        self.assertEqual(attempt['status'], 'attempt_started', attempt)
-        if stage == 'material_check':
-            self.assertEqual(attempt['role'], '主工单 Agent')
-            evidence = self.bug_detail
-        elif stage.endswith('.coding'):
-            side = stage.split('.')[0]
-            evidence = self.change(side)
-            evidence['unit_test'] = self.evidence(side + '.unit_test', attempt)['verification']
-        elif stage == 'handoff' and 'backend' not in self.merged:
-            document = self.artifacts / 'backend' / 'handoff.md'
-            call = self.check_api(self.worktrees['backend'])
-            document.write_text(call, encoding='utf-8')
-            evidence = {'document': str(document), 'backend_versions': self.versions['backend'],
-                        'environment': self.api, 'verification': call}
-        else:
-            evidence = self.evidence(stage, attempt)
-            if stage == 'frontend.e2e' and 'backend' in self.repositories:
-                evidence['backend_versions'] = self.merged.get('backend', self.versions['backend'])
-        finished = self.finish(stage, attempt, evidence)
-        self.assertEqual(finished['status'], 'attempt_finished', (stage, finished))
-        self.stage = finished['next_stage']
-        return stage
-
-    def test_frontend_bug_uses_triage_and_verifies_before_merge(self):
-        self.streamlined_bug('frontend_only')
-        stages = []
-        while self.stage:
-            stages.append(self.bug_step())
-        self.assertEqual(stages, ['material_check', 'frontend.branch_check', 'frontend.coding',
-                                  'frontend.code_review', 'frontend.e2e', 'frontend.integration'])
-        self.assertEqual(self.record('complete')['conclusion'], '已交付')
-
-    def test_fullstack_bug_verifies_both_candidates_before_merging(self):
-        self.streamlined_bug('fullstack')
-        stages = []
-        while self.stage:
-            if self.stage == 'frontend.e2e':
-                self.assertEqual(self.merged, {})
-            stages.append(self.bug_step())
-        self.assertEqual(stages, ['material_check', 'backend.branch_check', 'backend.coding', 'backend.code_review',
-                                  'backend.acceptance', 'handoff', 'frontend.branch_check', 'frontend.coding',
-                                  'frontend.code_review', 'frontend.e2e', 'backend.integration', 'frontend.integration'])
-        self.assertEqual(self.record('complete')['conclusion'], '已交付')
-
-    def test_shared_environment_bug_handoff_uses_merged_backend(self):
-        self.streamlined_bug('fullstack', handoff_mode='deployed')
-        while self.stage and self.stage != 'handoff':
-            self.bug_step()
-        self.assertEqual(self.stage, 'handoff')
-        self.assertEqual(self.merged, {'backend': self.versions['backend']})
-        while self.stage:
-            self.bug_step()
-        self.assertEqual(self.record('complete')['conclusion'], '已交付')
-
-    def test_bug_page_validation_blocker_stops_before_merge(self):
-        self.streamlined_bug('frontend_only')
-        stages = ['material_check', 'frontend.branch_check', 'frontend.coding', 'frontend.code_review']
-        for stage in stages:
-            self.assertEqual(self.bug_step(), stage)
-        self.assertEqual(self.stage, 'frontend.e2e')
-        attempt = self.record('attempt_start', stage=self.stage)
-        failed = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
-                             retryable=False, summary='Browser unavailable', evidence={})
-        self.assertIsNone(failed['next_stage'])
-        closeout = self.record('complete', blockers_path='blockers.md')
-        self.assertEqual(closeout['conclusion'], '待验证')
-        self.assertEqual(closeout['steps'][-1]['outcome'], 'skipped')
-
-    def test_enabled_bug_route_does_not_change_story(self):
-        self.config['runtime']['streamlined_bugs'] = True
-        self.drill('fullstack', '前后端')
-
-    def check_frontend_release(self, *, merge_success=True, streamlined=False):
+    def check_unavailable_e2e_continues_to_release_checks(self, *, merge_success=True):
         from development_git_runner import run_development_git
         from frontend_release import tag_for
         from frontend_release_runner import run_frontend_release
@@ -448,26 +359,19 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
         release = project['development']['frontend_bundle']['deployment']
         release.pop('rancher', None)
         self.config['development']['frontend_bundle']['deployment'] = release
-        if streamlined:
-            self.streamlined_bug('frontend_only')
-            while self.stage != 'frontend.integration':
-                self.bug_step()
-        else:
-            self.begin_drill('frontend_only', '纯前端')
-            # The admitted Bug must keep the original route across config changes.
-            self.config['runtime']['streamlined_bugs'] = True
-            stage = 'material_check'
-            while stage != 'frontend.e2e':
-                attempt = self.record('attempt_start', stage=stage)
-                result = self.finish(stage, attempt, self.evidence(stage, attempt))
-                self.assertEqual(result['status'], 'attempt_finished', result)
-                stage = result['next_stage']
-
+        self.begin_drill('frontend_only', '纯前端')
+        stage = 'material_check'
+        while stage != 'frontend.e2e':
             attempt = self.record('attempt_start', stage=stage)
-            result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
-                                 retryable=False, summary='Credentials unavailable',
-                                 evidence={'task_blockers': {'frontend': 'Credentials unavailable'}})
-            self.assertEqual((result['disposition'], result['next_stage']), ('next', 'frontend.integration'))
+            result = self.finish(stage, attempt, self.evidence(stage, attempt))
+            self.assertEqual(result['status'], 'attempt_finished', result)
+            stage = result['next_stage']
+
+        attempt = self.record('attempt_start', stage=stage)
+        result = self.record('attempt_finish', attempt_id=attempt['attempt_id'], outcome='failed',
+                             retryable=False, summary='Credentials unavailable',
+                             evidence={'task_blockers': {'frontend': 'Credentials unavailable'}})
+        self.assertEqual((result['disposition'], result['next_stage']), ('next', 'frontend.integration'))
         integration = self.record('attempt_start', stage='frontend.integration')
         self.assertEqual(integration['task_scope']['active'], ['frontend'])
         if not merge_success:
@@ -526,11 +430,6 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
             released = run_frontend_release(marker, self.database, config_file, self.root)
             self.assertEqual((released['outcome'], released['disposition']), ('success', 'close'), released)
 
-        if streamlined:
-            final = self.record('complete')
-            self.assertEqual(final['conclusion'], '已交付', final)
-            self.assertEqual([step['outcome'] for step in final['steps'][-4:]], ['success'] * 4)
-            return
         final = self.record('complete', blockers_path='blockers.md')
         self.assertEqual(final['conclusion'], '待验证')
         self.assertEqual([step['outcome'] for step in final['steps'][-4:]],
@@ -541,16 +440,13 @@ fetch(new URLSearchParams(location.search).get('api')).then(response => response
 
     def test_bug_continues_to_release_checks_after_e2e_failure(self):
         self.item['kind'] = 'bug'
-        self.check_frontend_release()
-
-    def test_streamlined_bug_reaches_push_and_release_with_triage_repositories(self):
-        self.check_frontend_release(streamlined=True)
+        self.check_unavailable_e2e_continues_to_release_checks()
 
     def test_story_continues_to_release_checks_after_e2e_failure(self):
-        self.check_frontend_release()
+        self.check_unavailable_e2e_continues_to_release_checks()
 
     def test_failed_frontend_merge_skips_push_and_deployment(self):
-        self.check_frontend_release(merge_success=False)
+        self.check_unavailable_e2e_continues_to_release_checks(merge_success=False)
 
     def test_independent_frontend_is_verified_and_merged_after_backend_blocker(self):
         self.begin_drill('fullstack', '前后端')

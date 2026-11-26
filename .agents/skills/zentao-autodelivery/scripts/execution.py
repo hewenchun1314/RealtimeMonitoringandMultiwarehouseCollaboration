@@ -14,9 +14,9 @@ from desktop_runtime import runtime_check
 from ledger import STAGES, STAGE_NAMES, encode, item_identity, message, require_text, stamp
 from material_sync import requirement_checkout, verify_requirement_intent
 from route_evidence import agentlimb_receipt_error, delivery_summary, validate_partial_merge, validate_success
-from route_execution import (blocked_tasks, bug_route, get_split, is_routed, is_streamlined_bug, read_history,
-                             repository_plan, snapshot, split_result, stage_evidence, stage_role, stage_task_ids,
-                             stages_for, task_scope, unit_test_revision, v2_repair)
+from route_execution import (blocked_tasks, get_split, is_routed, read_history, snapshot, split_result,
+                             stage_evidence, stage_role, stage_task_ids, stages_for, task_scope,
+                             unit_test_revision, v2_repair)
 import task_evidence
 
 
@@ -167,15 +167,6 @@ def phase_deadline(store, item, phase):
 def phase_context(store, item, phase, config_directory):
     stage = item['stage'] if phase == 'verify' else phase
     context = {'role': stage_role(stage)}
-    if is_streamlined_bug(item):
-        side, _, leaf = stage.partition('.')
-        if stage in ('material_check', 'split'):
-            context['role'] = '主工单 Agent'
-            context['bug_triage_required'] = True
-        elif leaf in ('code_review', 'acceptance', 'e2e'):
-            context['role'] = '独立验证 Agent'
-            context['validation_stages'] = [side + '.code_review',
-                                            side + ('.e2e' if side == 'frontend' else '.acceptance')]
     scope = task_scope(store, item, stage)
     if scope is not None and stage_task_ids(get_split(store, item), stage):
         context['task_scope'] = scope
@@ -186,7 +177,7 @@ def phase_context(store, item, phase, config_directory):
         return context
     services = None
     if stage not in ('backend.design', 'backend.plan'):
-        plan = repository_plan(store, item, 'backend')
+        plan = stage_evidence(store, item, 'backend.plan')
         services = set(planned_applications(plan, 'backend') or [])
     dependencies = dependency_context(config, config_directory, services)
     if dependencies:
@@ -311,21 +302,11 @@ def repair_advance(store, item, data, *, config_directory, deployment_worker=Fal
     if routed:
         if phase == 'split':
             try:
-                if is_streamlined_bug(item):
-                    material = stage_evidence(store, item, 'material_check')['material']
-                    receipt['route'] = bug_route(snapshot(item), evidence, material)
-                else:
-                    receipt['route'] = split_result(store, item, evidence, revision=True)
+                receipt['route'] = split_result(store, item, evidence, revision=True)
             except ValueError as exc:
                 return message('evidence_required', reason=str(exc))
             return finish_revision(store, item, trial, receipt, completed)
         else:
-            if (phase == 'frontend.e2e' and is_streamlined_bug(item)
-                    and snapshot(item).get('e2e', {}).get('agentlimb')):
-                reason = agentlimb_receipt_error(store, item, trial['attempt_id'], evidence,
-                                                 'passed', config_directory)
-                if reason:
-                    return message('evidence_required', reason=reason)
             reason = validate_success(store, item, phase, evidence)
             if reason:
                 return message('evidence_required', reason=reason)
@@ -382,7 +363,7 @@ def finish_revision(store, item, trial, receipt, completed):
         store.update_item(item, state='closing', conclusion='阻断', stage='split', run_round=next_round)
         next_stage = None
     else:
-        next_stage = stages_for(store, item, route)[1 if is_streamlined_bug(item) else 2]
+        next_stage = stages_for(store, item, route)[2]
         store.update_item(item, stage=next_stage, run_round=next_round)
     return message('route_revised', attempt_id=trial['attempt_id'], next_stage=next_stage,
                    run_round=next_round, route=route)
@@ -437,7 +418,6 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         raise ValueError('retryable must be a boolean')
     repair_required = data.get('repair_required', False)
     routed = is_routed(item)
-    streamlined = is_streamlined_bug(item)
     stage = item['stage']
     entry_stage = stage in ('material_check', 'split')
     skipped = outcome == 'skipped'
@@ -549,8 +529,6 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
                 if stage == 'material_check':
                     material = read_material(config, config_directory, item['kind'], evidence)
                     evidence = {**evidence, 'material': material}
-                    if streamlined:
-                        route = bug_route(config, evidence, material)
                 else:
                     route = split_result(store, item, evidence)
             except (ValueError, OSError) as exc:
@@ -587,8 +565,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     no_work = route and route['blockers'] and not any(route['tasks'].values())
     merge_blocked = (outcome in ('failed', 'timed_out') and not retry
                      and (leaf == 'integration' or phase.endswith('.integration')))
-    bug_blocked = streamlined and not finished and not retry
-    stop_route = (missing_file or no_work or merge_blocked or bug_blocked or
+    stop_route = (missing_file or no_work or merge_blocked or
                   (not finished and ((routed and entry_stage) or sync_required or story_review)))
     next_stage = stages[number + 1] if not stop_route and number + 1 < len(stages) else None
     recorded_blockers = dict(reported or {}) if not retry else {}
@@ -596,7 +573,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         existing = blocked_tasks(current_route, history)
         if not finished and stage in GIT_PUSH_STAGES:
             side = stage.split('.')[0]
-            plan = repository_plan(store, item, side) or {}
+            plan = stage_evidence(store, item, side + '.plan') or {}
             pushed = (evidence or {}).get('repositories', {})
             recorded_blockers.update({
                 key: '待核验远端代码：' + '、'.join(sorted(set(repositories) - pushed.keys()))
@@ -606,7 +583,7 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
         if not finished and stage == 'handoff':
             recorded_blockers.update({key: summary for key in stage_tasks - existing.keys() - recorded_blockers.keys()})
         if not finished and stage == DEPLOY_STAGE and not recorded_blockers:
-            plan = repository_plan(store, item, 'backend') or {}
+            plan = stage_evidence(store, item, 'backend.plan') or {}
             merged = (stage_evidence(store, item, 'backend.integration') or {}).get('merged_versions', {})
             receipts = (evidence or {}).get('services', {})
             targets = configured_targets(config)

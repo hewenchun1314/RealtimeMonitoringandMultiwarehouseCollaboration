@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend_dependencies import backend_services, writable_dependencies
-from branch_check import planned_applications, valid_target
+from branch_check import valid_target
 from deploy_state import (COMMIT, DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, TAG, WORKER_STAGES,
                           deployed_receipt_matches, frontend_release_config, project_services, release_locks, target_key)
 from execution import active_attempt, attempt_finish, attempt_seed, attempt_start, execution_matches, repair_advance
 from ledger import Ledger, item_identity, message, transaction, validate_config
 from route_evidence import deployment_requirements, git_push_evidence_error, git_push_requirements, push_covers
-from route_execution import contract_revision_pending, get_split, is_routed, read_history, repository_plan, snapshot
+from route_execution import contract_revision_pending, get_split, is_routed, read_history, snapshot
 
 
 def pending_worker_stage(store, item):
@@ -94,11 +94,10 @@ def frontend_request(store, item, directory):
     route, steps = read_history(store, item)
     if contract_revision_pending(steps):
         raise ValueError('接口契约变更，等待重新拆分后核验前端发布')
-    required = ('frontend.branch_check', 'frontend.coding', 'frontend.integration')
-    plan = repository_plan(store, item, 'frontend')
-    if not plan or any(steps.get(name, {}).get('outcome') != 'success' for name in required):
+    required = ('frontend.plan', 'frontend.branch_check', 'frontend.coding', 'frontend.integration')
+    if any(steps.get(name, {}).get('outcome') != 'success' for name in required):
         raise ValueError('前端发布需要成功的计划、分支核验、开发及合回回执')
-    planned = planned_applications(plan)
+    planned = steps['frontend.plan']['evidence']['applications']
     versions = steps['frontend.integration']['evidence']['merged_versions']
     if not planned or set(planned) != versions.keys():
         raise ValueError('前端应用与合回 SHA 清单不一致')

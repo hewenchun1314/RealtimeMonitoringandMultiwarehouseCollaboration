@@ -2,8 +2,6 @@
 
 import json
 
-from backend_dependencies import backend_services
-from branch_check import planned_applications, valid_target
 from delivery_scope import resolve_split, route_stages
 from deploy_state import DEPLOY_STAGE, FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES, configured_targets, frontend_release_config
 from ledger import workflow_stages
@@ -15,13 +13,6 @@ def snapshot(item):
 
 def is_routed(item):
     return snapshot(item).get('workflow_version') == 2
-
-
-def is_streamlined_bug(item):
-    if 'kind' not in item.keys() or item['kind'] != 'bug':
-        return False
-    config = snapshot(item)
-    return config.get('workflow_version') == 2 and config.get('runtime', {}).get('streamlined_bugs') is True
 
 
 def invalidate_repaired_outputs(stages, phase, route):
@@ -70,7 +61,7 @@ def read_history(store, item):
         result = json.loads(record['result'])
         if result.get('route_revision'):
             continue
-        if record['outcome'] == 'success' and stage in ('material_check', 'split') and 'route' in result:
+        if record['outcome'] == 'success' and stage == 'split':
             route = result['route']
         outcome = 'failed' if record['outcome'] == 'timed_out' else record['outcome']
         entry = {'stage': stage, 'outcome': outcome,
@@ -114,15 +105,7 @@ def stages_for(store, item, route=None):
     if not is_routed(item):
         return workflow_stages(snapshot(item)['development'])
     route = route or get_split(store, item)
-    if route:
-        return route['stages']
-    return ('material_check',) if is_streamlined_bug(item) else ('material_check', 'split')
-
-
-def repository_plan(store, item, side):
-    if is_streamlined_bug(item):
-        return (get_split(store, item) or {}).get('repository_plan', {}).get(side)
-    return stage_evidence(store, item, side + '.plan')
+    return route['stages'] if route else ('material_check', 'split')
 
 
 def handoff_tasks(route):
@@ -206,52 +189,6 @@ def split_result(store, item, evidence, *, revision=False):
     return route
 
 
-def bug_route(config, evidence, material):
-    repositories = evidence.get('repositories')
-    criteria = evidence.get('acceptance')
-    if (not isinstance(repositories, dict) or not repositories or repositories.keys() - {'frontend', 'backend'}
-            or not isinstance(criteria, list) or not criteria):
-        raise ValueError('Bug triage requires repositories and acceptance criteria')
-    targets = {'backend': backend_services(config),
-               'frontend': config['development'].get('frontend_bundle', {}).get('applications', {})}
-    plans = {}
-    for side, keys in repositories.items():
-        field = 'services' if side == 'backend' else 'applications'
-        plan = {field: keys}
-        if not planned_applications(plan, side) or any(not valid_target(targets[side].get(key)) for key in keys):
-            raise ValueError(f'Bug triage requires writable configured {side} repositories')
-        plans[side] = {**plan, 'task_repositories': {side: keys}}
-    scope = 'fullstack' if len(plans) == 2 else next(iter(plans)) + '_only'
-    handoff_mode = evidence.get('handoff_mode', 'candidate')
-    if scope == 'fullstack' and handoff_mode not in ('candidate', 'deployed'):
-        raise ValueError('Fullstack bug triage requires candidate or deployed handoff')
-    dependency = evidence.get('depends_on_backend', scope == 'fullstack')
-    if type(dependency) is not bool or (dependency and scope != 'fullstack'):
-        raise ValueError('Only a fullstack bug can declare a frontend dependency on backend changes')
-    tasks = {side: [{'id': side, 'description': f'{side} bug fix', 'acceptance': criteria}]
-             for side in plans}
-    if dependency:
-        tasks['frontend'][0]['depends_on'] = ['backend']
-        tasks['backend'][0]['joint_acceptance'] = True
-    route = resolve_split(config, {**evidence, 'material': material, 'ai_scope': scope,
-                                  'rationale': 'Bug 接单核对已确认改动仓库', 'tasks': tasks})
-    if route['scope'] != scope:
-        raise ValueError('Bug repositories must match the configured or declared delivery scope')
-    if route['blockers']:
-        raise ValueError('Record unresolved intake blockers before starting the bug route')
-    stages = route_stages(scope, e2e_enabled=True, deploy_enabled=bool(configured_targets(config)),
-                          frontend_deploy_enabled=frontend_release_config(config).get('enabled', False),
-                          git_push_enabled=config.get('runtime', {}).get('git_push_enabled', False))
-    stages = [stage for stage in stages if stage.rsplit('.', 1)[-1] not in ('split', 'design', 'plan', 'unit_test')]
-    if scope == 'fullstack' and handoff_mode == 'candidate':
-        delivery = [name for name in stages if name in ('backend.integration', 'backend.push', DEPLOY_STAGE)]
-        stages = [name for name in stages if name not in delivery]
-        index = stages.index('frontend.integration')
-        stages[index:index] = delivery
-    return {**route, 'repository_plan': plans, 'stages': stages, 'e2e_enabled': True,
-            'handoff_mode': handoff_mode if scope == 'fullstack' else None}
-
-
 def v2_repair(stage, data, route):
     """Store a repair itinerary in the failed verification receipt for replay."""
     side, name = stage.split('.')
@@ -269,27 +206,22 @@ def v2_repair(stage, data, route):
         # The original unit-test stage is the final verifier. Publish a coding
         # revision first so its immutable candidate receipt names the new SHA.
         return [*phases, owner + '.coding', 'verify']
-    streamlined = bool(route and 'repository_plan' in route)
-    phases.append(owner + '.coding')
-    if not streamlined:
-        phases.append(owner + '.unit_test')
+    phases.extend((owner + '.coding', owner + '.unit_test'))
     if name != 'code_review':
         phases.append(owner + '.code_review')
     if name == 'integration':
         acceptance = owner + ('.e2e' if owner == 'frontend' else '.acceptance')
         if acceptance in route['stages']:
             phases.append(acceptance)
-        if owner == 'backend' and route.get('handoff_mode') == 'candidate':
-            phases.extend(('handoff', 'frontend.e2e'))
     if joint and owner == 'backend':
-        phases.append('backend.acceptance')
-        if route.get('handoff_mode') != 'candidate':
-            phases.extend(name for name in ('backend.integration', 'backend.push', DEPLOY_STAGE)
-                          if name in route['stages'])
+        phases.extend(('backend.acceptance', 'backend.integration'))
+        if 'backend.push' in route['stages']:
+            phases.append('backend.push')
+        if DEPLOY_STAGE in route['stages']:
+            phases.append(DEPLOY_STAGE)
         phases.append('handoff')
         if data.get('frontend_changed') or data.get('contract_changed'):
-            phases.extend(name for name in ('frontend.coding', 'frontend.unit_test', 'frontend.code_review')
-                          if name in route['stages'])
+            phases.extend(('frontend.coding', 'frontend.unit_test', 'frontend.code_review'))
     return [*phases, 'verify']
 
 
