@@ -126,6 +126,7 @@ def worker_prompt(operation, item):
         '若账本进入 backend.push、frontend.push、backend.deploy 或 frontend.deploy（含返工分段），'
         '结束当前轮次，Windows 执行器会接手并续接原会话。'
         '各阶段按 task_scope.active 派发，按编号记录 task_blockers 与证据。'
+        '按步骤指引的钉钉收尾证据传递并登记 bug_cause、acceptance_checks、pending_confirmations。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )
 

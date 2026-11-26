@@ -19,18 +19,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ledger import stamp, transaction
+from ledger import STAGE_NAMES, stamp, transaction
 from task_remote import _dpapi
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 CONFIG = PROJECT_ROOT / '.agents' / 'zentao-project.json'
 DATABASE = PROJECT_ROOT / '.local' / 'zentao-delivery' / 'workflow.sqlite3'
-CONCLUSIONS = {
-    '待补材料': '请查看禅道原单，按收尾备注补充材料。',
-    '待验证': '请查看禅道原单中的待验证项。',
-    '阻断': '请查看禅道原单中的阻断原因。',
-}
+STAGE_STATUS = {'success': '通过', 'failed': '未通过', 'skipped': '未执行'}
+CHECK_STATUS = {'passed': '通过', 'failed': '未通过', 'pending': '待验证'}
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -45,6 +42,74 @@ def enabled(config):
     return config.get('notifications', {}).get('dingtalk', {}).get('enabled') is True
 
 
+def compact(value, limit=160):
+    text = ' '.join(value.split()) if isinstance(value, str) else ''
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
+def closeout_lines(item, result):
+    causes = {}
+    pending = {}
+    lines = []
+    for step in result['steps']:
+        stage = step['stage']
+        name = STAGE_NAMES.get(stage, stage)
+        outcome = step['outcome']
+        lines.append(f'{STAGE_STATUS[outcome]}｜{name} · {compact(step["summary"])}')
+        evidence = step.get('evidence')
+        if not isinstance(evidence, dict):
+            continue
+        cause = compact(evidence.get('bug_cause'))
+        if cause:
+            causes[cause] = None
+        questions = evidence.get('pending_confirmations')
+        if isinstance(questions, list):
+            pending.update(dict.fromkeys(filter(None, map(compact, questions))))
+
+        checks = evidence.get('acceptance_checks')
+        checks = checks if isinstance(checks, list) else []
+        checks = [check for check in checks if isinstance(check, dict)
+                  and compact(check.get('name')) and compact(check.get('outcome')) in CHECK_STATUS]
+        if not checks:
+            tasks = evidence.get('task_results')
+            if isinstance(tasks, dict):
+                checks = [{'name': task, 'outcome': entry.get('outcome'), 'detail': entry.get('verification')}
+                          for task, entry in sorted(tasks.items())
+                          if isinstance(entry, dict) and compact(entry.get('outcome')) in CHECK_STATUS]
+        for check in checks:
+            check_outcome = compact(check['outcome'])
+            detail = compact(check.get('detail'))
+            if outcome == 'skipped':
+                check_outcome = 'pending'
+                detail = compact(step['summary'])
+            line = f'{CHECK_STATUS[check_outcome]}｜{name} / {compact(check["name"], 72)}'
+            lines.append(f'{line} · {detail}' if detail else line)
+
+    if item['kind'] == 'bug':
+        if causes:
+            lines[:0] = [f'缺陷原因｜{cause}' for cause in causes]
+        else:
+            pending['缺陷根因尚无已记录的证据结论'] = None
+    if result.get('task_summary'):
+        lines.append(compact(result['task_summary']))
+    lines.extend(f'待确认｜{question}' for question in pending)
+    kind = item['kind']
+    query = urlencode({'m': kind, 'f': 'view', f'{kind}ID': item['item_id']})
+    lines.append(f'禅道原单 {item["instance"].rstrip("/")}/index.php?{query}')
+    return lines
+
+
+def notification_pages(header, lines):
+    pages = [header]
+    for line in lines:
+        if len(f'{pages[-1]}\n{line}'.encode()) > 1950:
+            pages.append(header)
+        pages[-1] += '\n' + line
+    if len(pages) == 1:
+        return pages
+    return [f'第 {number}/{len(pages)} 部分\n{page}' for number, page in enumerate(pages, 1)]
+
+
 def enqueue_notification(store, item, result):
     started = result['status'] == 'started'
     event_type = 'started' if started else 'closed'
@@ -53,15 +118,16 @@ def enqueue_notification(store, item, result):
     title = ' '.join(item['title'].split())[:160]
     kind = '需求' if item['kind'] == 'story' else '缺陷'
     local_time = store.now.astimezone().strftime('%Y-%m-%d %H:%M %z')
-    body = f'【{headline}】禅道{kind} #{item["item_id"]} {title}\n{local_time}'
-    details = (result.get('task_summary'), CONCLUSIONS.get(headline))
-    for detail in details:
-        if detail:
-            body += '\n' + detail
-    store.conn.execute('''INSERT INTO dingtalk_notifications
-        (operation_id, item_seq, event_type, body, available_at) VALUES (?,?,?,?,?)
-        ON CONFLICT(operation_id) DO NOTHING''',
-        (f'{item["marker"]}/{operation}', item['seq'], event_type, body, store.time))
+    header = f'【{headline}】禅道{kind} #{item["item_id"]} {title}\n{local_time}'
+    pages = [header] if started else notification_pages(header, closeout_lines(item, result))
+    for number, body in enumerate(pages, 1):
+        suffix = '' if number == 1 else f'/{number}'
+        inserted = store.conn.execute('''INSERT INTO dingtalk_notifications
+            (operation_id, item_seq, event_type, body, available_at) VALUES (?,?,?,?,?)
+            ON CONFLICT(operation_id) DO NOTHING''',
+            (f'{item["marker"]}/{operation}{suffix}', item['seq'], event_type, body, store.time))
+        if not inserted.rowcount:
+            break
 
 
 def validate_credentials(webhook, signing_secret):
