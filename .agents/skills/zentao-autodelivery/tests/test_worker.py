@@ -16,6 +16,34 @@ class WorkerTests(unittest.TestCase):
         pending = patch.object(worker, 'pending_development_git', return_value={'status': 'host_git_not_pending'}, create=True)
         pending.start()
         self.addCleanup(pending.stop)
+        stage = patch.object(worker, 'pending_stage', return_value=None)
+        stage.start()
+        self.addCleanup(stage.stop)
+
+    def test_stage_handoff_resumes_original_chat_after_host_preflight_failure(self):
+        item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'frontend.coding'}
+        calls = []
+
+        def chat(current):
+            self.assertIs(current, item)
+            calls.append('chat')
+            return {'receipt_path': 'chat', 'stop_confirmed': True, 'outcome': 'success'}, None
+
+        def stage(*args):
+            calls.append('host')
+            return {'stop_confirmed': True, 'outcome': 'failed',
+                    'preflight_failure': {'check': 'sandbox'}}
+
+        with (
+            patch.object(worker, 'read_item', return_value=item),
+            patch.object(worker, 'deployment_action', return_value={'status': 'deployment_not_pending'}),
+            patch.object(worker, 'pending_stage', side_effect=lambda *args: 'request' if calls == ['chat'] else None),
+            patch.object(worker, 'run_pending_stage', side_effect=stage),
+            patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}),
+        ):
+            result = worker.dispatch_work_item('HNF-' + '1' * 20, chat)
+        self.assertEqual(calls, ['chat', 'host', 'chat'])
+        self.assertEqual(result['host_stage']['preflight_failure']['check'], 'sandbox')
 
     def test_development_git_handoff_stops_host_and_resumes_same_chat(self):
         item = {'state': 'running', 'chat_id': 'fixed-chat', 'stage': 'backend.coding'}

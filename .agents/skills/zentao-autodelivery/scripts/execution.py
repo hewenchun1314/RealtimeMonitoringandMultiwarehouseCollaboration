@@ -448,7 +448,8 @@ def story_review_payload(item, target, result, summary):
     return operation_id, {**target, 'result': result, 'comment': comment, 'vote_key': vote_key}
 
 
-def attempt_finish(store, item, data, branches_verified=False, config_directory=None, *, deployment_worker=False):
+def attempt_finish(store, item, data, branches_verified=False, config_directory=None, *, deployment_worker=False,
+                   database=None):
     if not execution_matches(store, item, data):
         return message('stale_execution')
     attempt_id = require_text(data.get('attempt_id'), 'attempt_id')
@@ -506,6 +507,13 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     development = config['development']
     finished = outcome == 'success'
     evidence = data.get('evidence')
+    preflight = None
+    if database is not None and outcome in ('failed', 'timed_out'):
+        from stage_preflight import blocked_preflight
+
+        preflight = blocked_preflight(database, item, trial)
+        if preflight:
+            evidence = {**(evidence if isinstance(evidence, dict) else {}), 'stage_preflight': preflight}
     if isinstance(evidence, dict):
         if skipped and any(evidence.get(key) for key in (
                 'merged_versions', 'repositories', 'services', 'task_results', 'verified_tasks')):
@@ -601,7 +609,8 @@ def attempt_finish(store, item, data, branches_verified=False, config_directory=
     stages = stages_for(store, item, route)
     if sync_receipt:
         evidence = {**(evidence if isinstance(evidence, dict) else {}), 'requirement_sync': sync_receipt}
-    retry = (not finished and not skipped and not missing_file and not clarification and data.get('retryable', True)
+    retry = (not finished and not skipped and not missing_file and not clarification and not preflight
+             and data.get('retryable', True)
              and trial['retry_number'] < development['max_retries_per_step'])
     if routed and repair_required and data.get('contract_changed') and revision_count(store, item) >= development['max_retries_per_step']:
         retry = False

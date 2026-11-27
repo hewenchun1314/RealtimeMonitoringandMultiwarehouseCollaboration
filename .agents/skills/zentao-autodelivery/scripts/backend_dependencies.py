@@ -1,10 +1,29 @@
 """Resolve contract references and protect upstream repositories in work-item workers."""
 
+import json
+from os import environ
 from os.path import expandvars
 from pathlib import Path
 import subprocess
 
 from material_sync import requirement_checkout
+
+
+def codex_directory():
+    return Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
+
+
+def worker_permission_options(protected_roots, writable_roots):
+    if any(root.is_relative_to(protected) for root in writable_roots for protected in protected_roots):
+        raise ValueError('A writable worker root is inside a read-only dependency')
+    filesystem = {':root': 'read', ':tmpdir': 'write'}
+    filesystem.update({path.as_posix(): 'write' for path in writable_roots})
+    filesystem.update({path.as_posix(): 'read' for path in protected_roots})
+    entries = ','.join(f'{json.dumps(path, ensure_ascii=False)}="{access}"' for path, access in filesystem.items())
+    return ['-c', 'default_permissions="zentao_delivery"',
+            '-c', 'permissions.zentao_delivery.filesystem={' + entries + '}',
+            '-c', 'permissions.zentao_delivery.network.enabled=true',
+            '-c', 'windows.sandbox="mxc"']
 
 
 def writable_dependencies(config):
