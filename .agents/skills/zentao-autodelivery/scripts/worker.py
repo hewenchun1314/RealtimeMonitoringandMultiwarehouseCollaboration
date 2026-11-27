@@ -15,7 +15,7 @@ import time
 from uuid import UUID, uuid4
 
 from backend_deploy_runner import deployment_action, run_deployment
-from backend_dependencies import codex_directory, worker_permission_options, worker_roots
+from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
 from deploy_state import FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
@@ -26,7 +26,6 @@ from frontend_e2e_runner import (frontend_delivery_in_use, frontend_e2e_lock, fr
 from git_delivery_runner import run_git_delivery
 from development_git_runner import pending_development_git, run_development_git
 from stage_runner import recover_job_stop, run_stage, utc_now
-from stage_preflight import pending_stage, run_pending_stage
 from status_board import publish_status
 from story_review_remote import StoryReviewRemote
 from story_review_sync import rearm_uncertain, release_handoff, resume_ready, sync_review
@@ -37,11 +36,25 @@ from material_sync_runner import (pending_material_sync, run_material_sync, run_
                                   release_preflight_reservation)
 
 
+def codex_directory():
+    return Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+
+
 def command(cli, operation, chat_id=None, *, protected_roots=(), writable_roots=()):
     argv = [str(cli), '--ask-for-approval', 'never', 'exec',
             '--json', '--color', 'never', '--skip-git-repo-check']
     if protected_roots or writable_roots:
-        argv.extend(worker_permission_options(protected_roots, writable_roots))
+        if any(root.is_relative_to(protected) for root in writable_roots for protected in protected_roots):
+            raise ValueError('A writable worker root is inside a read-only dependency')
+        filesystem = {':root': 'read', ':tmpdir': 'write'}
+        filesystem.update({path.as_posix(): 'write' for path in writable_roots})
+        filesystem.update({path.as_posix(): 'read' for path in protected_roots})
+        entries = ','.join(f'{json.dumps(path, ensure_ascii=False)}="{access}"'
+                           for path, access in filesystem.items())
+        argv.extend(['-c', 'default_permissions="zentao_delivery"',
+                     '-c', 'permissions.zentao_delivery.filesystem={' + entries + '}',
+                     '-c', 'permissions.zentao_delivery.network.enabled=true',
+                     '-c', 'windows.sandbox="mxc"'])
     if operation == 'probe':
         argv.append('--ephemeral')
     if operation == 'run':
@@ -83,8 +96,6 @@ def worker_prompt(operation, item):
         '恢复轮次读取本工单 recoveries 的最新记录及其中的本地证据文件，落实已核验的受阻范围。'
         '禁止申请临时权限、弹审批、提问或等待人工确认，也不要开启新的桌面聊天。'
         '每次阶段尝试使用账本截止时间及阶段运行器。'
-        '阶段运行器返回 host_stage_required 时立即结束本轮，交 Windows 启动器运行该阶段；'
-        '续接后读取返回的 receipt_path，无须另起尝试。'
         '材料评审返回 material_sync_required 时，先按步骤指引运行 record material_sync，'
         '若返回 material_sync_worker_required，立即结束本轮，交 Windows 启动器在宿主同步；'
         '禁止在沙箱里自行 fetch、探测或转存 Git 凭据。恢复同一会话后读取原尝试结果，'
@@ -199,7 +210,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     last_material = None
     last_git = None
     last_e2e = None
-    last_stage = None
     release_key = 'backend_deployment'
     while utc_now() < deadline:
         state = pending['status']
@@ -222,16 +232,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
                 time.sleep(max(0, min(2, (deadline - utc_now()).total_seconds())))
             elif last_e2e['status'] not in ('host_e2e_finished', 'host_e2e_inactive', 'host_e2e_not_pending'):
                 return {**last_turn, 'status': 'worker_host_e2e_blocked', 'frontend_e2e': last_e2e}
-            continue
-        hosted_stage = pending_stage(DATABASE_PATH, marker)
-        if hosted_stage:
-            if last_turn.get('status') != 'worker_stopped' and not (recover_git and recover_git(item)):
-                return {**last_turn, 'status': 'worker_host_stage_stop_unverified'}
-            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
-                return {**last_turn, 'status': 'worker_host_stage_runtime_blocked'}
-            last_stage = run_pending_stage(DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT, item, hosted_stage)
-            if last_stage.get('stop_confirmed') is not True:
-                return {**last_turn, 'status': 'worker_host_stage_blocked', 'host_stage': last_stage}
             continue
         development_git = pending_development_git(marker, DATABASE_PATH, CONFIG_PATH)
         if development_git['status'] == 'host_git_pending':
@@ -314,8 +314,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             last_turn['development_git'] = last_git
         if last_e2e is not None:
             last_turn['frontend_e2e'] = last_e2e
-        if last_stage is not None:
-            last_turn['host_stage'] = last_stage
         if last_turn['status'] != 'worker_stopped':
             return last_turn
         current = read_item(marker)
@@ -325,8 +323,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
         if (pending_frontend_e2e(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'host_e2e_pending'
                 or frontend_queue_owner(marker, DATABASE_PATH, CONFIG_PATH) is not None
                 or (not was_waiting and frontend_waiting(marker, DATABASE_PATH, CONFIG_PATH))):
-            continue
-        if current and pending_stage(DATABASE_PATH, marker):
             continue
         if pending_material_sync(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'material_sync_pending':
             continue

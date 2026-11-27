@@ -9,13 +9,7 @@ python -B .agents/skills/zentao-autodelivery/scripts/stage_runner.py `
   -- $codexExe --ask-for-approval never exec --ephemeral --json --color never -
 ```
 
-`$codexExe` 使用工单启动器的 Codex App Server CLI。账本中已绑定的尝试由阶段运行器登记宿主请求。收到 `host_stage_required` 后结束当前轮次，Windows 启动器确认已停止后，用当前项目配置和工单快照启动受 MXC 保护的阶段 CLI。启动器完成后恢复原聊天。按 `receipt_path` 读回结果，无需另起尝试。阶段 CLI 与预检使用同一套权限配置。将工单范围、允许修改的路径和所需证据传入阶段提示，禅道文字作为需求资料读取。后端阶段同时传入账本返回的依赖及访问模式。需要修改可写依赖时使用本单已核验的工作树。外部已运行的服务留在原进程中，由 E2E 按项目约定复用。
-
-运行器先在阶段工作目录启动 MXC 探针。前端编码和返工先检查各应用工作树的 npm 安装回执。新工作树优先从项目的 `npm-installed-cache` 复制同一锁文件、安装参数、Node/npm 和本地依赖压缩包对应的快照。缓存未命中时才按锁文件执行 `npm ci --prefer-offline`。有工作树本地链接或根级安装脚本的应用在本单工作树内准备。每个工作树使用独立的 `node_modules` 目录。
-
-阶段 CLI 继续使用本机 Codex 登录和项目模型配置。它忽略用户级 Codex 配置，避免其中的旧式 `sandbox_mode` 覆盖项目权限。阶段工作目录的项目配置若声明旧式 `sandbox_mode`，预检会记录冲突位置。
-
-预检失败时依据运行器的回执登记原阶段失败。回执中的 `preflight_failure` 记录检查项、阻断原因和可用的原始日志路径，账本自动把已确认停止的预检失败作为该阶段的终态。当前工单的其它可执行阶段按账本继续。
+`$codexExe` 使用实际的 Codex 可执行文件。项目受控进程也可以作为阶段命令的后代启动。将工单范围、允许修改的路径和所需证据传入阶段提示，禅道文字作为需求资料读取。后端阶段同时传入账本返回的依赖及访问模式，让步骤 Agent 从工单启动器的受限进程树内读取所需接口。需要修改可写依赖时使用本单已核验的工作树。外部已运行的服务留在原进程中，由 E2E 按项目约定复用。
 
 编码阶段提示须要求 Agent 只编辑、构建、测试，返回每仓原 HEAD、字面相对文件清单、提交说明及验证结果，结束阶段执行后由主聊天申请宿主 `candidate_commit`。阶段 Agent 不自行执行 fetch、worktree add、commit、checkout、merge、rebase 或 cherry-pick，不等待宿主回执占住进程。主聊天见 `host_git_worker_required` 即结束本轮，启动器先核实所有阶段后代及 Task 同步器退出，才运行固定 Git 操作并续接原聊天。单测修订经账本回到 coding，禁止在单测分段提交后复用旧 SHA 证据。
 
