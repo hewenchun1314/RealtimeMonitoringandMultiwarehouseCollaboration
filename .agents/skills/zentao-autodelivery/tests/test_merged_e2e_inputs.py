@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import agentlimb_e2e as e2e
+import merged_e2e_sources as sources
 from merged_e2e_sources import check_merged_checkout, remove_committed_sources, verify_runtime_sources
 
 
@@ -92,6 +94,131 @@ class MergedInputsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             for checkout in self.options['mergedCheckouts'].values():
                 check_merged_checkout(**checkout)
+
+    @unittest.skipUnless(os.name == 'nt', 'Exercises Windows host path limits')
+    def test_deep_host_directory_prepares_recorded_sources_and_preserves_local_edits(self):
+        # Real item/attempt host directories put nested repository hook templates
+        # beyond MAX_PATH before clone has written its repository configuration.
+        desired_destination_length = 218
+        suffix_size = desired_destination_length - len(str(self.log.parent)) - len('/frontend-source') - 1
+        self.assertGreater(suffix_size, 0)
+        stage = self.log.parent / ('h' * suffix_size)
+        stage.mkdir()
+        self.log = stage / 'frontend.log'
+        renamed = self.workspace / 'children' / 'micro-double-sweet-spot'
+        self.assertTrue(self.child.resolve().is_relative_to(self.workspace.resolve()))
+        self.assertTrue(renamed.resolve().is_relative_to(self.workspace.resolve()))
+        self.child.rename(renamed)
+        self.child = renamed
+        self.branches['app']['source_root'] = str(self.child)
+        relative = 'children/' + self.child.name
+        self.config['development']['frontend_bundle']['applications']['app']['repository'] = relative
+        source = self.child / 'input.js'
+        source.write_bytes(b'local draft must survive')
+
+        compiled = self.prepare()
+
+        self.assertEqual(len(str(compiled)), desired_destination_length)
+        self.assertEqual((compiled / relative / 'input.js').read_bytes(), b'committed input')
+        self.assertEqual(git(compiled / relative, 'cat-file', '-t', self.versions['app']), 'commit')
+        self.assertEqual(source.read_bytes(), b'local draft must survive')
+        verify_runtime_sources(self.options, compiled)
+        self.assertEqual(remove_committed_sources(stage), 'removed')
+        self.assertFalse((stage / 'frontend-git').exists())
+        self.assertTrue((self.child / 'node_modules/fixture.txt').is_file())
+
+    def test_owned_source_and_git_storage_can_be_cleaned_after_clone_failure(self):
+        (self.child / 'input.js').write_bytes(b'local draft')
+        self.options['mergedCheckouts'] = e2e.merged_workspace(
+            self.options, self.config, self.branches, self.versions)
+        actual_git = sources.git
+        clones = []
+
+        def fail_second_clone(root, *args, **kwargs):
+            if 'clone' in args:
+                clones.append(args)
+                if len(clones) == 2:
+                    raise ValueError('simulated clone failure')
+            return actual_git(root, *args, **kwargs)
+
+        with patch.object(sources, 'git', side_effect=fail_second_clone):
+            with self.assertRaisesRegex(ValueError, 'simulated clone failure'):
+                sources.prepare_committed_sources(self.options, self.log.parent / 'frontend-source')
+        self.assertTrue((self.log.parent / 'frontend-git').is_dir())
+
+        self.assertEqual(remove_committed_sources(self.log.parent), 'removed')
+
+        self.assertFalse((self.log.parent / 'frontend-source').exists())
+        self.assertFalse((self.log.parent / 'frontend-git').exists())
+        self.assertEqual((self.child / 'input.js').read_bytes(), b'local draft')
+        self.assertTrue((self.child / 'node_modules/fixture.txt').is_file())
+
+    def test_cleanup_preserves_sources_if_git_storage_ownership_changed(self):
+        (self.child / 'input.js').write_bytes(b'local draft')
+        compiled = self.prepare()
+        storage = self.log.parent / 'frontend-git'
+        self.assertTrue(storage.is_dir())
+        (self.log.parent / 'frontend-git.owner').write_text('changed owner', encoding='ascii')
+
+        self.assertEqual(remove_committed_sources(self.log.parent), 'ownership-changed')
+
+        self.assertTrue(compiled.is_dir())
+        self.assertTrue(storage.is_dir())
+        self.assertEqual((self.child / 'node_modules/fixture.txt').read_text(), 'installed')
+
+    def test_cleanup_can_resume_after_git_storage_removed_but_source_removal_failed(self):
+        (self.child / 'input.js').write_bytes(b'local draft')
+        compiled = self.prepare()
+        storage = self.log.parent / 'frontend-git'
+        self.assertTrue(storage.is_dir())
+        actual_remove = sources.shutil.rmtree
+
+        def fail_source(path, *args, **kwargs):
+            if Path(path) == compiled:
+                raise OSError('simulated interrupted source cleanup')
+            return actual_remove(path, *args, **kwargs)
+
+        with patch.object(sources.shutil, 'rmtree', side_effect=fail_source):
+            self.assertEqual(remove_committed_sources(self.log.parent), 'retained')
+        self.assertFalse(storage.exists())
+        self.assertTrue(compiled.exists())
+        self.assertEqual(remove_committed_sources(self.log.parent), 'removed')
+        self.assertFalse(compiled.exists())
+        self.assertTrue((self.child / 'node_modules/fixture.txt').is_file())
+
+    def test_legacy_source_only_cleanup_remains_supported(self):
+        compiled = self.log.parent / 'frontend-source'
+        compiled.mkdir()
+        (compiled / 'owned.txt').write_bytes(b'old attempt')
+        (self.log.parent / 'frontend-source.owner').write_text(str(compiled.stat().st_ino), encoding='ascii')
+
+        self.assertEqual(remove_committed_sources(self.log.parent), 'removed')
+
+        self.assertFalse(compiled.exists())
+
+    def test_cleanup_resumes_when_git_owner_unlink_failed_after_directory_removal(self):
+        (self.child / 'input.js').write_bytes(b'local draft')
+        compiled = self.prepare()
+        owner = self.log.parent / 'frontend-git.owner'
+        actual_unlink = Path.unlink
+        failed = []
+
+        def fail_once(path, *args, **kwargs):
+            if path == owner and not failed:
+                failed.append(True)
+                raise OSError('simulated owner unlink failure')
+            return actual_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, 'unlink', fail_once):
+            self.assertEqual(remove_committed_sources(self.log.parent), 'retained')
+            self.assertFalse((self.log.parent / 'frontend-git').exists())
+            self.assertTrue(owner.exists())
+            self.assertTrue(compiled.exists())
+            self.assertEqual(remove_committed_sources(self.log.parent), 'removed')
+        self.assertFalse(owner.exists())
+        self.assertFalse(compiled.exists())
+        self.assertEqual((self.child / 'input.js').read_bytes(), b'local draft')
+        self.assertTrue((self.child / 'node_modules/fixture.txt').is_file())
 
     def run_with_browser(self, browser):
         self.options['mergedCheckouts'] = e2e.merged_workspace(self.options, self.config, self.branches, self.versions)

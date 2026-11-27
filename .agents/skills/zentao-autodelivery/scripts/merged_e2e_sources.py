@@ -80,7 +80,17 @@ def prepare_committed_sources(options, destination):
     ownership = destination.parent / 'frontend-source.owner'
     with ownership.open('x', encoding='ascii') as receipt:
         receipt.write(str(destination.stat().st_ino))
-    for row in checkouts.values():
+    # Keep Git's object/alternates paths short even for long application names.
+    # This sibling belongs to the same host attempt and has independent proof.
+    git_storage = destination.parent / 'frontend-git'
+    git_ownership = destination.parent / 'frontend-git.owner'
+    if (git_storage.resolve() != git_storage or os.path.lexists(git_storage)
+            or os.path.lexists(git_ownership)):
+        raise ValueError('Formal frontend Git storage requires a new attempt-owned directory')
+    git_storage.mkdir()
+    with git_ownership.open('x', encoding='ascii') as receipt:
+        receipt.write(str(git_storage.stat().st_ino))
+    for index, row in enumerate(checkouts.values()):
         source = Path(row['repository'])
         target = destination / source.relative_to(main)
         if target.resolve() != target:
@@ -88,7 +98,11 @@ def prepare_committed_sources(options, destination):
         target.parent.mkdir(parents=True, exist_ok=True)
         # Shared object storage avoids copying every repository's history. Each
         # checkout has its own index and files, including package definitions.
-        git(target.parent, 'clone', '--shared', '--no-checkout', '--no-tags', '--config', 'core.longpaths=true',
+        # Apply long paths before clone copies hook templates during init; the
+        # new repository's --config alone takes effect too late on Windows.
+        git(target.parent, '-c', 'core.longpaths=true', 'clone', '--shared',
+            '--no-checkout', '--no-tags', '--config', 'core.longpaths=true',
+            '--separate-git-dir', str(git_storage / str(index)),
             '--', str(source), str(target), timeout=180)
         git(target, 'checkout', '--detach', row['sha'], timeout=180)
         modules = source / 'node_modules'
@@ -113,6 +127,23 @@ def remove_committed_sources(stage_folder):
         if (destination.resolve() != destination or ownership.resolve() != ownership
                 or ownership.read_text(encoding='ascii') != str(destination.stat().st_ino)):
             return 'ownership-changed'
+        git_storage = stage_folder / 'frontend-git'
+        git_ownership = stage_folder / 'frontend-git.owner'
+        if os.path.lexists(git_storage) or os.path.lexists(git_ownership):
+            if git_ownership.resolve() != git_ownership or not git_ownership.is_file():
+                return 'ownership-changed'
+            expected_inode = git_ownership.read_text(encoding='ascii')
+            if not expected_inode.isdecimal():
+                return 'ownership-changed'
+            if os.path.lexists(git_storage):
+                if (git_storage.resolve() != git_storage or not git_storage.is_dir()
+                        or expected_inode != str(git_storage.stat().st_ino)):
+                    return 'ownership-changed'
+                shutil.rmtree(git_storage)
+            # A previous cleanup may have removed storage before unlinking its
+            # marker. No unverified directory is removed in this recovery state.
+            # Remove metadata first so source cleanup can be retried independently.
+            git_ownership.unlink()
         # Python 3.8+ unlinks Windows junctions without traversing their target.
         shutil.rmtree(destination)
         ownership.unlink()
