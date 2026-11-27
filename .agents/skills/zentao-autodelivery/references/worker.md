@@ -2,6 +2,8 @@
 
 从项目根目录执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py` 并选择以下操作。启动器使用已登录 Codex，查找配置的 CLI 或系统 PATH，对实际工单启用非交互执行和配置的工作区权限。
 
+工单的 Codex 模型和推理强度由运行它的 Codex CLI 配置决定。
+
 | 操作 | 用途 |
 |---|---|
 | `probe` | 在临时会话里实际读取项目文件，核对命令、退出码、回合结束及进程清理。 |

@@ -21,8 +21,6 @@
     "interval_minutes": 60
   },
   "runtime": {
-    "codex_model": "gpt-6.1-sol",
-    "codex_reasoning_effort": "xhigh",
     "sync_requirement_before_review": true,
     "streamlined_bug_intake": true,
     "git_push_enabled": true,
@@ -250,6 +248,7 @@
     },
     "ready_url": null,
     "platform_entry_path": "/aggregation-platform/sso/home-page/platform",
+    "source_origins": ["http://10.10.4.140:31111"],
     "work_area_path": "/aggregation-platform/sso/home-page/work-area",
     "agentlimb": {
       "browser": "Profile-744b45",

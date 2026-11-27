@@ -54,7 +54,7 @@
 }
 ```
 
-- 动作 `navigate` 使用 `path`，`click` 使用 `selector`，`input` 使用 `selector` 和字符串 `value`。
+- 动作 `navigate` 使用 `path`，`click` 使用 `selector`，`input` 使用 `selector` 和字符串 `value`。宿主把 `entry_path` 和 `navigate.path` 中匹配 `e2e.source_origins` 的完整链接转换为候选服务的相对路径。
 - 等待与断言使用 CSS `selector`。支持 `wait-for`、`assert-visible`、`assert-hidden`、`assert-text` 和 `assert-count`。`assert-text` 增加 `text` 精确匹配文字，`assert-count` 增加非负整数 `count`。等待与断言可带 `timeout_ms`，范围 0 到 30000，默认 10000。步骤可用简短的小写英文标识 `name` 便于定位。
 - `wait-for` 用于测试数据、导航或前置控件，超时登记环境受阻。预期业务行为用 `assert-*` 核对。提交失败回执前先核对实际版本和场景列表，已验证版本上的业务断言失败才交给开发 Agent。
 - 虚拟列表只渲染当前可见的一段。查找列表项时可给 `wait-for` 指定 `scroll_container`（列表滚动区域的 CSS 选择器），执行器逐屏向下查找至该步超时。

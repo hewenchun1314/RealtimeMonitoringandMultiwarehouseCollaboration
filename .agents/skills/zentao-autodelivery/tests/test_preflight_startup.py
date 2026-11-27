@@ -1,6 +1,7 @@
 import argparse
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -103,14 +104,15 @@ class PreflightStartupTests(unittest.TestCase):
 
     def test_open_origin_port_reuses_service_without_starting_another(self):
         options = e2e.browser_options(self.config, self.args)
-        with patch.object(e2e, 'port_open', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
+        with (patch.object(e2e, 'port_in_use', return_value=True), patch.object(e2e, 'port_open', return_value=True),
+              patch.object(e2e.subprocess, 'Popen') as start):
             self.assertEqual(e2e.prepare_frontend(self.config['e2e'], options, None), {'mode': 'reused'})
         start.assert_not_called()
 
     def test_frontend_only_candidate_refuses_to_reuse_the_base_service(self):
         options = e2e.browser_options(self.config, self.args)
         options['startupWorkspace'] = str(self.workspace / 'candidate')
-        with patch.object(e2e, 'port_open', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
+        with patch.object(e2e, 'port_in_use', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
             self.assertEqual(e2e.prepare_frontend(self.config['e2e'], options, None)['reason'],
                              'candidate-port-in-use')
         start.assert_not_called()
@@ -119,7 +121,7 @@ class PreflightStartupTests(unittest.TestCase):
         options = e2e.browser_options(self.config, self.args)
         settings = dict(self.config['e2e'], startup_ports=[5000, 5010, 5080])
         options.update(postMerge=True, startupWorkspace=str(self.workspace))
-        with (patch.object(e2e, 'port_open', side_effect=lambda host, port: port == 5080),
+        with (patch.object(e2e, 'port_in_use', side_effect=lambda host, port: port == 5080),
               patch.object(e2e.subprocess, 'Popen') as start):
             result = e2e.prepare_frontend(settings, options, None)
         self.assertEqual(result, {'mode': 'start-failed', 'reason': 'candidate-port-in-use', 'ports': [5080]})
@@ -159,7 +161,23 @@ class PreflightStartupTests(unittest.TestCase):
         self.assertEqual(options['candidateVersions'], {'shell': sha})
         check.assert_called_once_with(options, self.config, repositories, {'shell': sha})
 
-    def test_owned_http_service_starts_and_is_cleaned_without_stopping_external_listener(self):
+    @unittest.skipUnless(os.name == 'nt', 'Exercises Windows socket reuse')
+    def test_windows_startup_ignores_a_stale_connection_probe_on_a_reusable_port(self):
+        with tempfile.TemporaryDirectory() as folder, socket.socket() as available:
+            available.bind(('127.0.0.1', 0))
+            port = available.getsockname()[1]
+            available.close()
+            options = {'workspace': folder, 'startupWorkspace': folder, 'baseUrl': f'http://127.0.0.1:{port}',
+                       'loginPath': '/'}
+            settings = {'start_command': ['npm', 'run', 'serve'], 'startup_ports': [port]}
+            child = Mock(pid=37, poll=Mock(return_value=None))
+            with (patch.object(e2e, 'port_open', return_value=True), patch.object(e2e, 'http_ready', return_value=True),
+                  patch.object(e2e, 'launch_frontend', return_value=child) as launch):
+                result = e2e.prepare_frontend(settings, options, Path(folder) / 'frontend.log')
+            self.assertEqual(result['mode'], 'started')
+            launch.assert_called_once()
+
+    def test_next_http_service_reuses_the_same_port_without_stopping_external_listener(self):
         from stage_runner import run_stage, utc_now
 
         with tempfile.TemporaryDirectory() as folder, socket.socket() as external:
@@ -182,13 +200,13 @@ class PreflightStartupTests(unittest.TestCase):
                               + 'from agentlimb_e2e import prepare_frontend\n'
                               + f'print(json.dumps(prepare_frontend({config!r}, {options!r}, Path("frontend.log"))))\n',
                               encoding='utf-8')
-            receipt = run_stage('http-test', 'frontend', utc_now() + timedelta(seconds=20),
-                                root, root / 'runs', None, [sys.executable, '-B', str(script)])
-            self.assertEqual(receipt['outcome'], 'success', receipt)
-            report = json.loads(Path(receipt['stdout_path']).read_bytes())
-            self.assertEqual(report['mode'], 'started')
-            self.assertTrue(receipt['stop_confirmed'])
-            self.assertFalse(e2e.port_open('127.0.0.1', port))
+            for attempt in ('first-item', 'next-item'):
+                receipt = run_stage(attempt, 'frontend', utc_now() + timedelta(seconds=20),
+                                    root, root / 'runs', None, [sys.executable, '-B', str(script)])
+                self.assertEqual(receipt['outcome'], 'success', receipt)
+                report = json.loads(Path(receipt['stdout_path']).read_bytes())
+                self.assertEqual(report['mode'], 'started', report)
+                self.assertTrue(receipt['stop_confirmed'], receipt)
             with socket.create_connection(external.getsockname(), timeout=1):
                 pass
 
@@ -197,21 +215,23 @@ class PreflightStartupTests(unittest.TestCase):
         child = Mock(pid=37)
         child.poll.return_value = None
         with (tempfile.TemporaryDirectory() as folder,
-              patch.object(e2e, 'port_open', side_effect=[False, False, False, True, True]) as port,
+              patch.object(e2e, 'port_in_use', return_value=False) as excluded,
+              patch.object(e2e, 'port_open', side_effect=[True, True]) as port,
               patch.object(e2e, 'http_ready', return_value=True) as ready,
               patch.object(e2e, 'sleep'), patch.object(e2e.subprocess, 'Popen', return_value=child) as start):
             log = Path(folder) / 'frontend.log'
             result = e2e.prepare_frontend(self.config['e2e'], options, log)
         self.assertEqual(result['mode'], 'started')
         self.assertEqual(result['pid'], 37)
-        self.assertEqual([call.args[1] for call in port.call_args_list], [5000, 5000, 5010, 5000, 5010])
+        self.assertEqual([call.args[1] for call in excluded.call_args_list], [5000, 5000, 5010])
+        self.assertEqual([call.args[1] for call in port.call_args_list], [5000, 5010])
         self.assertEqual(ready.call_args.args, ('http://localhost:5000/login',))
         self.assertEqual(start.call_args.args[0][1:], ['run', 'serve-shell-hub'])
         self.assertEqual(start.call_args.kwargs['cwd'], str(self.workspace))
 
     def test_start_command_exit_is_reported_before_browser(self):
         options = e2e.browser_options(self.config, self.args)
-        with (tempfile.TemporaryDirectory() as folder, patch.object(e2e, 'port_open', return_value=False),
+        with (tempfile.TemporaryDirectory() as folder, patch.object(e2e, 'port_in_use', return_value=False),
               patch.object(e2e.subprocess, 'Popen', return_value=Mock(pid=37, poll=Mock(return_value=1)))):
             self.assertEqual(e2e.prepare_frontend(self.config['e2e'], options, Path(folder) / 'frontend.log')['reason'],
                              'start-command-exited')
@@ -219,7 +239,7 @@ class PreflightStartupTests(unittest.TestCase):
     def test_deployed_candidate_refuses_reuse_of_unproven_local_service(self):
         options = e2e.browser_options(self.config, self.args)
         options['gatewayUrl'] = 'http://deployment.example.test:31111/'
-        with patch.object(e2e, 'port_open', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
+        with patch.object(e2e, 'port_in_use', return_value=True), patch.object(e2e.subprocess, 'Popen') as start:
             result = e2e.prepare_frontend(self.config['e2e'], options, None)
         self.assertEqual(result['mode'], 'start-failed')
         self.assertEqual(result['reason'], 'candidate-port-in-use')
@@ -231,7 +251,8 @@ class PreflightStartupTests(unittest.TestCase):
         options['gatewayUrl'] = 'http://deployment.example.test:31111/'
         child = Mock(pid=37, poll=Mock(return_value=None))
         with (tempfile.TemporaryDirectory() as folder,
-              patch.object(e2e, 'port_open', side_effect=[False, False, True, True]),
+              patch.object(e2e, 'port_in_use', return_value=False),
+              patch.object(e2e, 'port_open', return_value=True),
               patch.object(e2e, 'http_ready', return_value=True),
               patch.object(e2e.subprocess, 'Popen', return_value=child) as start):
             result = e2e.prepare_frontend(self.config['e2e'], options, Path(folder) / 'frontend.log')

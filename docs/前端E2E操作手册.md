@@ -10,6 +10,7 @@
 
 ## 在业务页面验证
 
+- 原单可以填写线上完整链接或以 `/` 开头的页面路径。把页面地址填入场景的 `entry_path` 或 `navigate.path`。验收执行器会把项目配置 `e2e.source_origins` 中的线上地址转换成本次候选服务的本地地址，保留路径、查询参数和锚点。例如 `http://10.10.4.140:31111/aggregation-platform/shell-hub/data-overview/gas-profile` 会在默认环境访问 `http://localhost:5000/aggregation-platform/shell-hub/data-overview/gas-profile`。未配置的完整链接会报告场景输入受阻。
 - 有数据的用例先按原单完成数据选择，等到页面出现真实记录、数值或曲线后，再执行本单的业务断言。将等待实际数据的步骤写入场景的 `wait-for`，保存页面读到的值。找不到可用数据时记录「测试数据受阻」和已查范围。
 - 空状态用例按原单指定的空条件验证。涉及保存或覆盖数据时，使用原单指定的可写样本及恢复方式。
 - 回执记录候选版本、实际工区、实际样本、操作和结果。运行器、超时和回执格式见 [E2E 阶段指引](../.agents/skills/zentao-autodelivery/references/e2e.md)。

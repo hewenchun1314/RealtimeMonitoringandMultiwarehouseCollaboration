@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
-from socket import create_connection
+import socket
 import sqlite3
 import subprocess
 from time import monotonic, sleep
@@ -219,10 +219,27 @@ def verify_deployment(deployment):
 
 def port_open(host, port):
     try:
-        with create_connection((host, port), timeout=0.5):
+        with socket.create_connection((host, port), timeout=0.5):
             return True
     except OSError:
         return False
+
+
+def port_in_use(host, port):
+    if os.name != 'nt':
+        return port_open(host, port)
+    # Windows can briefly report a successful connection to a stopped listener.
+    # An exclusive bind checks whether the next server can actually claim the port.
+    for family, kind, protocol, _, address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        with socket.socket(family, kind, protocol) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                probe.bind(address)
+            except OSError as error:
+                if error.winerror in (10013, 10048):  # WSAEACCES, WSAEADDRINUSE
+                    return True
+                raise
+    return False
 
 
 def http_ready(url):
@@ -264,9 +281,9 @@ def prepare_frontend(config, options, startup_log):
     if (not isinstance(startup_ports, list) or any(type(p) is not int or not 1 <= p <= 65535 for p in startup_ports)
             or not set(ready_ports).issubset(startup_ports)):
         raise ValueError('All frontend readiness ports must be in the configured startup ports')
-    if not formal and port_open(origin.hostname, entry_port):
+    if not formal and port_in_use(origin.hostname, entry_port) and port_open(origin.hostname, entry_port):
         return {'mode': 'reused'}
-    occupied = [port for port in sorted(set(startup_ports)) if port_open(origin.hostname, port)]
+    occupied = [port for port in sorted(set(startup_ports)) if port_in_use(origin.hostname, port)]
     if occupied:
         return {'mode': 'start-failed', 'reason': 'candidate-port-in-use', 'ports': occupied}
 

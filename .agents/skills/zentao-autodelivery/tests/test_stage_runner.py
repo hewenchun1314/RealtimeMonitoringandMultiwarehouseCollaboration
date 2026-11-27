@@ -33,7 +33,7 @@ class StageRunnerTests(unittest.TestCase):
             self.assertEqual(receipt['outcome'], 'success')
             self.assertEqual(Path(receipt['receipt_path']), folder / 'joint' / 'backend.coding' / 'result.json')
 
-    def test_codex_exec_receives_project_model_settings_in_the_worktree(self):
+    def test_codex_exec_keeps_its_model_settings_in_the_worktree(self):
         from stage_runner import run_stage
 
         with tempfile.TemporaryDirectory() as directory:
@@ -55,8 +55,7 @@ class StageRunnerTests(unittest.TestCase):
             self.assertEqual(spawn.call_args.kwargs['cwd'], worktree)
             worker_argv = spawn.call_args.args[0]
             self.assertEqual(worker_argv[worker_argv.index('codex.exe'):], [
-                'codex.exe', '-c', 'model="gpt-6.1-sol"', '-c', 'model_reasoning_effort="xhigh"',
-                'exec', '--ephemeral', '-',
+                'codex.exe', 'exec', '--ephemeral', '-',
             ])
 
     def test_deadline_stops_worker_and_grandchild_without_touching_external_process(self):

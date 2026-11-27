@@ -70,7 +70,7 @@ class MergedInputsTests(unittest.TestCase):
     def prepare(self, port=5000):
         options = self.options
         options['mergedCheckouts'] = e2e.merged_workspace(options, self.config, self.branches, self.versions)
-        with (patch.object(e2e, 'port_open', side_effect=[False, True]),
+        with (patch.object(e2e, 'port_in_use', return_value=False), patch.object(e2e, 'port_open', return_value=True),
               patch.object(e2e, 'http_ready', return_value=True),
               patch.object(e2e, 'launch_frontend', return_value=Mock(pid=42, poll=lambda: None)) as launch):
             result = e2e.prepare_frontend({'start_command': ['npm', 'run', 'serve'], 'startup_ports': [port]}, options, self.log)
@@ -301,7 +301,7 @@ server.listen(port, '127.0.0.1', async () => {
         self.options['mergedCheckouts'] = e2e.merged_workspace(self.options, self.config, self.branches, self.versions)
         self.options['candidateVersions'] = self.versions
         config = {'e2e': {'start_command': 'npm run serve', 'startup_ports': [5000]}}
-        with (patch.object(e2e, 'port_open', side_effect=[False, True]),
+        with (patch.object(e2e, 'port_in_use', return_value=False), patch.object(e2e, 'port_open', return_value=True),
               patch.object(e2e, 'http_ready', return_value=True),
               patch.object(e2e, 'launch_frontend', return_value=Mock(pid=42, poll=lambda: None)),
               patch.object(e2e, 'browser_result', side_effect=browser) as visited):

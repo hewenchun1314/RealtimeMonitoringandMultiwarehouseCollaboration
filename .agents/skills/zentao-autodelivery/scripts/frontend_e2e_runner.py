@@ -9,7 +9,7 @@ import sqlite3
 import sys
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from ledger import Ledger, message
 from material_sync_runner import checkout_lock, read_json, recover_proof
@@ -137,6 +137,19 @@ def _json_input(root, value):
     return path
 
 
+def _local_page_path(value, allowed_origins):
+    if not isinstance(value, str) or '\\' in value or any(char.isspace() or ord(char) < 32 for char in value):
+        raise ValueError('Use a local path or a configured frontend URL')
+    if value.startswith('/') and not value.startswith('//'):
+        return value
+    address = urlsplit(value)
+    origin = f'{address.scheme}://{address.netloc}'
+    if (address.scheme not in ('http', 'https') or address.username is not None or address.password is not None
+            or origin not in allowed_origins or address.path.startswith('//')):
+        raise ValueError('Frontend URL does not match a configured origin')
+    return urlunsplit(('', '', address.path or '/', address.query, address.fragment))
+
+
 def _command(marker, job, stage_root):
     data = job.request
     expected = {'attempt_id', 'scenario'}
@@ -166,8 +179,18 @@ def _command(marker, job, stage_root):
         profile_data = {key: scenario_data.pop(key) for key in fields if key in scenario_data}
     else:
         profile_data = read_json(_json_input(job.item_root, data['profile']))
-    if profile_data is None or not _case_names(scenario_data):
+    if not isinstance(profile_data, dict) or not _case_names(scenario_data):
         raise ValueError('Host E2E requires a JSON profile and a scenario with named cases')
+    origins = {base.rstrip('/'), *job.e2e.get('source_origins', [])}
+    if 'entry_path' in profile_data:
+        profile_data['entry_path'] = _local_page_path(profile_data['entry_path'], origins)
+    for case in scenario_data.get('cases', [scenario_data]):
+        steps = case.get('steps') if isinstance(case, dict) else None
+        if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+            raise ValueError('Host E2E requires a list of scenario steps')
+        for step in steps:
+            if step.get('action') == 'navigate':
+                step['path'] = _local_page_path(step.get('path'), origins)
     inputs.mkdir(parents=True, exist_ok=True)
     profile = inputs / 'profile.json'
     scenario = inputs / 'scenario.json'

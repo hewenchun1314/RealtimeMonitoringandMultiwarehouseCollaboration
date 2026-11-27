@@ -25,6 +25,7 @@ class FrontendHostTests(unittest.TestCase):
         self.database = self.root / 'workflow.sqlite3'
         self.config = self.root / 'config.json'
         config = {'workspaces': {'frontend': '.'}, 'e2e': {'workspace': 'frontend', 'enabled': True,
+                  'source_origins': ['http://10.10.4.140:31111'],
                   'after_integration': True, 'agentlimb': {'preflight_origin': 'http://localhost:5000'}}}
         self.config.write_text(json.dumps(config), encoding='utf-8')
         self.deadline = utc_now() + timedelta(minutes=2)
@@ -73,8 +74,13 @@ class FrontendHostTests(unittest.TestCase):
             cfg['e2e_attestation'] = 'launch'
             conn.execute('UPDATE work_items SET config_snapshot=?', (json.dumps(cfg),))
         scenario = self.folder / 'scenario.json'
-        scenario.write_text(json.dumps({'entry_path': '/charts',
-                                        'steps': [{'action': 'assert-visible', 'selector': '#fixture'}]}),
+        local = '/aggregation-platform/shell-hub/data-overview/gas-profile?well=1#summary'
+        online = 'http://10.10.4.140:31111' + local
+        scenario.write_text(json.dumps({'entry_path': online, 'cases': [{'name': 'gas-profile', 'steps': [
+            {'action': 'navigate', 'path': online},
+            {'action': 'navigate', 'path': '/charts'},
+            {'action': 'assert-visible', 'selector': '#fixture'},
+        ]}]}),
                             encoding='utf-8')
         request = {'attempt_id': self.attempt, 'scenario': scenario.relative_to(self.item).as_posix()}
         (self.folder / 'host-request.json').write_text(json.dumps(request), encoding='utf-8')
@@ -84,8 +90,17 @@ class FrontendHostTests(unittest.TestCase):
         command = runner._command(self.marker, job, stage_root)
         self.assertIn('http://localhost:5000', command)
         self.assertEqual(json.loads((stage_root / 'inputs/profile.json').read_text('utf-8')),
-                         {'entry_path': '/charts'})
-        self.assertEqual(list(json.loads((stage_root / 'inputs/scenario.json').read_text('utf-8'))), ['steps'])
+                         {'entry_path': local})
+        prepared = json.loads((stage_root / 'inputs/scenario.json').read_text('utf-8'))
+        self.assertEqual([step['path'] for step in prepared['cases'][0]['steps'][:2]], [local, '/charts'])
+        self.assertEqual(json.loads(scenario.read_text('utf-8'))['entry_path'], online)
+
+    def test_unconfigured_and_ambiguous_frontend_urls_are_rejected(self):
+        origins = {'http://10.10.4.140:31111'}
+        for url in ('https://other.example/page', 'http://10.10.4.140:31111@other.example/page',
+                    '//other.example/page', 'http://10.10.4.140:31111//other.example/page'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                runner._local_page_path(url, origins)
 
     def test_external_code_out_of_scope_is_rejected_without_host_process(self):
         self.request(scenario='../other/scenario.cjs')
