@@ -271,7 +271,7 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
                 return message('story_review_worker_required')
         if action == 'attempt_finish':
             response = attempt_finish(store, item, data, branches_verified=branches_verified,
-                                      config_directory=config_directory)
+                                      config_directory=config_directory, database=Path(database).resolve())
         elif action in ('attempt_start', 'repair_advance', 'recover'):
             response = actions[action](store, item, data, config_directory=config_directory)
         else:

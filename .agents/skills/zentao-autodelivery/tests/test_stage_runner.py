@@ -105,6 +105,39 @@ class StageRunnerTests(unittest.TestCase):
             self.assertEqual(result['stop_evidence']['owned_processes_at_stop'], 0)
             self.assertFalse((folder / 'marker').exists())
 
+    def test_failed_preflight_stops_before_agent_start(self):
+        from stage_runner import run_stage, utc_now
+
+        for check in ('sandbox', 'frontend_dependencies'):
+            with self.subTest(check=check), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                command = [sys.executable, '-c', 'from pathlib import Path; Path("agent-started").touch()']
+                preflight = [{'check': check, 'cwd': str(folder), 'command': [
+                    sys.executable, '-c', 'import sys; print("blocked"); sys.exit(3)',
+                ]}]
+                receipt = run_stage('blocked', 'verify', utc_now() + timedelta(seconds=15),
+                                    folder, folder, None, command, preflight=preflight)
+                self.assertEqual(receipt['outcome'], 'failed')
+                self.assertEqual(receipt['preflight_failure']['check'], check)
+                self.assertTrue(receipt['stop_confirmed'])
+                self.assertFalse(receipt['stop_evidence']['worker_started'])
+                self.assertIn('blocked', Path(receipt['preflight_failure']['log']).read_text())
+                self.assertFalse((folder / 'agent-started').exists())
+
+    def test_successful_preflight_runs_in_order_before_agent(self):
+        from stage_runner import run_stage, utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            preflight = [{'check': 'sandbox', 'cwd': str(folder), 'command': [
+                sys.executable, '-c', 'from pathlib import Path; Path("probe-ok").touch()',
+            ]}]
+            command = [sys.executable, '-c', 'from pathlib import Path; assert Path("probe-ok").is_file()']
+            receipt = run_stage('ready', 'verify', utc_now() + timedelta(seconds=15),
+                                folder, folder, None, command, preflight=preflight)
+            self.assertEqual(receipt['outcome'], 'success')
+            self.assertTrue(receipt['stop_evidence']['worker_started'])
+
     def test_successful_worker_cleans_up_its_remaining_background_process(self):
         payload = (
             'import subprocess, sys\n'

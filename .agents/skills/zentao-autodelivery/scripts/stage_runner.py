@@ -167,8 +167,8 @@ def parse_session(path):
     return session
 
 
-def coding_start_callback(attempt_id, phase, deadline):
-    chat_id = os.environ.get('CODEX_THREAD_ID')
+def coding_start_callback(attempt_id, phase, deadline, chat_id=None):
+    chat_id = chat_id or os.environ.get('CODEX_THREAD_ID')
     if not chat_id or phase not in ('verify', 'backend.coding', 'frontend.coding'):
         return None
     from task_sync import coding_attempt, record_coding_start
@@ -187,34 +187,63 @@ def coding_start_callback(attempt_id, phase, deadline):
     return record
 
 
-def bootstrap(prompt, command):
+def bootstrap(prompt, command, plan=None):
     # A closed pipe means the supervisor failed before the process was contained.
     if sys.stdin.buffer.read(1) != b'G':
         return 125
+    if plan is not None:
+        directory = plan.parent
+        for index, check in enumerate(json.loads(plan.read_text(encoding='utf-8')), start=1):
+            log = directory / f'preflight-{index}.log'
+            failure = {'check': check['check'], 'log': str(log), 'working_directory': check['cwd']}
+            write_json(directory / 'preflight-active.json', failure)
+            try:
+                with log.open('wb') as stream:
+                    status = subprocess.call(check['command'], cwd=check['cwd'], stdin=subprocess.DEVNULL,
+                                             stdout=stream, stderr=subprocess.STDOUT, timeout=check.get('timeout'))
+                if status:
+                    failure['reason'] = f'Preflight exited with code {status}'
+                elif (expected := check.get('expected_stdout')) and expected.encode('ascii') not in log.read_bytes().split():
+                    failure['reason'] = 'Sandbox probe did not return its expected output'
+            except (OSError, subprocess.TimeoutExpired) as error:
+                failure['reason'] = ('Sandbox probe exceeded its timeout' if isinstance(error, subprocess.TimeoutExpired)
+                                     else str(error))
+            if 'reason' in failure:
+                write_json(directory / 'preflight-active.json', failure)
+                return 1
+        (directory / 'preflight-active.json').unlink(missing_ok=True)
     with open(prompt, 'rb') if prompt else nullcontext(subprocess.DEVNULL) as input_stream:
-        return subprocess.call(command, stdin=input_stream)
+        if plan is None:
+            return subprocess.call(command, stdin=input_stream)
+        with subprocess.Popen(command, stdin=input_stream) as worker:
+            (plan.parent / 'worker-started').touch()
+            return worker.wait()
 
 
-def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None, recoverable=False):
+def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None, recoverable=False,
+              preflight=(), preflight_error=None, chat_id=None):
     directory = evidence_dir / attempt_id / phase
     directory.mkdir(parents=True, exist_ok=False)
     receipt_path = directory / 'result.json'
     stdout_path = directory / 'stdout.log'
     stderr_path = directory / 'stderr.log'
-    hosted_agent = Path(command[0]).name.lower() in ('codex', 'codex.exe') and 'exec' in command[1:]
-    record_start = coding_start_callback(attempt_id, phase, deadline) if hosted_agent else None
+    hosted_agent = is_codex_agent(command)
     result = {
         'attempt_id': attempt_id, 'phase': phase, 'deadline_at': deadline.isoformat(),
         'receipt_path': str(receipt_path), 'stdout_path': str(stdout_path), 'stderr_path': str(stderr_path),
     }
     evidence = {'mechanism': 'windows_job_object', 'working_directory': str(cwd)}
-    if utc_now() >= deadline:
-        result.update(outcome='timed_out', stop_confirmed=True,
+    expired = utc_now() >= deadline
+    if expired or preflight_error:
+        result.update(outcome='timed_out' if expired else 'failed', stop_confirmed=True,
                       stop_evidence={**evidence, 'worker_started': False, 'owned_processes_at_stop': 0,
                                      'owned_processes_active_after_stop': 0})
+        if preflight_error:
+            result['preflight_failure'] = preflight_error
         write_json(receipt_path, result)
         return result
 
+    record_start = coding_start_callback(attempt_id, phase, deadline, chat_id) if hosted_agent else None
     if hosted_agent:
         from workflow import CONFIG_PATH
 
@@ -233,7 +262,12 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
     process = None
     try:
         with stdout_path.open('wb') as stdout, stderr_path.open('wb') as stderr:
-            argv = [sys.executable, '-B', __file__, '--bootstrap', str(prompt) if prompt else '', *command]
+            bootstrap_args = ['--bootstrap', str(prompt) if prompt else '']
+            if preflight:
+                plan = directory / 'preflight-plan.json'
+                write_json(plan, preflight)
+                bootstrap_args = ['--preflight-bootstrap', str(plan), bootstrap_args[1]]
+            argv = [sys.executable, '-B', __file__, *bootstrap_args, *command]
             process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
                                        creationflags=subprocess.CREATE_NO_WINDOW)
             job.assign(process.pid)
@@ -271,11 +305,12 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
             before = job.accounting()
             after = job.stop() if before.active else before
             process.wait(timeout=5)
+            started = (directory / 'worker-started').exists() if preflight else after.total > 1
             evidence.update(
                 owned_processes_at_stop=before.active,
                 owned_processes_active_after_stop=after.active,
                 owned_processes_total=after.total,
-                worker_started=after.total > 1,
+                worker_started=started,
                 verified_at=utc_now().isoformat(),
                 launcher_exit_code=process.returncode,
             )
@@ -284,6 +319,11 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
             outcome = 'timed_out' if timed_out else ('success' if process.returncode == 0 else 'failed')
             if stopped:
                 outcome = 'stopped'
+            pending = directory / 'preflight-active.json'
+            if preflight and not started and pending.is_file():
+                failure = json.loads(pending.read_text(encoding='utf-8'))
+                failure.setdefault('reason', 'Preflight exceeded the stage deadline' if timed_out else 'Preflight stopped')
+                result['preflight_failure'] = failure
             result.update(outcome=outcome, stop_confirmed=after.active == 0, stop_evidence=evidence)
     finally:
         job.close()
@@ -298,9 +338,15 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
     return result
 
 
+def is_codex_agent(command):
+    return bool(command and Path(command[0]).name.lower() in ('codex', 'codex.exe') and 'exec' in command[1:])
+
+
 def main(argv):
     if argv and argv[0] == '--bootstrap':
         return bootstrap(argv[1], argv[2:])
+    if argv and argv[0] == '--preflight-bootstrap':
+        return bootstrap(argv[2], argv[3:], plan=Path(argv[1]))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--attempt-id', required=True)
     parser.add_argument('--phase', required=True)
@@ -322,8 +368,16 @@ def main(argv):
             raise ValueError('The deadline must include a timezone offset')
         cwd = args.cwd.resolve(strict=True)
         prompt = args.stdin_file.resolve(strict=True) if args.stdin_file else None
-        value = run_stage(args.attempt_id, args.phase, deadline, cwd, args.evidence_dir.resolve(), prompt, command)
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        value = None
+        if is_codex_agent(command):
+            from stage_preflight import request_stage
+            from workflow import DATABASE_PATH
+
+            value = request_stage(DATABASE_PATH, args.attempt_id, args.phase, deadline,
+                                  os.environ.get('CODEX_THREAD_ID'), cwd, prompt)
+        if value is None:
+            value = run_stage(args.attempt_id, args.phase, deadline, cwd, args.evidence_dir.resolve(), prompt, command)
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(json.dumps({'outcome': 'runner_error', 'reason': str(error), 'stop_confirmed': False}))
         return 1
     print(json.dumps(value, ensure_ascii=True))

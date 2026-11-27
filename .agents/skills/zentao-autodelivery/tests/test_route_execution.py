@@ -1,6 +1,7 @@
 import sqlite3
 import json
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 from test_workflow import WorkflowFixture
@@ -35,6 +36,47 @@ class RouteExecutionTests(WorkflowFixture):
             result = json.loads(conn.execute("SELECT result FROM attempts WHERE stage='split'").fetchone()[0])
         self.assertEqual(result['route']['source'], 'config')
         self.assertEqual(result['route']['material']['markers'], ['前后端'])
+
+    def test_preflight_receipt_prevents_automatic_retry(self):
+        from stage_preflight import evidence_directory, pending_stage, request_stage
+
+        context = self.start()
+        self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        self.finish_stage(context, 'split', evidence={
+            'tasks': {'frontend': [{'id': 'F1', 'description': 'Render data', 'acceptance': ['Visible']}]},
+        })
+        attempt = self.record('attempt_start', **context, stage='frontend.design')
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            item = conn.execute("SELECT * FROM work_items WHERE item_id='2'").fetchone()
+        receipt = evidence_directory(self.database, item) / attempt['attempt_id'] / 'verify' / 'result.json'
+        deadline = datetime.fromisoformat(attempt['deadline_at'])
+        with self.assertRaisesRegex(ValueError, 'active work item'):
+            request_stage(self.database, attempt['attempt_id'], 'verify', deadline,
+                          'another-chat', self.fixture, None)
+        request = request_stage(self.database, attempt['attempt_id'], 'verify', deadline,
+                                item['chat_id'], self.fixture, None)
+        self.assertEqual(request['receipt_path'], str(receipt))
+        self.assertEqual(request['status'], 'host_stage_required')
+        self.assertEqual(pending_stage(self.database, item['marker'])[0]['attempt_id'], attempt['attempt_id'])
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({
+            'attempt_id': attempt['attempt_id'], 'phase': 'verify', 'outcome': 'failed',
+            'stop_confirmed': True, 'stop_evidence': {'worker_started': False},
+            'preflight_failure': {'check': 'sandbox', 'reason': 'MXC unavailable'},
+        }), encoding='utf-8')
+        self.assertIsNone(pending_stage(self.database, item['marker']))
+        replay = request_stage(self.database, attempt['attempt_id'], 'verify', deadline,
+                               item['chat_id'], self.fixture, None)
+        self.assertEqual(replay['outcome'], 'failed')
+        result = self.record('attempt_finish', **context, attempt_id=attempt['attempt_id'],
+                             outcome='failed', summary='Agent preflight blocked')
+        self.assertEqual(result['next_stage'], 'frontend.plan', result)
+        with closing(sqlite3.connect(self.database)) as conn:
+            recorded = json.loads(conn.execute('SELECT result FROM attempts WHERE attempt_id=?',
+                                               (attempt['attempt_id'],)).fetchone()[0])
+        self.assertTrue(recorded['terminal_step'])
+        self.assertEqual(recorded['evidence']['stage_preflight']['reason'], 'MXC unavailable')
 
     def configure_backend_dependencies(self):
         self.config['workspaces']['backend'] = 'backend'
