@@ -5,7 +5,7 @@ from contextlib import closing
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from task_evidence import evaluate, progress_note, validate_merge_tests, validate_task_fields
+from task_evidence import evaluate, validate_merge_tests, validate_task_fields
 
 
 def step(data, outcome='success'):
@@ -125,12 +125,9 @@ class TaskEvidenceTests(unittest.TestCase):
                                'task_blockers': {'B': '待核验部署：smart-geo'}},
         }
         decisions = evaluate(route, stages)
-        backend, frontend = decisions['B'][2], decisions['F'][2]
-        blocked = {'B': backend['blocked'], 'F': frontend['blocked']}
-        self.assertIn('代码已合回（smart-geo aaaaaaaaaaaa）', progress_note('B', 'backend', backend, stages, blocked))
-        self.assertIn('mvn -B failed', progress_note('B', 'backend', backend, stages, blocked))
-        self.assertIn('等待前置任务：B（待核验部署：smart-geo）',
-                      progress_note('F', 'frontend', frontend, stages, blocked))
+        self.assertIn('代码已合回（smart-geo aaaaaaaaaaaa）', decisions['B'][1])
+        self.assertIn('mvn -B failed', decisions['B'][1])
+        self.assertIn('等待前置任务：B（待核验部署：smart-geo）', decisions['F'][1])
 
 
 class TaskWorkflowDrill(unittest.TestCase):
@@ -139,7 +136,6 @@ class TaskWorkflowDrill(unittest.TestCase):
         drill = RouteDrills()
         drill.setUp()
         self.addCleanup(drill.doCleanups)
-        drill.config['runtime']['split_task_sync'] = True
         drill.begin_drill('fullstack', '前后端')
         stage = 'material_check'
         while stage != 'frontend.design':
@@ -170,7 +166,6 @@ class TaskWorkflowDrill(unittest.TestCase):
         drill = RouteDrills()
         drill.setUp()
         self.addCleanup(drill.doCleanups)
-        drill.config['runtime']['split_task_sync'] = True
         drill.begin_drill('fullstack', '前后端')
         stage = 'material_check'
         while stage:
@@ -181,7 +176,7 @@ class TaskWorkflowDrill(unittest.TestCase):
                 evidence['tasks']['backend'].append({'id': 'joint', 'description': 'Both ends show the new value',
                                                     'acceptance': ['Page displays API response'], 'joint_acceptance': True})
             if stage.endswith('.plan'):
-                missing = drill.finish(stage, attempt, evidence)
+                missing = drill.finish(stage, attempt, {**evidence, 'task_repositories': {}})
                 self.assertEqual(missing['status'], 'evidence_required')
                 evidence['task_repositories'] = {key: [drill.key] for key in (side, 'joint')}
             if stage.endswith(('.e2e', '.acceptance')):
@@ -231,4 +226,4 @@ class TaskWorkflowDrill(unittest.TestCase):
         with closing(sqlite3.connect(drill.database)) as conn:
             self.assertEqual([op[0] for op in conn.execute('''SELECT operation_type FROM writebacks
                WHERE json_extract(payload,'$.key')='backend' ORDER BY rowid''')],
-                             ['task_create', 'task_close', 'task_reopen', 'task_close'])
+                             [])

@@ -1,8 +1,8 @@
 # 账本命令
 
-在项目根目录从标准输入传入一个 JSON 请求。命令为 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py claim` 或 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`。隔离验收用 `--config PATH --database PATH` 指向临时配置和临时 SQLite。命令管理本地账本、只读 Git 核验及受控 Git 请求；实际认证、建树、提交与合回由 Windows 启动器执行。运行 Agent 和授权的禅道写入沿当前工单流程处理。
+在项目根目录从标准输入传入一个 JSON 请求。命令为 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py claim` 或 `python -B .agents/skills/zentao-autodelivery/scripts/workflow.py record`。隔离验收用 `--config PATH --database PATH` 指向临时配置和临时 SQLite。命令管理本地账本、只读 Git 核验及受控 Git 请求；实际认证、建树、提交与合回由跨平台宿主执行器执行。运行 Agent 和授权的禅道写入沿当前工单流程处理。
 
-工单键 `item` 包含 `instance`、`project_id`、`kind`、`id`。项目 ID 来自经实际查询确认的禅道项目，项目和工单 ID 用正整数或相应数字字符串，`kind` 为 `story` 或 `bug`。桌面项目 ID 从当前可用的桌面项目接口确认，使用独立字段 `desktop_project_id`。配置可通过 `runtime.desktop_project_id` 额外固定桌面项目 ID。
+工单键 `item` 包含 `instance`、`project_id`、`kind`、`id`。项目 ID 来自经实际查询确认的禅道项目，项目和工单 ID 用正整数或相应数字字符串，`kind` 为 `story` 或 `bug`。可选字段 `desktop_project_id` 供桌面归组，独立监测使用实际工单项目和会话 ID。
 
 启用 `zentao.scope_mode:"project_or_product"` 时，`item.project_id` 保留本自动化的队列项目，原单可以没有项目或关联其他项目。`scan.items[]` 和 `reserve` 须提供 `source:{"project_id":"0","product_id":"2"}` 等实际归属。未报告单一项目的 Story 使用 `project_id:null`；与明确的零值区分。账本校验项目或产品匹配并写入 `work_item_sources`，缺少证据返回 `source_verification_required`，均不匹配返回 `scope_mismatch`（扫描）或 `not_eligible`（领取）。扫描入口为 `scripts/monitor.py`；详情复核为 `monitor.py --recheck bug 2 --project-id 2`。归属字段须来自本轮详情，禁止把队列项目抄作原单项目。
 
@@ -11,9 +11,11 @@
 | `action` | 请求字段 | 如何处理结果 |
 | --- | --- | --- |
 | `scan` | `scan_id`、带时区的 `observed_at`、`complete`、`instance`、`project_id`、`project_name`、`items`。列表元素含 `kind`、`id`、`title`、`assigned_to`、`status`、`priority`。较小的正整数优先，未知优先级排在后面。 | 首次完整扫描返回 `baseline`，后续完整扫描返回 `scanned`。读 `candidate` 取得需复核的队首。部分或失序扫描保留最新队列。 |
-| `reserve` | `item`、详情复核时的 `observed_at`、`assigned_to`、`status`、`desktop_project_id`。 | `reserved` 表示实际取得名额，保存 `request_id`、`expires_at`、`marker` 和已有 `chat_id`。`queue_changed` 或 `stale_check` 时重新复核队首，`busy` 时保留队列供后续轮次处理。 |
+| `reserve` | `item`、详情复核时的 `observed_at`、`assigned_to`、`status`、可选的 `desktop_project_id`。 | `reserved` 表示实际取得名额，保存 `request_id`、`expires_at`、`marker` 和已有 `chat_id`。`queue_changed` 或 `stale_check` 时重新复核队首，`busy` 时保留队列供后续轮次处理。 |
 
 ## `record` 阶段、执行和写回
+
+主会话提交阶段回执后，监测进程领取本地待回写记录。备注通过禅道 v2 的 `POST /actions/comment?objectType=story|bug&objectID=<ID>` 提交到原单，附件通过 `POST /files` 关联同一原单。发送前后都用 `GET /stories/<ID>` 或 `GET /bugs/<ID>` 读取原单历史和附件。备注核对操作编号、正文和作者信息；附件核对关联、文件编号和下载内容。上次发送结果不明时只读回，进度页显示待核对的操作编号。
 
 已拆分工单的 `attempt_start` / `attempt_active` 返回 `task_scope`。其中 `active` 为本步骤可执行的任务编号，`blocked` 保留直接原因和受影响的依赖链。已确认的局部阻断通过 `attempt_finish.evidence.task_blockers` 提交，格式为任务编号到原因的对象，例如 `{"B5":"归档接口缺少全井原子写入契约，证据见 backend/design.md"}`。同一阶段其余任务已完成且满足证据要求时可提交成功，计划及验收证据只覆盖可执行范围。尚需重试的失败按原重试策略推进，最终失败才应用阻断。不可重试时用 `retryable:false`。阻断和已有结果会一并保存在账本，后续阶段可执行无依赖的任务。
 
@@ -42,7 +44,7 @@
 
 ### 受控开发 Git 请求
 
-`branch_prepare`、`candidate_commit`、`integration_merge` 都需要当前绑定的 `item`、`request_id`、`chat_id`、`attempt_id`、实际 `phase` 和稳定 `event_id`。首次返回 `host_git_worker_required` 及 `operation_id`，主聊天立即结束本轮；阶段 Agent 先返回修改信息，不能占住进程等待宿主。启动器确认原 CLI、阶段后代和 Task 同步器停止后执行，再续接同一聊天。用原事件和原数据读回，或以 `host_git_status` 加上述绑定及 `operation_id` 查询。不同数据必须使用新事件，不在沙箱自行运行相应 Git 命令。
+`branch_prepare`、`candidate_commit`、`integration_merge` 都需要当前绑定的 `item`、`request_id`、`chat_id`、`attempt_id`、实际 `phase` 和稳定 `event_id`。主聊天调用统一 Git 入口后，命令等待宿主执行并读回原尝试回执，主聊天收到结果后继续。若进程中断，可凭原事件和数据读回，或用 `host_git_status` 加上述绑定及 `operation_id` 查询。不同数据使用新事件。
 
 普通 coding 阶段的请求示例，`phase` 必须取实际尝试回执（返工时可能是 `backend.coding` 等）：
 
@@ -76,14 +78,14 @@
 
 | `action` | 请求字段及用法 |
 | --- | --- |
-| `runtime_check` | 只需实际桌面 `chat_id`。读取该聊天最近一轮 Codex 本机运行记录的审批策略，只输出策略和检查状态。仅 `runtime_unattended` 可派发。其他状态为 `runtime_requires_approval` 或 `runtime_unverified`。配置文件默认值及父聊天的策略不能用作该聊天的证明。 |
-| `bind` | `request_id`、实际 `chat_id`、读回的 `desktop_project_id`。确认绑定和名额后，再向绑定的聊天发启动指令。处理待核对建聊时先绑定，再重新领取名额。 |
+| `runtime_check` | 只需实际工单 `chat_id`。读取该聊天最近一轮 Codex 本机运行记录的审批策略，只输出策略和检查状态。仅 `runtime_unattended` 可派发。其他状态为 `runtime_requires_approval` 或 `runtime_unverified`。配置文件默认值及父聊天的策略不能用作该聊天的证明。 |
+| `bind` | `request_id`、实际 `chat_id`、可选的 `desktop_project_id`。确认绑定和名额后，再向绑定的聊天发启动指令。处理待核对建聊时先绑定，再重新领取名额。 |
 | `start` | `request_id`、当前 `chat_id`。只有工单聊天在获得启动指令后调用。启用 `runtime.require_unattended_approval` 时账本再次核对该聊天策略。若返回 `dispatch_runtime_blocked`，工单仍绑定原聊天，预占名额已释放。 |
 | `defer_dispatch` | `request_id`。建聊结果不明且尚未启动业务时，登记待核对。已绑定但未开始执行且检查未通过时传入 `reason:"approval_policy"`，账本复核后释放预占名额并保留原聊天。等待策略或运行环境变化后，用新的派发请求续接。 |
 | `expire_dispatch` | `request_id`。核对未领取执行权的过期派发。 |
 | `resolve_dispatch` | `request_id`、`not_created:true` 和非空 `evidence`。有明确证据证明旧请求未创建聊天时，用于释放待建状态。 |
 | `attempt_start` | `request_id`、`chat_id`、`stage`。保存返回的 `attempt_id`、`started_at`、`phase_started_at`、`deadline_at`、`retry_number` 和 `phase`。新单的 `phase` 为 `verify` 或返工的实际分段名。旧单沿用 `repair_coding` 等原分段。按回执的角色和截止时间执行，`attempt_active` 表示原尝试仍存在。 |
-| `material_sync` | `item`、`request_id`、`chat_id`、有效的 Story 材料评审 `attempt_id`。这是状态查询，不在工单沙箱运行 Git。首次返回 `material_sync_worker_required` 和原截止时间，立即结束本轮交宿主启动器执行，禁止自行 fetch 或读取 Git 凭据。恢复原会话后读同一尝试：`material_synced` 含核验后的 `branch`、`upstream`、`commit` 及宿主回执；`material_sync_failed` 供原尝试登记失败和重试；`material_sync_inactive` 表示尝试过期或绑定无效。成功回执仅在宿主进程停止且绑定及提交复核后发布。 |
+| `material_sync` | `item`、`request_id`、`chat_id`、有效的 Story 材料评审 `attempt_id`。这是状态查询，不在工单沙箱运行 Git。在工单 CLI 中由宿主按原截止时间同步，命令等待同一尝试的结果。`material_synced` 含核验后的 `branch`、`upstream`、`commit` 及宿主回执；`material_sync_failed` 供原尝试登记失败和重试；`material_sync_inactive` 表示尝试过期或绑定无效。成功回执仅在宿主进程停止且绑定及提交复核后发布。 |
 | `branch_inspect` | `request_id`、`chat_id`、有效分支核验 `attempt_id`。可传 `worktrees`（应用配置键对应的工作树绝对路径）。首次调用解析分支，准备好工作树后再次调用验证真实提交和工单分支。参照 [分支核验与工作树](branches.md) 处理每项状态。 |
 | `branch_prepare` | 当前绑定、分支核验 `attempt_id`、实际 `phase`、稳定 `event_id`。只登记整个成功计划的宿主准备请求，缺 ref 时只补取 origin 的配置目标；成功后以 `repositories` 继续只读核验，不自行切换源分支。 |
 | `candidate_commit` | 当前 coding 绑定、尝试、分段、稳定事件和 `commits`。每仓提供 `expected_head`、字面 `files`、`message`、可选验证说明；具体格式及复验规则见上文。成功 `versions` 供 coding 结果使用。 |
@@ -108,9 +110,3 @@
 只读核对使用 `sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)`，其中 `path` 是账本的绝对 `Path`。查询未初始化账本时报告尚无数据。`work_items` 通过 `instance`、`project_id`、`kind`、`item_id` 定位。以该行的 `seq` 对应 `dispatches`、`attempts`、`writebacks` 的 `item_seq` 查派发、各步骤尝试和待写回。`work_items.config_snapshot` 保存已接单的配置，`request_id` 和 `stage` 记录当前派发和步骤。
 
 账本记录里只保存对象标识、非敏感证据和回执。禅道密码、登录会话和原始认证响应禁止进入命令请求或 SQLite。
-
-启用 `runtime.split_task_sync` 的新 Story 会把每个拆分编号登记在 `split_tasks`。监测与工单会话在选取原需求备注和附件时，只领取类型为 `comment` 或 `attachment` 的操作。任务同步器处理 `task_create`、`task_start`、`task_note`、`task_close` 和 `task_reopen`。对这些操作调用通用 `record writeback_*` 返回 `task_sync_required`。任务管理继承工单快照、稳定拆分编号和已绑定的禅道 Task ID。
-
-同时启用 `runtime.split_task_progress_sync` 的新 Story 按实际开工和逐项阻塞证据同步进度。阶段运行器观察研发 CLI 启动后，仅为本次开发的 `task_scope.active` 登记开工。任务同步器使用任务已登记的工时。工时不足时保留待同步原因并写开工备注，阻塞备注和后续关单仍可继续。阻塞备注使用稳定标识读回确认，重复处理同一结果时保留原备注。已领取工单沿用原快照。
-
-发送结果不明后，任务同步器持续读取原发送目标。若确认原请求已经终止且该动作确实没有生效，可用 `record task_reconcile_missing` 登记 `operation_id`、与原 `payload.sent` 一致的 `original_target`、`prior_ended:true`、`missing:true`，以及分别证明请求结束和结果缺失的 `termination_evidence`、`readback_evidence`。只有已释放或到期的操作可恢复，下一次发送仍重新读取目标并核对拆分标记。

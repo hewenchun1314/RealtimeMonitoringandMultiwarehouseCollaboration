@@ -20,12 +20,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ledger import stamp, transaction
-from task_remote import _dpapi
+from runtime_paths import CONFIG_PATH as CONFIG, DATABASE_PATH as DATABASE, LOCAL_DIRECTORY
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-CONFIG = PROJECT_ROOT / '.agents' / 'zentao-project.json'
-DATABASE = PROJECT_ROOT / '.local' / 'zentao-delivery' / 'workflow.sqlite3'
 CONCLUSIONS = {
     '待补材料': '请查看禅道原单，按收尾备注补充材料。',
     '待验证': '请查看禅道原单中的待验证项。',
@@ -109,11 +106,11 @@ def send_message(webhook, signing_secret, body):
 
 
 def credential_path(database):
-    return database.with_name('dingtalk.dpapi')
+    return LOCAL_DIRECTORY / 'dingtalk-credentials.json'
 
 
 def read_credentials(database):
-    record = json.loads(_dpapi(credential_path(database).read_bytes(), protect=False))
+    record = json.loads(credential_path(database).read_text(encoding='utf-8-sig'))
     webhook, signing_secret = record['webhook'], record['signing_secret']
     validate_credentials(webhook, signing_secret)
     return webhook, signing_secret
@@ -187,21 +184,20 @@ def main():
         return 0
     if args.operation == 'configure':
         if not sys.stdin.isatty():
-            print('请在本机交互式 PowerShell 窗口运行 configure。', file=sys.stderr)
+            print('请在本机交互终端运行 configure。', file=sys.stderr)
             return 1
         try:
             webhook = getpass('钉钉 Webhook 地址（隐藏输入）：').strip()
             signing_secret = getpass('钉钉加签密钥（隐藏输入）：').strip()
             validate_credentials(webhook, signing_secret)
-            encrypted = _dpapi(json.dumps({'webhook': webhook, 'signing_secret': signing_secret}).encode(),
-                               protect=True)
+            payload = json.dumps({'webhook': webhook, 'signing_secret': signing_secret}).encode('utf-8')
             destination = credential_path(DATABASE)
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = None
             try:
                 with NamedTemporaryFile(dir=destination.parent, delete=False) as output:
                     temporary = Path(output.name)
-                    output.write(encrypted)
+                    output.write(payload)
                 temporary.replace(destination)
             finally:
                 if temporary is not None:
@@ -209,7 +205,7 @@ def main():
         except (OSError, ValueError, EOFError, KeyboardInterrupt):
             print('凭据配置失败。请检查 Webhook 格式、加签密钥及本机存储权限。', file=sys.stderr)
             return 1
-        print('钉钉凭据已加密保存在本机。')
+        print('钉钉凭据已保存到 .local/dingtalk-credentials.json。')
         return 0
     try:
         status = send_message(*read_credentials(DATABASE), '【测试通知】禅道自动接单 · 钉钉渠道连通性测试。')

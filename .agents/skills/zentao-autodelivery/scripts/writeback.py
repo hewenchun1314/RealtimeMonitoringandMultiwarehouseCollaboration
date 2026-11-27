@@ -26,11 +26,13 @@ def claim_writeback(store, item, data):
     owner = require_text(data.get('owner'), 'owner')
     if entry['state'] == 'confirmed':
         return message('already_confirmed', receipt=json.loads(entry['receipt']))
+    if entry['state'] not in ('pending', 'leased', 'sending'):
+        return message('writeback_inactive')
     if entry['state'] in ('leased', 'sending') and store.time < entry['expires_at']:
         return message('leased', expires_at=entry['expires_at'])
     lease_id = uuid4().hex
     expires_at = store.expiry('writeback_lease_seconds', 120)
-    reconcile = entry['state'] in ('leased', 'sending') or bool(entry['reconcile_required'])
+    reconcile = entry['state'] == 'sending' or bool(entry['reconcile_required'])
     store.conn.execute('''UPDATE writebacks SET state='leased', lease_id=?, owner=?, expires_at=?,
                                                 reconcile_required=? WHERE operation_id=?''',
                        (lease_id, owner, expires_at, int(reconcile), entry['operation_id']))

@@ -4,11 +4,12 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from branch_check import git, planned_applications
 from deploy_state import (COMMIT, DEPLOY_STAGE, DIGEST, FRONTEND_DEPLOY_STAGE, FRONTEND_PROFILE, GIT_PUSH_STAGES, TAG,
                           configured_targets, deployed_receipt_matches, frontend_release_config,
-                          mcp_rollout_matches, release_verification)
+                          rollout_matches, release_verification)
 from route_execution import (blocked_tasks, contract_revision_pending, get_split, handoff_tasks,
                              read_history, repository_plan, snapshot, stage_evidence)
 from task_evidence import verified_task_merge
@@ -24,12 +25,20 @@ def commit_map(value):
         for key, sha in value.items())
 
 
+def frontend_evidence_root(store, config_directory, marker):
+    if store is not None:
+        filename = store.conn.execute('PRAGMA database_list').fetchone()[2]
+        if filename:
+            return Path(filename).resolve().parent / 'items' / marker
+    return (config_directory.parent / '.local' / 'zentao-delivery-v2' / 'items' / marker).resolve()
+
+
 def agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_directory):
     path = evidence.get('agentlimb_receipt') if isinstance(evidence, dict) else None
     if not nonblank(path) or not config_directory:
         return 'Provide the AgentLimb runner JSON receipt for this attempt'
     project = config_directory.parent
-    root = (project / '.local' / 'zentao-delivery' / 'items' / item['marker']).resolve()
+    root = frontend_evidence_root(store, config_directory, item['marker'])
     try:
         receipt_path = (project / path).resolve(strict=True)
         if not receipt_path.is_relative_to(root):
@@ -46,17 +55,24 @@ def agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_
         if (receipt_path != expected_path or not isinstance(host, dict) or host.get('stop_confirmed') is not True
                 or not isinstance(stop, dict) or type(stop.get('owned_processes_active_after_stop')) is not int
                 or stop['owned_processes_active_after_stop'] != 0):
-            return 'Provide the verified Windows host receipt with tested process cleanup for this E2E attempt'
+            return 'Provide the verified host receipt with tested process cleanup for this E2E attempt'
     if (not isinstance(receipt, dict) or receipt.get('runner') != 'agentlimb' or receipt.get('marker') != item['marker']
             or receipt.get('attempt_id') != attempt_id or receipt.get('status') != expected
             or receipt.get('stage') != 'acceptance' or not commit_map(versions) or receipt.get('versions') != versions):
         return 'AgentLimb receipt must match the active attempt, candidate versions and result'
     resources = receipt.get('candidate_resources')
-    if (not receipt.get('checks') or not isinstance(resources, list) or not resources
+    post_merge = (route or {}).get('post_merge_e2e')
+    automatic = (post_merge and 'config_snapshot' in item.keys()
+                 and snapshot(item).get('e2e_attestation') == 'launch')
+    if (not (automatic or receipt.get('checks')) or not isinstance(resources, list) or not resources
             or any(not isinstance(row, dict) or not nonblank(row.get('app')) for row in resources)
             or {row['app'] for row in resources} != versions.keys()):
         return 'AgentLimb receipt must include checks and observed resources for every candidate application'
-    if (route or {}).get('post_merge_e2e') and any(
+    if automatic:
+        if (receipt.get('version_attestation') != 'launch' or len(resources) != len(versions)
+                or not all(loopback_resource(row.get('url')) for row in resources)):
+            return 'Host E2E must attest a loaded resource for each application from its own launch'
+    elif post_merge and any(
         not nonblank(row.get('url')) or not isinstance(row.get('sha256'), str)
         or not re.fullmatch(r'[0-9a-f]{64}', row['sha256']) for row in resources
     ):
@@ -75,11 +91,22 @@ def agentlimb_receipt_error(store, item, attempt_id, evidence, expected, config_
         return 'Only a confirmed AgentLimb business assertion failure can trigger code repair'
 
 
-def host_e2e_blocker_error(item, attempt_id, evidence, config_directory, outcome):
+def loopback_resource(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        url = urlsplit(value)
+        return (url.scheme in ('http', 'https') and url.hostname in ('localhost', '127.0.0.1', '::1')
+                and url.username is None and url.password is None and bool(url.path) and not url.fragment)
+    except ValueError:
+        return False
+
+
+def host_e2e_blocker_error(item, attempt_id, evidence, config_directory, outcome, *, store=None):
     """Keep an active host attempt separate from a terminal environment blocker."""
     if config_directory is None:
         return 'A formal E2E attempt needs its project evidence directory'
-    folder = config_directory.parent / '.local' / 'zentao-delivery' / 'items' / item['marker'] / 'frontend'
+    folder = frontend_evidence_root(store, config_directory, item['marker']) / 'frontend'
     folder = folder / f'e2e-{attempt_id}'
     request = folder / 'host-request.json'
     receipt_path = folder / 'agentlimb.json'
@@ -95,19 +122,19 @@ def host_e2e_blocker_error(item, attempt_id, evidence, config_directory, outcome
         receipt = json.loads(receipt_path.read_text(encoding='utf-8-sig'))
         if (not isinstance(receipt, dict) or receipt.get('attempt_id') != attempt_id
                 or receipt.get('marker') != item['marker'] or receipt.get('runner') != 'agentlimb'):
-            return 'The active Windows E2E request requires its matching host receipt'
+            return 'The active host E2E request requires its matching host receipt'
         if (folder / 'host-run' / attempt_id / 'e2e-host').exists():
             host = receipt.get('host_run')
             if (not isinstance(host, dict) or host.get('stop_confirmed') is not True
                     or (host.get('stop_evidence') or {}).get('owned_processes_active_after_stop') != 0):
-                return 'Finish the Windows host E2E and confirm that its processes stopped'
+                return 'Finish the host E2E and confirm that its processes stopped'
         if receipt.get('status') == 'blocked':
             return None
         if receipt.get('status') == 'failed':
             return 'Record the confirmed business assertion with repair_required and the formal E2E receipt'
         return 'The recorded E2E outcome must match the completed host receipt'
     except (OSError, ValueError, TypeError, AttributeError):
-        return 'Wait for the Windows host E2E result and process cleanup before finishing the attempt'
+        return 'Wait for the host E2E result and process cleanup before finishing the attempt'
 
 
 def check_candidate(proof, candidate):
@@ -236,8 +263,6 @@ def frontend_acceptance_terminal(route, stages, merged):
 
 
 def git_push_requirements(store, item, stage):
-    from task_sync import enabled as task_sync_enabled
-
     route, history = read_history(store, item)
     side = stage.split('.')[0]
     if not route or stage not in route['stages']:
@@ -273,8 +298,6 @@ def git_push_requirements(store, item, stage):
     skip_e2e = acceptance_stage not in route['stages']
     acceptance = history.get(acceptance_stage, {})
     full = (skip_e2e or acceptance.get('outcome') == 'success') and integration.get('outcome') == 'success'
-    if not full and not task_sync_enabled(item):
-        return {}, {}, {}, 'Git 部分交付需要已核验的逐任务验收及合回证据'
     if not full and ((not skip_e2e and not (acceptance.get('terminal_step') or acceptance.get('outcome') == 'success'))
                      or not (integration.get('terminal_step') or integration.get('outcome') == 'success')):
         return {}, {}, {}, 'Git 推送缺少已结束的验收或合回回执'
@@ -460,7 +483,6 @@ def validate_success(store, item, stage, evidence, *, task_blockers=None):
                 or not isinstance(image, str) or not TAG.fullmatch(image)
                 or image.rsplit(':', 1)[0] != repository
                 or not image.endswith('-' + FRONTEND_PROFILE)
-                or evidence.get('stopped_ports') != settings.get('local_ports')
                 or evidence.get('status') != 'published'
                 or not all(isinstance(digest, str) and DIGEST.fullmatch(digest) for digest in digests)):
             return '前端镜像发布需要逐仓版本、停服及 Harbor 摘要回执'
@@ -471,7 +493,7 @@ def validate_success(store, item, stage, evidence, *, task_blockers=None):
             if (not isinstance(base, str) or not base.startswith(repository + '@')
                     or not DIGEST.fullmatch(base.split('@', 1)[1])
                     or not isinstance(rollout, dict) or rollout.get('target') != target
-                    or not mcp_rollout_matches(rollout.get('pod_verification'), repository + '@' + digests[0])):
+                    or not rollout_matches(target, rollout.get('pod_verification'), repository + '@' + digests[0])):
                 return '前端镜像发布需要当前基线及 Rancher 新 Pod 核验'
         elif base != settings.get('base_image'):
             return '前端镜像发布需要匹配的底包摘要'

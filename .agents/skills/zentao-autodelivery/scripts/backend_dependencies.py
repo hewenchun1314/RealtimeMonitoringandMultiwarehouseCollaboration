@@ -117,8 +117,6 @@ def worker_roots(configs, config_directory, project_root, codex_directory):
     git_roots = set(git_metadata_roots(configs, config_directory))
     requirements = {requirement_checkout(config, config_directory) for config in configs
                     if config.get('runtime', {}).get('sync_requirement_before_review')} - {None}
-    if not roots and not git_roots and not requirements:
-        return [], []
     granted = {root for _, root in set.intersection(*dependency_writes)}
     protected = (roots - granted) | requirements
     writable.update(root for root in granted | git_roots if not any(

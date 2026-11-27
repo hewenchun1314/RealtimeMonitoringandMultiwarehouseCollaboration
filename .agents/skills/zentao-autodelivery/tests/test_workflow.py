@@ -340,10 +340,8 @@ class WorkflowTests(WorkflowFixture):
         git('branch', 'release')
         git('commit', '--allow-empty', '-m', 'Another branch')
         args = dict(context, attempt_id=attempt['attempt_id'], application='Example', event_id='host-prepare-fixture')
-        with patch('workflow.prepare_local_worktree') as sandbox_mutation:
-            requested = self.record('branch_prepare', **args)
+        requested = self.record('branch_prepare', **args)
         self.assertEqual(requested['status'], 'host_git_worker_required')
-        sandbox_mutation.assert_not_called()
         self.assertFalse((self.database.parent / 'worktrees').exists())
         first = self.host_git()
         self.assertEqual(first['status'], 'host_git_completed', first)
@@ -599,6 +597,8 @@ class WorkflowTests(WorkflowFixture):
         operation_id = result['operation_id']
         first = self.record('writeback_claim', operation_id=operation_id, owner='chat-2')
         self.assertFalse(first['reconcile_required'])
+        self.assertEqual(self.record('writeback_send', operation_id=operation_id,
+                                     lease_id=first['lease_id'])['status'], 'send_authorized')
         self.assertEqual(self.record('writeback_claim', operation_id=operation_id, owner='monitor')['status'], 'leased')
         self.time += timedelta(seconds=31)
         again = self.record('writeback_claim', operation_id=operation_id, owner='monitor')

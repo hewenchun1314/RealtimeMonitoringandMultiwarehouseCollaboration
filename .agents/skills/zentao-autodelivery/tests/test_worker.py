@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -207,12 +208,12 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result['status'], 'worker_material_stop_unverified')
         host.assert_not_called()
 
-    def test_material_only_turn_and_task_jobs_are_recoverable(self):
+    def test_turn_hosts_one_recoverable_cli_with_live_git_broker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cfg = root / 'config.json'
             config = {'workflow_version': 2,
-                      'runtime': {'sync_requirement_before_review': True, 'split_task_sync': True},
+                      'runtime': {'sync_requirement_before_review': True},
                       'zentao': {'base_url': 'http://localhost:8088', 'project_name': 'Sample',
                                  'assigned_to_accounts': [], 'accepted_statuses': {'story': [], 'bug': []}},
                       'monitor': {'enabled': False},
@@ -223,10 +224,16 @@ class WorkerTests(unittest.TestCase):
                     'request_id': '1' * 32, 'marker': 'HNF-' + '1' * 20,
                     'instance': 'http://localhost:8088', 'project_id': '1', 'kind': 'story', 'item_id': '2'}
             with patch.object(worker, 'CONFIG_PATH', cfg), patch.object(worker, 'validate_config'), \
+                    patch.object(worker, 'DATABASE_PATH', root / 'workflow.sqlite3'), \
                     patch.object(worker, 'worker_roots', return_value=([], [])), \
                     patch.object(worker, 'run_stage', return_value={}) as run_stage:
                 worker.launch_turn(root / 'codex.exe', 'run', item, root, worker.utc_now())
-            self.assertEqual(run_stage.call_count, 2)
+            self.assertEqual(run_stage.call_count, 1)
+            self.assertIn('ZENTAO_GIT_BROKER_TURN', run_stage.call_args.kwargs['env'])
+            for key, expected in (('ZENTAO_DELIVERY_CONFIG', cfg), ('ZENTAO_DELIVERY_DATABASE', root / 'workflow.sqlite3')):
+                self.assertEqual(run_stage.call_args.kwargs['env'][key], str(expected.resolve()))
+                self.assertIn(f'shell_environment_policy.set.{key}={json.dumps(str(expected.resolve()), ensure_ascii=False)}',
+                              run_stage.call_args.args[-1])
             self.assertTrue(all(call.kwargs.get('recoverable') for call in run_stage.call_args_list))
 
     def test_worker_uses_never_for_new_and_resumed_chats(self):
@@ -241,6 +248,20 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual('resume' in argv, operation == 'run')
             self.assertEqual(chat in argv, operation == 'run')
 
+    def test_prepare_recovers_original_thread_only_after_proving_stop(self):
+        chat = '01a1f1df-ddb1-77f1-aa07-a96f2a74d43a'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'launch.json').write_text('{}', encoding='utf-8')
+            events = [{'type': 'thread.started', 'thread_id': chat}, {'type': 'turn.completed'}]
+            (root / 'stdout.log').write_text('\n'.join(map(json.dumps, events)), encoding='utf-8')
+            with patch.object(worker, 'recover_job_stop', return_value=None):
+                self.assertEqual(worker.read_prepared_turn(root)['status'], 'worker_prepare_uncertain')
+            with patch.object(worker, 'recover_job_stop', return_value={'owned_processes_active_after_stop': 0}), \
+                    patch.object(worker, 'runtime_check', return_value={'status': 'runtime_unattended'}):
+                recovered = worker.read_prepared_turn(root)
+                self.assertEqual((recovered['status'], recovered['chat_id']), ('worker_ready', chat))
+
     def test_new_and_resumed_workers_get_read_only_dependency_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -250,7 +271,7 @@ class WorkerTests(unittest.TestCase):
                 argv = command(Path('codex.exe'), operation, chat,
                                protected_roots=[dependency], writable_roots=[root])
                 self.assertIn('default_permissions="zentao_delivery"', argv)
-                self.assertIn('windows.sandbox="mxc"', argv)
+                self.assertEqual('windows.sandbox="mxc"' in argv, os.name == 'nt')
                 filesystem = next(arg for arg in argv if arg.startswith('permissions.zentao_delivery.filesystem='))
                 self.assertIn(json.dumps(dependency.as_posix()) + '="read"', filesystem)
                 self.assertIn(json.dumps(root.as_posix()) + '="write"', filesystem)

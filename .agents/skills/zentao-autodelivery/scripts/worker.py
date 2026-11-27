@@ -2,12 +2,13 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import timedelta
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import sys
 from threading import Event
@@ -18,19 +19,16 @@ from backend_deploy_runner import deployment_action, run_deployment
 from backend_dependencies import worker_roots
 from desktop_runtime import runtime_check
 from deploy_state import FRONTEND_DEPLOY_STAGE, GIT_PUSH_STAGES
-from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled
-from ledger import Ledger, encode, item_identity, transaction, validate_config
+from ledger import validate_config
+from portable_lock import file_lock
+from runtime_paths import LOCAL_DIRECTORY
+import git_broker
 from frontend_release_runner import run_frontend_release
 from frontend_e2e_runner import (frontend_delivery_in_use, frontend_e2e_lock, frontend_queue_owner,
                                  frontend_waiting, pending_frontend_e2e, run_frontend_e2e)
 from git_delivery_runner import run_git_delivery
 from development_git_runner import pending_development_git, run_development_git
-from stage_runner import recover_job_stop, run_stage, utc_now
-from status_board import publish_status
-from story_review_remote import StoryReviewRemote
-from story_review_sync import rearm_uncertain, release_handoff, resume_ready, sync_review
-from task_remote import RemoteRejected
-from task_sync import enabled as task_sync_enabled
+from stage_runner import parse_session, recover_job_stop, run_stage, utc_now
 from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 from material_sync_runner import (pending_material_sync, run_material_sync, run_git_preflight,
                                   release_preflight_reservation)
@@ -38,6 +36,29 @@ from material_sync_runner import (pending_material_sync, run_material_sync, run_
 
 def codex_directory():
     return Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+
+
+def resolve_cli(config=None):
+    if config is None:
+        config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+    configured = config.get('runtime', {}).get('codex_cli')
+    if configured:
+        candidate = shutil.which(os.path.expanduser(configured))
+    else:
+        candidate = shutil.which('codex.exe') if os.name == 'nt' else None
+        candidate = candidate or shutil.which('codex')
+    if not candidate:
+        raise ValueError('Install Codex CLI on PATH or set runtime.codex_cli to an executable')
+    path = Path(candidate).absolute()
+    if os.name == 'nt' and path.suffix.lower() in ('.cmd', '.bat', '.ps1', ''):
+        # Use the native binary from the npm distribution. Passing permission
+        # expressions through cmd.exe would alter their quoting and arguments.
+        package = path.parent / 'node_modules' / '@openai' / 'codex'
+        binaries = list(package.glob('node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe'))
+        if len(binaries) != 1:
+            raise ValueError('Set runtime.codex_cli to the native Codex executable')
+        path = binaries[0]
+    return path
 
 
 def command(cli, operation, chat_id=None, *, protected_roots=(), writable_roots=()):
@@ -53,8 +74,9 @@ def command(cli, operation, chat_id=None, *, protected_roots=(), writable_roots=
                            for path, access in filesystem.items())
         argv.extend(['-c', 'default_permissions="zentao_delivery"',
                      '-c', 'permissions.zentao_delivery.filesystem={' + entries + '}',
-                     '-c', 'permissions.zentao_delivery.network.enabled=true',
-                     '-c', 'windows.sandbox="mxc"'])
+                     '-c', 'permissions.zentao_delivery.network.enabled=true'])
+        if os.name == 'nt':
+            argv.extend(['-c', 'windows.sandbox="mxc"'])
     if operation == 'probe':
         argv.append('--ephemeral')
     if operation == 'run':
@@ -70,11 +92,10 @@ def read_item(marker):
 
 def worker_prompt(operation, item):
     if operation == 'probe':
-        return (
-            '这是无人值守入口的只读探针。必须用 shell 实际运行下面的 PowerShell 命令。'
-            '执行成功后回答结果。禁止写文件、访问禅道或请求权限。\n'
-            "if ((Get-Item -LiteralPath 'AGENTS.md').Exists) { Write-Output WORKER_RUNTIME_OK }"
-        )
+        interpreter = 'python' if os.name == 'nt' else 'python3'
+        return (f'请使用 shell 实际执行只读检查：{interpreter} -c "from pathlib import Path; '
+                "assert Path('AGENTS.md').is_file(); print('WORKER_RUNTIME_OK')\""
+                '。记录实际结果；不要写文件或访问禅道。')
     if operation == 'prepare':
         return f'这是禅道工单 {item["marker"]} 的固定会话。只回复「就绪」，不要调用工具或开始执行。'
     identity = {key: item[key] for key in ('instance', 'project_id', 'kind')}
@@ -88,6 +109,15 @@ def worker_prompt(operation, item):
         source_context = ('本单按“所属项目或所属产品”接收，绑定中的 project_id 是自动化队列项目，'
                           '不代表原单必须关联此项目。原始归属：' + (source[0] if source else '待复核') + '。'
                           '按工单快照中 product_id 或实际项目复核原单；禁止改写原单项目来迁就账本。')
+    if admitted.get('e2e_attestation') == 'launch' and admitted.get('e2e', {}).get('after_integration'):
+        e2e_request = (
+            '新的前端正式验收取得 host_e2e 后，仅编写 JSON 页面场景（entry_path、可选 work_area/checks、'
+            'cases 或 steps），按回执路径提交 host-request.json，只填 attempt_id 和本工单相对 scenario 路径。'
+            '由宿主核对浏览器加载版本，写完请求后结束本轮。')
+    else:
+        e2e_request = (
+            '前端正式验收取得 host_e2e 后，在回执路径写 host-request.json，'
+            '包含 attempt_id、工单目录相对的 profile 和 scenario（均为 JSON）以及 base_url，并结束本轮。')
     return (
         f'从项目根目录读取 .agents/skills/zentao-autodelivery/SKILL.md，并按照其中的工单执行入口执行。'
         f'这是经授权的无人值守工单 {item["marker"]}。原账本绑定为 {json.dumps(binding)}。'
@@ -96,34 +126,28 @@ def worker_prompt(operation, item):
         '恢复轮次读取本工单 recoveries 的最新记录及其中的本地证据文件，落实已核验的受阻范围。'
         '禁止申请临时权限、弹审批、提问或等待人工确认，也不要开启新的桌面聊天。'
         '每次阶段尝试使用账本截止时间及阶段运行器。'
-        '材料评审返回 material_sync_required 时，先按步骤指引运行 record material_sync，'
-        '若返回 material_sync_worker_required，立即结束本轮，交 Windows 启动器在宿主同步；'
-        '禁止在沙箱里自行 fetch、探测或转存 Git 凭据。恢复同一会话后读取原尝试结果，'
-        '取得 material_synced 回执后才派发需求评审；同步失败按原尝试登记。'
-        '前后端 branch_prepare、candidate_commit、integration_merge 只登记固定宿主 Git 请求。'
-        '返回 host_git_worker_required 时立即结束当前轮次；Windows 启动器确认主进程及任务同步进程均已停止后执行，'
-        '随后续接原聊天。恢复后用相同 event_id 和原提交数据读回，或用 host_git_status 按 operation_id 查询。'
+        '材料检查需要同步时执行 record material_sync。使用统一的 workflow.py record 入口，'
+        'branch_prepare、candidate_commit、integration_merge 和材料同步都会等待宿主执行并返回结果。'
+        '保持同一会话，只有拿到已核实的回执才继续；结果不明时查询原尝试或原 operation_id。'
+        '禁止在沙箱自行补取、提交、合回或读取 Git 凭据。'
         '主工作区可有已暂存和未暂存改动。单仓返回 integration_conflict 时，主聊天在当前 integration 尝试'
         '按 references/branches.md 组织逐文件协调，取得解决内容和复验依据，以新事件提交 resolutions。'
         '读到 integration_retry_required 表示原工作区已恢复，立即在同一 integration 阶段用新事件续办。'
-        '新路线前端正式验收取得 host_e2e 后，在回执指定的工单相对路径写 host-request.json，'
-        '包含本次 attempt_id、工单目录相对路径 profile 与 scenario（均为 JSON）及 base_url，并结束本轮。'
+        f'{e2e_request}'
         '宿主执行后从同一目录的 agentlimb.json 读取实际结果，再登记账本原尝试。'
         '若返回 frontend_delivery_busy，结束本轮等待当前交付单完成。'
         '沙箱内只编辑、构建、测试及只读 Git 核验；禁止自行 fetch、worktree add、commit、checkout 或 merge，禁止跳过原有 hooks。'
-        '若返回 story_review_required，按步骤指引取得 review-target，交给需求评审 Agent 随评审结果提交。'
-        '账本返回 disposition=review_wait 时立即结束本轮，Windows 启动器负责禅道评审与续接。'
         '若阶段回执带 bug_intake_required，主会话按步骤指引直接核对并登记 Bug 的仓库与验收条件。'
         '按本单快照与账本当前阶段分派评审、拆分和本端开发或测试 Agent，主会话负责分支核验和合回。'
         '把后端阶段回执中的 backend_dependencies 交给对应步骤 Agent。先追踪业务服务自己的接口与实现，'
         '只在本单涉及上游调用时读取对应依赖的契约。read_only 依赖只供查阅。writable 依赖确需修改时，'
         '按同名后端服务登记目标仓库并使用核验过的工单工作树。前端使用已配置业务后端的契约。'
         '若账本进入 backend.push、frontend.push、backend.deploy 或 frontend.deploy（含返工分段），'
-        '结束当前轮次，Windows 执行器会接手并续接原会话。'
+        '结束当前轮次，宿主执行器会接手并续接原会话。'
         '各阶段按 task_scope.active 派发，按编号记录 task_blockers 与证据。'
         '依次处理账本返回的每个阶段。当前阶段缺少必要输入或没有可处理的任务时，'
         '用 attempt_finish 的 outcome=skipped 记录本阶段核对结果并继续；实际运行失败记 failed。'
-        '跨端依赖须验证交接；交接受阻时按账本继续独立的前端任务。旧工单沿用原阶段。'
+        '跨端依赖须验证交接；交接受阻时按账本继续独立的前端任务。'
         '保持已有成功证据，核对后继续到可核实的收尾，按授权回写并读回原禅道工单。'
     )
 
@@ -147,57 +171,65 @@ def launch_turn(cli, operation, item, output, deadline):
         configs.append(json.loads(item['config_snapshot']))
     # Recheck current permissions before each new or resumed turn.
     protected, writable = worker_roots(configs, CONFIG_PATH.parent, PROJECT_ROOT, codex_directory())
+    for directory in (DATABASE_PATH.parent, LOCAL_DIRECTORY / 'npm-cache'):
+        if not any(directory.is_relative_to(root) for root in writable):
+            writable.append(directory)
     argv = command(cli, operation, item['chat_id'] if item is not None else None,
                    protected_roots=protected, writable_roots=writable)
     prompt_file = output / f'{run_id}.txt'
     prompt_file.write_text(worker_prompt(operation, item), encoding='utf-8')
     launch = (run_id, operation, deadline, PROJECT_ROOT, output, prompt_file, argv)
-    # Any development phase can hand off fixed Git work, regardless of optional
-    # material/review integration flags. Persist both owned Job identities.
-    options = {'recoverable': True} if operation == 'run' else {}
-    if operation != 'run' or not task_sync_enabled(item):
-        return run_stage(*launch, **options), None
+    environment = os.environ.copy()
+    environment.pop('CODEX_THREAD_ID', None)
+    environment.pop('ZENTAO_GIT_BROKER_TURN', None)
+    # The CLI can filter inherited shell variables. Keep all workflow clients
+    # on this launcher's configuration and ledger, including isolated runs.
+    shell_environment = {
+        'ZENTAO_DELIVERY_CONFIG': str(CONFIG_PATH.resolve()),
+        'ZENTAO_DELIVERY_DATABASE': str(DATABASE_PATH.resolve()),
+        'npm_config_cache': str(LOCAL_DIRECTORY / 'npm-cache'),
+    }
+    if operation == 'run':
+        shell_environment['ZENTAO_GIT_BROKER_TURN'] = run_id
+    environment.update(shell_environment)
+    for key, value in shell_environment.items():
+        argv[1:1] = ['-c', f'shell_environment_policy.set.{key}={json.dumps(value, ensure_ascii=False)}']
+    if operation != 'run':
+        return run_stage(*launch, recoverable=True, agent=True, env=environment), None
+    git_broker.prepare(DATABASE_PATH)
     stop = Event()
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(run_stage, run_id, 'task-sync', deadline, PROJECT_ROOT, output, None,
-                                 sync_command('--marker', item['marker'], '--chat-id', item['chat_id']),
-                                 stop_event=stop, **options)
+        broker = executor.submit(git_broker.service, run_id, item, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT, stop)
+        broker.add_done_callback(lambda _: stop.set())
         try:
-            receipt = run_stage(*launch, **options)
+            receipt = run_stage(*launch, recoverable=True, agent=True, env=environment, stop_event=stop)
         finally:
             stop.set()
-        return receipt, future.result()
+        broker.result()
+    return receipt, None
 
 
-def worker_result(receipt, sync_receipt):
-    stopped = receipt['stop_confirmed'] and (sync_receipt is None or sync_receipt['stop_confirmed'])
-    result = {'status': 'worker_stopped' if stopped else 'worker_stop_unverified',
-              'receipt': receipt['receipt_path'], 'outcome': receipt['outcome']}
-    if sync_receipt:
-        result.update(task_sync_receipt=sync_receipt['receipt_path'], task_sync_outcome=sync_receipt['outcome'])
-    return result
+def worker_result(receipt, _unused=None):
+    return {'status': 'worker_stopped' if receipt['stop_confirmed'] else 'worker_stop_unverified',
+            'receipt': receipt['receipt_path'], 'outcome': receipt['outcome']}
 
 
-def review_handoff_stopped(output, item):
-    turns = list(output.glob('*/run'))
-    if not turns:
-        return False
-    turn = max(turns, key=lambda path: path.stat().st_mtime_ns)
-    phases = [turn, turn.parent / 'task-sync'] if task_sync_enabled(item) else [turn]
-    try:
-        for phase in phases:
-            receipt = phase / 'result.json'
+def previous_turn_stopped(output):
+    # Check every launch without an affirmative receipt. The OS lock alone is
+    # insufficient after supervisor loss since descendants might still be alive.
+    for turn in output.glob('*/run'):
+        try:
+            receipt = turn / 'result.json'
             if receipt.is_file() and json.loads(receipt.read_text(encoding='utf-8')).get('stop_confirmed') is True:
                 continue
-            launch = json.loads((phase / 'launch.json').read_text(encoding='utf-8'))
-            if not recover_job_stop(launch):
+            if not recover_job_stop(json.loads((turn / 'launch.json').read_text(encoding='utf-8'))):
                 return False
-        return True
-    except (OSError, ValueError):
-        return False
+        except (OSError, ValueError):
+            return False
+    return True
 
 
-def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False, recover_review=None,
+def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment=False,
                        recover_material=None, recover_git=None, recover_e2e=None):
     deadline = deadline or utc_now() + timedelta(hours=72)
 
@@ -214,7 +246,7 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
     while utc_now() < deadline:
         state = pending['status']
         item = read_item(marker)
-        if not item or item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready'):
+        if not item or item['state'] not in ('bound', 'running', 'closing'):
             return last_turn or {'status': 'worker_released'}
         if frontend_queue_owner(marker, DATABASE_PATH, CONFIG_PATH) is not None:
             time.sleep(max(0, min(2, (deadline - utc_now()).total_seconds())))
@@ -254,23 +286,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             last_material = run_material_sync(marker, DATABASE_PATH, CONFIG_PATH, PROJECT_ROOT, recover=True)
             if last_material['status'] not in ('material_synced', 'material_sync_failed', 'material_sync_inactive'):
                 return {**last_turn, 'status': 'worker_material_blocked', 'material_sync': last_material}
-            continue
-        if item['state'] == 'review_handoff':
-            if last_turn.get('status') != 'worker_stopped' and not (recover_review and recover_review(item)):
-                return {**last_turn, 'status': 'worker_review_stop_unverified'}
-            config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-            release_handoff(DATABASE_PATH, config, item_identity(item))
-            continue
-        if item['state'] in ('review_wait', 'review_ready'):
-            if runtime_check(item['chat_id'])['status'] != 'runtime_unattended':
-                return {**last_turn, 'status': 'worker_review_wait', 'story_review': {'status': 'review_runtime_blocked'}}
-            config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-            review = sync_item_review(config, item)
-            if review['status'] == 'review_ready':
-                review = resume_ready(DATABASE_PATH, config, item_identity(item))
-            if review['status'] != 'review_resumed':
-                return {**last_turn, 'status': 'worker_review_wait', 'story_review': review}
-            pending = peek()
             continue
         if state == 'deployment_pending':
             stage = pending.get('stage')
@@ -316,9 +331,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
             last_turn['frontend_e2e'] = last_e2e
         if last_turn['status'] != 'worker_stopped':
             return last_turn
-        current = read_item(marker)
-        if current and current['state'] in ('review_handoff', 'review_wait', 'review_ready'):
-            continue
         pending = peek()
         if (pending_frontend_e2e(marker, DATABASE_PATH, CONFIG_PATH)['status'] == 'host_e2e_pending'
                 or frontend_queue_owner(marker, DATABASE_PATH, CONFIG_PATH) is not None
@@ -335,8 +347,6 @@ def dispatch_work_item(marker, launch_chat, deadline=None, *, recover_deployment
 
 
 def run(operation, marker, cli):
-    import msvcrt
-
     if operation == 'probe':
         item = None
         output = DATABASE_PATH.parent / 'worker-probes' / uuid4().hex
@@ -348,32 +358,32 @@ def run(operation, marker, cli):
             raise ValueError('Unknown work-item marker')
         output = DATABASE_PATH.parent / 'items' / marker / 'worker'
     output.mkdir(parents=True, exist_ok=True)
-    with (output / 'worker.lock').open('a+b') as lock:
-        if lock.tell() == 0:
-            lock.write(b'0')
-            lock.flush()
-        lock.seek(0)
-        try:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+    lock = nullcontext(True) if operation == 'probe' else file_lock(output / 'worker.lock')
+    with lock as acquired:
+        if not acquired:
             return {'status': 'worker_busy'}
+        if operation == 'run' and not previous_turn_stopped(output):
+            return {'status': 'worker_stop_unverified', 'evidence': str(output)}
         if item is not None:
             item = read_item(marker)
             if operation == 'prepare' and (item['state'] != 'reserved' or item['chat_id']):
                 raise ValueError('Preparing requires a reserved and unbound work item')
-            if operation == 'run' and (item['state'] not in ('bound', 'running', 'closing', 'review_handoff', 'review_wait', 'review_ready')
+            if operation == 'run' and (item['state'] not in ('bound', 'running', 'closing')
                                        or not item['chat_id']):
                 raise ValueError('Running requires an active ledger binding')
         if operation == 'prepare':
             run_id = UUID(item['request_id']).hex
-            for directory in output.glob('*/prepare'):
-                previous = directory / 'result.json'
-                if not previous.is_file():
-                    return {'status': 'worker_prepare_uncertain', 'evidence': str(directory)}
-                proof = json.loads(previous.read_text(encoding='utf-8'))
-                existing = prepared_result(proof)
-                if existing['chat_id'] or not proof['stop_confirmed'] or directory.parent.name == run_id:
+            for directory in sorted(output.glob('*/prepare')):
+                existing = read_prepared_turn(directory)
+                if directory.parent.name == run_id:
                     return existing
+                # A chat (or an indeterminate launch) for a different request
+                # cannot bind this request, nor safely authorize a fresh chat.
+                with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as db:
+                    prior = db.execute('SELECT state FROM dispatches WHERE request_id=? AND item_seq=?',
+                                       (directory.parent.name, item['seq'])).fetchone()
+                if existing.get('chat_id') or not prior or prior[0] != 'reconciled':
+                    return {'status': 'worker_prepare_uncertain', 'evidence': str(directory)}
         if item is not None and (operation == 'prepare' or (operation == 'run'
                 and item['state'] == 'bound' and not item['stage'])):
             preflight = run_git_preflight(CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT, item)
@@ -382,139 +392,19 @@ def run(operation, marker, cli):
                 released = release_preflight_reservation(DATABASE_PATH, config, item, preflight)
                 return {'status': 'worker_git_preflight_blocked', 'git_preflight': preflight,
                         'reservation': released}
-        os.environ.pop('CODEX_THREAD_ID', None)
         deadline = utc_now() + (timedelta(hours=72) if operation == 'run' else timedelta(minutes=4))
         if operation == 'run':
             return dispatch_work_item(
                 marker, lambda current: launch_turn(cli, operation, current, output, deadline), deadline,
-                recover_deployment=True, recover_review=lambda current: review_handoff_stopped(output, current),
-                recover_material=lambda current: review_handoff_stopped(output, current),
-                recover_git=lambda current: review_handoff_stopped(output, current),
-                recover_e2e=lambda current: review_handoff_stopped(output, current))
+                recover_deployment=True,
+                recover_material=lambda current: previous_turn_stopped(output),
+                recover_git=lambda current: previous_turn_stopped(output),
+                recover_e2e=lambda current: previous_turn_stopped(output))
         receipt, _ = launch_turn(cli, operation, item, output, deadline)
         if operation == 'prepare':
             return prepared_result(receipt)
         return {'status': 'probe_passed' if probe_passed(receipt) else 'probe_failed',
                 'receipt': receipt['receipt_path']}
-
-
-def sync_command(*args):
-    return [sys.executable, '-B', str(Path(__file__).with_name('task_sync_runner.py')), *args]
-
-
-def review_remote(config, item):
-    admitted = json.loads(item['config_snapshot'])
-    for key in ('base_url', 'credential_ref', 'project_name'):
-        if config['zentao'].get(key) != admitted['zentao'].get(key):
-            raise RemoteRejected('当前禅道配置与工单快照不匹配')
-    return StoryReviewRemote(admitted)
-
-
-def read_review_target(marker):
-    item = read_item(marker)
-    if (not item or item['kind'] != 'story' or item['state'] != 'running' or item['stage'] != 'material_check'
-            or not json.loads(item['config_snapshot']).get('runtime', {}).get('story_review_sync')
-            or runtime_check(item['chat_id'])['status'] != 'runtime_unattended'):
-        return {'status': 'review_target_inactive'}
-    config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-    with transaction(DATABASE_PATH) as conn:
-        attempt = review_target_attempt(conn, config, item)
-        if not attempt:
-            return {'status': 'review_target_inactive'}
-        if attempt['target']:
-            return {'status': 'review_target_verified', 'target': json.loads(attempt['target'])}
-    try:
-        target = review_remote(config, item).observe(item)['target']
-    except RemoteRejected as error:
-        return {'status': 'review_target_failed', 'reason': str(error)}
-    if target['status'] not in ('active', 'reviewing'):
-        return {'status': 'review_target_failed', 'reason': '禅道需求当前未处于接单所需的评审中或激活状态'}
-    with transaction(DATABASE_PATH) as conn:
-        current = review_target_attempt(conn, config, item)
-        if not current or current['attempt_id'] != attempt['attempt_id']:
-            return {'status': 'review_target_inactive'}
-        if current['target']:
-            target = json.loads(current['target'])
-        else:
-            conn.execute('INSERT INTO story_review_targets(attempt_id,target) VALUES (?,?)',
-                         (attempt['attempt_id'], encode(target)))
-        return {'status': 'review_target_verified', 'target': target}
-
-
-def review_target_attempt(conn, config, item):
-    now = Ledger(conn, config, utc_now()).time
-    return conn.execute('''SELECT a.attempt_id,t.target FROM attempts a
-                           JOIN work_items w ON w.seq=a.item_seq AND w.run_round=a.run_round
-                           LEFT JOIN story_review_targets t ON t.attempt_id=a.attempt_id
-                           WHERE a.item_seq=? AND a.stage='material_check' AND a.outcome IS NULL
-                           AND a.deadline_at>? AND w.request_id=? AND w.state='running' AND w.stage=a.stage''',
-                        (item['seq'], now, item['request_id'])).fetchone()
-
-
-def sync_item_review(config, item):
-    try:
-        remote = review_remote(config, item)
-    except RemoteRejected as error:
-        return {'status': 'review_retry', 'reason': str(error)}
-    result = sync_review(DATABASE_PATH, config, remote, item_identity(item))
-    try:
-        publish_status(DATABASE_PATH, config)
-    except (OSError, ValueError, sqlite3.Error) as error:
-        print(f'Status page refresh failed: {error}', file=sys.stderr)
-    return result
-
-
-def reconcile_review(marker, prior_ended):
-    if not prior_ended:
-        return {'status': 'review_prior_request_unverified'}
-    item = read_item(marker)
-    if not item or item['state'] != 'review_wait':
-        return {'status': 'review_not_rearmable'}
-    config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-    remote = review_remote(config, item)
-    return rearm_uncertain(DATABASE_PATH, config, remote, item_identity(item), prior_ended=prior_ended)
-
-
-def sync_monitor_reviews(config):
-    if not DATABASE_PATH.is_file():
-        return {'checked': [], 'ready': []}
-    zentao = config['zentao']
-    scope = (zentao['base_url'].rstrip('/'), zentao['project_name'])
-    with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        projects = conn.execute('SELECT project_id FROM scans WHERE instance=? AND project_name=?', scope).fetchall()
-        if len(projects) != 1:
-            return {'checked': [], 'ready': []}
-        items = conn.execute('''SELECT w.* FROM work_items w JOIN writebacks b ON b.item_seq=w.seq
-                                AND b.run_round=w.run_round AND b.operation_type='story_review'
-                                WHERE w.instance=? AND w.project_id=? AND w.state='review_wait'
-                                ORDER BY COALESCE(json_extract(b.receipt,'$.checked_at'), ''), w.seq LIMIT 4''',
-                             (scope[0], projects[0]['project_id'])).fetchall()
-    checked = [{'marker': item['marker'], **sync_item_review(config, item)} for item in items]
-    with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
-        ready = [row[0] for row in conn.execute('''SELECT marker FROM work_items WHERE instance=? AND project_id=?
-                                                   AND state IN ('review_handoff','review_ready') ORDER BY seq''',
-                                               (scope[0], projects[0]['project_id']))]
-    return {'checked': checked, 'ready': ready}
-
-
-def run_monitor_sync():
-    if runtime_check(os.environ.get('CODEX_THREAD_ID', ''))['status'] != 'runtime_unattended':
-        raise ValueError('Task synchronization requires an unattended monitor session')
-    receipt = run_stage(uuid4().hex, 'monitor', utc_now() + timedelta(minutes=3), PROJECT_ROOT,
-                        DATABASE_PATH.parent / 'task-sync', None, sync_command())
-    result = {'status': 'tasks_checked' if receipt['outcome'] == 'success' else 'task_sync_incomplete',
-              'outcome': receipt['outcome'], 'stop_confirmed': receipt['stop_confirmed'],
-              'receipt': receipt['receipt_path']}
-    try:
-        config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-        result['git_preflight'] = run_git_preflight(CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT)
-        result['story_reviews'] = sync_monitor_reviews(config)
-        if dingtalk_enabled(config):
-            result['dingtalk'] = dispatch_dingtalk()
-    except (OSError, ValueError, TypeError, AttributeError):
-        result['dingtalk'] = {'status': 'configuration_error'}
-    return result
 
 
 def prepared_result(receipt):
@@ -524,7 +414,26 @@ def prepared_result(receipt):
              and session.get('last_turn_event') == 'turn.completed'
              and runtime_check(thread_id)['status'] == 'runtime_unattended')
     return {'status': 'worker_ready' if ready else 'worker_prepare_uncertain', 'chat_id': thread_id,
-            'receipt': receipt['receipt_path']}
+            'receipt': receipt['receipt_path'], 'stop_confirmed': receipt['stop_confirmed']}
+
+
+def read_prepared_turn(directory):
+    # A supervisor may have lost its final disk write after receiving all CLI
+    # events. Reconstruct this request's receipt only after proving it stopped.
+    try:
+        previous = directory / 'result.json'
+        if previous.is_file():
+            return prepared_result(json.loads(previous.read_text(encoding='utf-8')))
+        launch = directory / 'launch.json'
+        stopped = recover_job_stop(json.loads(launch.read_text(encoding='utf-8')))
+        if stopped:
+            session = parse_session(directory / 'stdout.log')
+            return prepared_result({'outcome': 'success' if session.get('last_turn_event') == 'turn.completed' else 'failed',
+                                    'stop_confirmed': True, 'receipt_path': str(launch),
+                                    'stop_evidence': {**stopped, 'codex_session': session}})
+    except (AttributeError, KeyError, TypeError, ValueError, OSError):
+        pass
+    return {'status': 'worker_prepare_uncertain', 'evidence': str(directory)}
 
 
 def run_e2e_preflight(profile):
@@ -535,8 +444,6 @@ def run_e2e_preflight(profile):
 
 
 def run_locked_e2e_preflight(profile):
-    import msvcrt
-
     attempt_id = uuid4().hex
     phase = 'e2e-preflight'
     output = DATABASE_PATH.parent / 'worker-probes'
@@ -546,14 +453,8 @@ def run_locked_e2e_preflight(profile):
     if profile:
         command.extend(['--profile', str(profile.resolve(strict=True))])
     output.mkdir(parents=True, exist_ok=True)
-    with (output / 'e2e-preflight.lock').open('a+b') as lock:
-        if lock.tell() == 0:
-            lock.write(b'0')
-            lock.flush()
-        lock.seek(0)
-        try:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+    with file_lock(output / 'e2e-preflight.lock') as acquired:
+        if not acquired:
             return {'status': 'e2e_preflight_busy', 'check': {'stage': 'runner-lock'}}
         receipt = run_stage(attempt_id, phase, utc_now() + timedelta(minutes=4), PROJECT_ROOT,
                             output, None, command)
@@ -569,35 +470,24 @@ def run_locked_e2e_preflight(profile):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'sync-tasks', 'e2e-preflight',
-                                             'review-target', 'review-reconcile', 'git-preflight'))
+    parser.add_argument('operation', choices=('prepare', 'run', 'probe', 'e2e-preflight', 'git-preflight'))
     parser.add_argument('--marker')
     parser.add_argument('--profile', type=Path)
-    parser.add_argument('--prior-ended', action='store_true')
     args = parser.parse_args()
     if args.profile and args.operation != 'e2e-preflight':
         parser.error('--profile is only supported for e2e-preflight')
-    if args.prior_ended and args.operation != 'review-reconcile':
-        parser.error('--prior-ended is only supported for review-reconcile')
-    cli = codex_directory() / 'packages' / 'app-server-daemon' / 'current' / 'bin' / 'codex.exe'
     try:
         if args.operation == 'git-preflight':
             result = run_git_preflight(CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT)
         elif args.operation == 'e2e-preflight':
             result = run_e2e_preflight(args.profile)
-        elif args.operation == 'sync-tasks':
-            result = run_monitor_sync()
-        elif args.operation == 'review-target':
-            result = read_review_target(args.marker)
-        elif args.operation == 'review-reconcile':
-            result = reconcile_review(args.marker, args.prior_ended)
         else:
-            result = run(args.operation, args.marker, cli.resolve(strict=True))
+            result = run(args.operation, args.marker, resolve_cli())
     except (OSError, TypeError, ValueError, sqlite3.Error) as error:
         result = {'status': 'worker_error', 'reason': str(error)}
     print(json.dumps(result, ensure_ascii=True))
-    return int(result['status'] in ('worker_error', 'worker_deployment_blocked', 'probe_failed', 'task_sync_incomplete',
-                                    'e2e_preflight_blocked', 'e2e_preflight_busy', 'worker_review_stop_unverified',
+    return int(result['status'] in ('worker_error', 'worker_deployment_blocked', 'probe_failed', 'worker_stop_unverified',
+                                    'e2e_preflight_blocked', 'e2e_preflight_busy',
                                     'worker_git_preflight_blocked', 'git_preflight_failed', 'git_preflight_busy',
                                     'worker_material_stop_unverified', 'worker_material_blocked',
                                     'worker_host_git_stop_unverified', 'worker_host_git_blocked',

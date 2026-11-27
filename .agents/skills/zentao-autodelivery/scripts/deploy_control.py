@@ -1,4 +1,4 @@
-"""Coordinate releases from the Windows worker, outside the work-item Agent."""
+"""Coordinate releases from the host worker, outside the work-item Agent."""
 
 import json
 from datetime import datetime, timezone
@@ -288,7 +288,7 @@ def finish_deployment(store, item, trial, directory, fields):
             if not deployed_receipt_matches(receipt, service, versions.get(service), selected[service]):
                 return message('evidence_required', reason=f'Invalid deployment receipt for {service}')
             target = selected[service]
-            if not target.get('mcp_url'):
+            if not (target.get('mcp_url') or target.get('kube_server')):
                 endpoint = target['gateway_url'].rstrip('/') + target['verification_path']
                 pods = receipt.get('pod_verification')
                 if (receipt['verification'].get('url') != endpoint or not isinstance(pods, dict)

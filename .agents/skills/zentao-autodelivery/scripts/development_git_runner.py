@@ -1,4 +1,4 @@
-"""Windows launcher for ledger-authorized frontend/backend Git batches."""
+"""Host runner for ledger-authorized frontend and backend Git operations."""
 import argparse
 from contextlib import ExitStack, closing
 from datetime import datetime

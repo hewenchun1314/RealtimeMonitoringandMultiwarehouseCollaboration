@@ -41,12 +41,18 @@ CREATE TABLE IF NOT EXISTS work_items (
     UNIQUE(instance, project_id, kind, item_id)
 );
 CREATE INDEX IF NOT EXISTS queue ON work_items(instance, project_id, state, priority, seq);
+CREATE TABLE IF NOT EXISTS intake_retries (
+    item_seq INTEGER PRIMARY KEY REFERENCES work_items(seq), retry_at TEXT NOT NULL, reason TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS work_item_sources (
     item_seq INTEGER PRIMARY KEY REFERENCES work_items(seq), source TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS intake_materials (
+    item_seq INTEGER PRIMARY KEY REFERENCES work_items(seq), materials TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dispatches (
     request_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
-    desktop_project_id TEXT NOT NULL, state TEXT NOT NULL, expires_at TEXT NOT NULL
+    desktop_project_id TEXT, state TEXT NOT NULL, expires_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attempts (
     attempt_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
@@ -93,22 +99,13 @@ CREATE TABLE IF NOT EXISTS writebacks (
     operation_id TEXT PRIMARY KEY, item_seq INTEGER NOT NULL REFERENCES work_items(seq),
     run_round INTEGER NOT NULL, operation_type TEXT NOT NULL, payload TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending', lease_id TEXT, owner TEXT, expires_at TEXT,
-    reconcile_required INTEGER NOT NULL DEFAULT 0, receipt TEXT
+    reconcile_required INTEGER NOT NULL DEFAULT 0, receipt TEXT, last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS pending_writebacks ON writebacks(state, expires_at);
-CREATE TABLE IF NOT EXISTS story_review_targets (
-    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id), target TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS split_task_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
-    WHERE operation_type IN ('task_create','task_close','task_reopen');
-CREATE INDEX IF NOT EXISTS split_task_progress_operations ON writebacks(item_seq,json_extract(payload,'$.key'))
-    WHERE operation_type IN ('task_create','task_close','task_reopen','task_start','task_note');
 CREATE TABLE IF NOT EXISTS split_tasks (
     item_seq INTEGER NOT NULL REFERENCES work_items(seq), task_key TEXT NOT NULL,
-    instance TEXT NOT NULL, side TEXT NOT NULL, definition TEXT NOT NULL,
-    desired TEXT NOT NULL DEFAULT 'open', generation INTEGER NOT NULL DEFAULT 0,
-    remote_id TEXT, remote_status TEXT, execution_id TEXT, assignee TEXT,
-    retry_at TEXT, last_error TEXT, PRIMARY KEY(item_seq,task_key), UNIQUE(instance,remote_id)
+    side TEXT NOT NULL, definition TEXT NOT NULL,
+    desired TEXT NOT NULL DEFAULT 'open', PRIMARY KEY(item_seq,task_key)
 );
 """ + EVIDENCE_SCHEMA
 
@@ -200,9 +197,21 @@ def validate_backend(config, development):
 
 
 def validate_service_delivery(service, key):
-    for field in ('branch', 'build_command', 'test_command', 'acceptance_command'):
-        require_text(service.get(field), f'{key}.{field}')
-    require_text(service.get('start_command') or service.get('service_url'), f'{key}.start_command or service_url')
+    from service_runtime import command_args, http_settings, start_config
+
+    require_text(service.get('branch'), f'{key}.branch')
+    for name in ('build_command', 'test_command'):
+        command_args(service.get(name))
+    if 'start' in service:
+        start_config(service['start'])
+    elif 'start_command' in service:
+        command_args(service['start_command'])
+    else:
+        require_text(service.get('service_url'), f'{key}.start or service_url')
+    if 'acceptance' in service:
+        http_settings(service['acceptance'])
+    else:
+        command_args(service.get('acceptance_command'))
 
 
 def validate_backend_dependencies(config, development):
@@ -258,6 +267,8 @@ def validate_config(config):
     for kind in ('story', 'bug'):
         require_strings(accepted.get(kind), f'zentao.accepted_statuses.{kind}')
     monitor = require_mapping(config.get('monitor'), 'monitor')
+    if type(monitor.get('interval_minutes', 60)) is not int or monitor.get('interval_minutes', 60) < 1:
+        raise ValueError('monitor.interval_minutes must be a positive integer')
     if type(monitor.get('enabled')) is not bool:
         raise ValueError('monitor.enabled must be a boolean')
     e2e = require_mapping(config.get('e2e', {}), 'e2e')
@@ -271,7 +282,8 @@ def validate_config(config):
                 or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
                 or len(set(ports)) != len(ports)):
             raise ValueError('e2e.startup_ports must contain unique local TCP ports')
-        require_text(e2e.get('start_command'), 'e2e.start_command')
+        from service_runtime import command_args
+        command_args(e2e.get('start_command'))
         require_mapping(e2e.get('agentlimb'), 'e2e.agentlimb')
     if 'agentlimb' in e2e:
         browser = require_mapping(e2e['agentlimb'], 'e2e.agentlimb')
@@ -315,7 +327,7 @@ def validate_config(config):
         side, _, name = target.partition(':')
         if side not in ('backend', 'frontend') or not name:
             raise ValueError('runtime.worker_git_write_repositories requires backend:service or frontend:application')
-    for key in ('split_task_sync', 'split_task_progress_sync', 'sync_requirement_before_review', 'story_review_sync',
+    for key in ('sync_requirement_before_review',
                 'git_push_enabled', 'streamlined_bug_intake'):
         if key in runtime and type(runtime[key]) is not bool:
             raise ValueError(f'runtime.{key} must be a boolean')

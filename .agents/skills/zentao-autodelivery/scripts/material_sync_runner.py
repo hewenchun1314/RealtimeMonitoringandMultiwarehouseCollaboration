@@ -1,11 +1,10 @@
 """Fixed host Git operations; the sandbox-facing workflow only requests/results."""
 
 import argparse
-from contextlib import closing, contextmanager
+from contextlib import closing
 from datetime import datetime, timedelta
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import sqlite3
@@ -13,6 +12,7 @@ import sys
 from time import monotonic
 from uuid import uuid4
 
+from portable_lock import file_lock
 from ledger import Ledger, item_identity, message, transaction, validate_config
 from material_sync import git_until, requirement_checkout
 from stage_runner import recover_job_stop, run_stage, utc_now, write_json
@@ -30,35 +30,8 @@ def checkout_key(checkout):
     return hashlib.sha256(str(checkout).casefold().encode()).hexdigest()
 
 
-@contextmanager
 def checkout_lock(directory, checkout):
-    """Nonblocking lock shared by this project's sync and preflight operations."""
-    directory.mkdir(parents=True, exist_ok=True)
-    name = checkout_key(checkout) + '.lock'
-    with (directory / name).open('a+b') as lock:
-        lock.seek(0, 2)
-        if lock.tell() == 0:
-            lock.write(b'0')
-            lock.flush()
-        lock.seek(0)
-        try:
-            if os.name == 'nt':
-                import msvcrt
-                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            lock.seek(0)
-            if os.name == 'nt':
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return file_lock(directory / (checkout_key(checkout) + '.lock'))
 
 
 def pending_material_sync(marker, database, config_path):

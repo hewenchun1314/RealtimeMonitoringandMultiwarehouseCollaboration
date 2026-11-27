@@ -173,30 +173,3 @@ def inspect_branches(context, config_directory, worktrees):
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
             repositories[application] = {'status': 'inspection_failed', 'reason': str(error)}
     return repositories
-
-
-def prepare_local_worktree(context, config_directory, database, app, deadline_budget):
-    branch = context['worktree_branch']
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', app) or app not in context['branch_targets']:
-        raise ValueError('Select a configured repository from the current plan')
-    if app in context.get('revoked_dependencies', ()):
-        return {'status': 'dependency_write_revoked'}
-    target = context['branch_targets'][app]
-    workspace = source_workspace(context, config_directory, app)
-    if not workspace:
-        return {'status': 'workspace_missing'}
-    resolved = inspect_repository(workspace, target, branch, None)
-    if resolved['status'] != 'resolved':
-        return resolved
-    ledger_directory = Path(database).resolve().parent
-    path = ledger_directory / 'worktrees' / branch.split('/')[-1] / app
-    if path.resolve() != path:
-        raise ValueError('Worktree destination must be within the ledger workspace and cannot contain directory redirects')
-    repository = Path(resolved['source_root'])
-    if path.is_relative_to(repository) or repository.is_relative_to(path):
-        raise ValueError('The worktree must be outside its source checkout')
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        git(repository, 'worktree', 'add', '-b', branch, '--', str(path), resolved['base_commit'],
-            timeout=min(50, max(1, deadline_budget)))
-    return inspect_repository(workspace, target, branch, str(path))

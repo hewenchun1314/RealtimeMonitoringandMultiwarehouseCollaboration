@@ -1,4 +1,4 @@
-"""Coordinate a fixed Windows-host AgentLimb run for a post-merge attempt."""
+"""Coordinate a fixed host AgentLimb run for a post-merge attempt."""
 
 from contextlib import closing
 from datetime import datetime
@@ -114,7 +114,8 @@ def _active_job(marker, database, config_path):
                           and config.get('workspaces', {}).get(frontend_key) == workspace)
         return SimpleNamespace(folder=folder, item_root=item_root, attempt_id=trial['attempt_id'],
                                request_id=item['request_id'], chat_id=item['chat_id'], deadline=deadline,
-                               request=read_json(request_path), e2e=e2e, config_current=config_current)
+                               request=read_json(request_path), e2e=e2e, config_current=config_current,
+                               automatic=admitted.get('e2e_attestation') == 'launch')
 
 
 def pending_frontend_e2e(marker, database, config_path):
@@ -138,15 +139,18 @@ def _json_input(root, value):
 
 def _command(marker, job, stage_root):
     data = job.request
-    if not data or data.keys() != {'attempt_id', 'profile', 'scenario', 'base_url'} or data['attempt_id'] != job.attempt_id:
+    expected = {'attempt_id', 'scenario'}
+    if not job.automatic:
+        expected.update(('profile', 'base_url'))
+    if not isinstance(data, dict) or data.keys() != expected or data['attempt_id'] != job.attempt_id:
         raise ValueError('Invalid fixed host E2E request')
-    profile = _json_input(job.item_root, data['profile'])
     scenario = _json_input(job.item_root, data['scenario'])
-    base = data['base_url']
+    preferred_origin = job.e2e.get('agentlimb', {}).get('preflight_origin', '')
+    base = preferred_origin if job.automatic else data['base_url']
     if not isinstance(base, str) or '\\' in base or any(char.isspace() for char in base):
         raise ValueError('Use a configured local origin')
     address = urlsplit(base)
-    preferred = urlsplit(job.e2e.get('agentlimb', {}).get('preflight_origin', ''))
+    preferred = urlsplit(preferred_origin)
     if (address.scheme not in ('http', 'https') or address.hostname not in ('localhost', '127.0.0.1', '::1')
             or address.username is not None or address.password is not None or address.path not in ('', '/')
             or address.query or address.fragment or (address.scheme, address.port) != (preferred.scheme, preferred.port)):
@@ -154,7 +158,14 @@ def _command(marker, job, stage_root):
     inputs = stage_root / 'inputs'
     if inputs.resolve() != inputs:
         raise ValueError('Host E2E inputs must remain in the attempt directory')
-    profile_data, scenario_data = read_json(profile), read_json(scenario)
+    scenario_data = read_json(scenario)
+    if job.automatic:
+        fields = {'entry_path', 'work_area', 'checks'}
+        if not isinstance(scenario_data, dict) or not isinstance(scenario_data.get('entry_path'), str):
+            raise ValueError('Specify the entry page in the scenario')
+        profile_data = {key: scenario_data.pop(key) for key in fields if key in scenario_data}
+    else:
+        profile_data = read_json(_json_input(job.item_root, data['profile']))
     if profile_data is None or not _case_names(scenario_data):
         raise ValueError('Host E2E requires a JSON profile and a scenario with named cases')
     inputs.mkdir(parents=True, exist_ok=True)
@@ -260,6 +271,9 @@ def run_frontend_e2e(marker, database, config_path, project_root):
               or (check.get('status') in ('passed', 'failed')
                   and (check.get('marker'), check.get('attempt_id')) != (marker, job.attempt_id))):
             check = {'status': 'blocked', 'stage': 'host-runner'}
+        elif (job.automatic and check['status'] in ('passed', 'failed')
+              and check.get('version_attestation') != 'launch'):
+            check = {'status': 'blocked', 'stage': 'candidate-version'}
         elif check['status'] in ('passed', 'failed') and not _valid_case_results(check, stage_root):
             check = {'status': 'blocked', 'stage': 'scenario-results'}
         if cleanup:

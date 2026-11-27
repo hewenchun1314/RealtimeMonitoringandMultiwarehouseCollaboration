@@ -1,6 +1,8 @@
 import argparse
+from datetime import timedelta
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
@@ -46,7 +48,7 @@ class PreflightStartupTests(unittest.TestCase):
     def test_receipt_requires_same_candidate_attempt_and_business_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            output = root / '.local/zentao-delivery/items/HNF-test/runner.json'
+            output = root / '.local/zentao-delivery-v2/items/HNF-test/runner.json'
             output.parent.mkdir(parents=True)
             evidence = {'agentlimb_receipt': str(output)}
             versions = {'shell': 'a' * 40}
@@ -65,6 +67,31 @@ class PreflightStartupTests(unittest.TestCase):
             self.assertIn('active attempt', check('expired'))
             receipt['repair_required'] = False
             self.assertIn('business assertion', check('current'))
+
+    def test_automatic_receipt_needs_current_launch_and_all_apps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = 'a' * 32
+            output = root / f'.local/zentao-delivery-v2/items/HNF-test/frontend/e2e-{attempt}/agentlimb.json'
+            output.parent.mkdir(parents=True)
+            item = {'marker': 'HNF-test', 'config_snapshot': json.dumps({'e2e_attestation': 'launch'})}
+            versions = {'charts': 'b' * 40}
+            receipt = {'runner': 'agentlimb', 'marker': item['marker'], 'attempt_id': attempt, 'status': 'passed',
+                       'stage': 'acceptance', 'version_attestation': 'launch', 'versions': versions,
+                       'checks': [], 'candidate_resources': [{'app': 'charts', 'url': 'http://localhost:30043/chart.js'}],
+                       'host_run': {'stop_confirmed': True, 'stop_evidence': {'owned_processes_active_after_stop': 0}},
+                       'scenario_cases': [{'name': 'scenario', 'status': 'passed'}]}
+
+            def check():
+                output.write_text(json.dumps(receipt), encoding='utf-8')
+                with (patch('route_evidence.frontend_acceptance_versions', return_value=versions),
+                      patch('route_evidence.get_split', return_value={'post_merge_e2e': True})):
+                    return agentlimb_receipt_error(None, item, attempt, {'agentlimb_receipt': str(output)},
+                                                  'passed', root / '.agents')
+
+            self.assertIsNone(check())
+            receipt['candidate_resources'][0]['url'] = 'https://example.invalid/chart.js'
+            self.assertIn('from its own launch', check())
 
     def test_optional_profile_uses_its_own_entry_and_assertions(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -88,57 +115,23 @@ class PreflightStartupTests(unittest.TestCase):
                              'candidate-port-in-use')
         start.assert_not_called()
 
-    def test_post_merge_only_restarts_when_loaded_resource_is_incompatible(self):
+    def test_post_merge_occupied_port_blocks_without_starting_or_stopping_processes(self):
         options = e2e.browser_options(self.config, self.args)
+        settings = dict(self.config['e2e'], startup_ports=[5000, 5010, 5080])
         options.update(postMerge=True, startupWorkspace=str(self.workspace))
-        args = argparse.Namespace(startup_log=Path('frontend.log'), scenario=Path('scenario.json'))
-        reports = [Mock(stdout=b'{"status":"blocked","stage":"candidate-resource"}'),
-                   Mock(stdout=b'{"status":"passed","stage":"acceptance"}')]
-        with (patch.object(e2e, 'prepare_frontend', side_effect=[{'mode': 'reused'}, {'mode': 'started'}]) as start,
-              patch.object(e2e.subprocess, 'run', side_effect=reports) as browser):
-            result = e2e.run_browser(self.config, options, args)
-        self.assertEqual(result['status'], 'passed')
-        self.assertEqual(start.call_args.kwargs, {'restart': True})
-        self.assertEqual(browser.call_count, 2)
-
-    def test_post_merge_starts_from_main_checkout_after_reclaiming_configured_ports(self):
-        options = e2e.browser_options(self.config, self.args)
-        settings = self.config['e2e']
-        settings['startup_ports'] = [5000, 5010, 5080]
-        options.update(postMerge=True, startupWorkspace=str(self.workspace),
-                       resources=[{'url': 'http://localhost:5010/index.js'}])
-        child = Mock(pid=37, poll=Mock(return_value=None))
-        with (tempfile.TemporaryDirectory() as directory,
-              patch.object(e2e, 'stop_frontend_ports', create=True, return_value=[{'port': 5080, 'pid': 59}]) as stop,
-              patch.object(e2e, 'port_open', return_value=True),
-              patch.object(e2e, 'http_ready', return_value=True),
-              patch.object(e2e.subprocess, 'Popen', return_value=child) as start):
-            result = e2e.prepare_frontend(settings, options, Path(directory) / 'front.log', restart=True)
-        stop.assert_called_once_with([5000, 5010, 5080])
-        self.assertEqual(result['mode'], 'started')
-        self.assertEqual(start.call_args.kwargs['cwd'], str(self.workspace))
-        self.assertIn('agentlimb_resource_witness.cjs', start.call_args.kwargs['env']['NODE_OPTIONS'])
-
-    def test_post_merge_does_not_restart_a_matching_service(self):
-        options = e2e.browser_options(self.config, self.args)
-        options.update(postMerge=True, startupWorkspace=str(self.workspace))
-        args = argparse.Namespace(startup_log=Path('frontend.log'), scenario=Path('scenario.json'))
-        with (patch.object(e2e, 'prepare_frontend', return_value={'mode': 'reused'}) as start,
-              patch.object(e2e.subprocess, 'run', return_value=Mock(stdout=b'{"status":"passed"}')) as browser):
-            result = e2e.run_browser(self.config, options, args)
-        self.assertEqual(result['frontend']['mode'], 'reused')
-        start.assert_called_once()
-        browser.assert_called_once()
+        with (patch.object(e2e, 'port_open', side_effect=lambda host, port: port == 5080),
+              patch.object(e2e.subprocess, 'Popen') as start):
+            result = e2e.prepare_frontend(settings, options, None)
+        self.assertEqual(result, {'mode': 'start-failed', 'reason': 'candidate-port-in-use', 'ports': [5080]})
+        start.assert_not_called()
 
     def test_post_merge_rejects_resource_port_outside_config_without_stopping_anything(self):
         options = e2e.browser_options(self.config, self.args)
         options.update(postMerge=True, startupWorkspace=str(self.workspace),
                        resources=[{'url': 'http://localhost:5011/index.js'}])
         settings = dict(self.config['e2e'], startup_ports=[5000, 5010])
-        with patch.object(e2e, 'stop_frontend_ports') as stop:
-            with self.assertRaisesRegex(ValueError, 'configured startup ports'):
-                e2e.prepare_frontend(settings, options, None, restart=True)
-        stop.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'configured startup ports'):
+            e2e.prepare_frontend(settings, options, None)
 
     def test_post_merge_setup_prefers_actual_integration_version_and_main_workspace(self):
         options = e2e.browser_options(self.config, self.args)
@@ -166,12 +159,45 @@ class PreflightStartupTests(unittest.TestCase):
         self.assertEqual(options['candidateVersions'], {'shell': sha})
         check.assert_called_once_with(options, self.config, repositories, {'shell': sha})
 
+    def test_owned_http_service_starts_and_is_cleaned_without_stopping_external_listener(self):
+        from stage_runner import run_stage, utc_now
+
+        with tempfile.TemporaryDirectory() as folder, socket.socket() as external:
+            root = Path(folder)
+            external.bind(('127.0.0.1', 0))
+            external.listen()
+            with socket.socket() as available:
+                available.bind(('127.0.0.1', 0))
+                port = available.getsockname()[1]
+            options = {'workspace': folder, 'startupWorkspace': folder, 'baseUrl': f'http://127.0.0.1:{port}',
+                       'loginPath': '/', 'postMerge': True}
+            config = {'start_command': [sys.executable, '-m', 'http.server', str(port), '--bind', '127.0.0.1'],
+                      'startup_ports': [port, external.getsockname()[1]]}
+            conflict = e2e.prepare_frontend(config, options, root / 'frontend.log')
+            self.assertEqual(conflict['ports'], [external.getsockname()[1]])
+            config['startup_ports'] = [port]
+            script = root / 'accept.py'
+            script.write_text('import json, sys\nfrom pathlib import Path\n'
+                              + f'sys.path.insert(0, {str(Path(e2e.__file__).parent)!r})\n'
+                              + 'from agentlimb_e2e import prepare_frontend\n'
+                              + f'print(json.dumps(prepare_frontend({config!r}, {options!r}, Path("frontend.log"))))\n',
+                              encoding='utf-8')
+            receipt = run_stage('http-test', 'frontend', utc_now() + timedelta(seconds=20),
+                                root, root / 'runs', None, [sys.executable, '-B', str(script)])
+            self.assertEqual(receipt['outcome'], 'success', receipt)
+            report = json.loads(Path(receipt['stdout_path']).read_bytes())
+            self.assertEqual(report['mode'], 'started')
+            self.assertTrue(receipt['stop_confirmed'])
+            self.assertFalse(e2e.port_open('127.0.0.1', port))
+            with socket.create_connection(external.getsockname(), timeout=1):
+                pass
+
     def test_cold_start_waits_for_owned_command_and_required_ports(self):
         options = e2e.browser_options(self.config, self.args)
         child = Mock(pid=37)
         child.poll.return_value = None
         with (tempfile.TemporaryDirectory() as folder,
-              patch.object(e2e, 'port_open', side_effect=[False, True, False, True, True]) as port,
+              patch.object(e2e, 'port_open', side_effect=[False, False, False, True, True]) as port,
               patch.object(e2e, 'http_ready', return_value=True) as ready,
               patch.object(e2e, 'sleep'), patch.object(e2e.subprocess, 'Popen', return_value=child) as start):
             log = Path(folder) / 'frontend.log'
@@ -180,7 +206,7 @@ class PreflightStartupTests(unittest.TestCase):
         self.assertEqual(result['pid'], 37)
         self.assertEqual([call.args[1] for call in port.call_args_list], [5000, 5000, 5010, 5000, 5010])
         self.assertEqual(ready.call_args.args, ('http://localhost:5000/login',))
-        self.assertEqual(start.call_args.args[0][-1], 'npm run serve-shell-hub')
+        self.assertEqual(start.call_args.args[0][1:], ['run', 'serve-shell-hub'])
         self.assertEqual(start.call_args.kwargs['cwd'], str(self.workspace))
 
     def test_start_command_exit_is_reported_before_browser(self):
@@ -210,8 +236,8 @@ class PreflightStartupTests(unittest.TestCase):
               patch.object(e2e.subprocess, 'Popen', return_value=child) as start):
             result = e2e.prepare_frontend(self.config['e2e'], options, Path(folder) / 'frontend.log')
         self.assertEqual(result['gateway'], options['gatewayUrl'])
-        self.assertEqual(start.call_args.args[0][-1],
-                         "npm run serve-shell-hub --gateway='http://deployment.example.test:31111/'")
+        self.assertEqual(start.call_args.args[0][1:],
+                         ["run", "serve-shell-hub", "--gateway=http://deployment.example.test:31111/"])
 
     def test_wrong_live_backend_blocks_the_browser_before_agentlimb(self):
         options = e2e.browser_options(self.config, self.args)

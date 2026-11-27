@@ -183,6 +183,28 @@ class BackendDeployTests(unittest.TestCase):
             kube.return_value.verify_rollout.assert_called_once_with(REFERENCE, {DIGEST, CONFIG})
         self.assertEqual(json.loads(Path(self.request['receipt_path']).read_text())['status'], 'deployed')
 
+    def test_rancher_direct_backend_release_and_later_acceptance_verify_digest_and_health(self):
+        from deploy_state import deployed_receipt_matches
+        target = self.request['target']
+        target.update(kube_server='https://rancher.example/k8s/clusters/test', health_url='https://gateway/health')
+        target.pop('verification_path')
+        observed = {'digest': DIGEST, 'platform_digest': PLATFORM_DIGEST, 'config_digest': CONFIG, 'sha': SHA}
+        proof = {'pods': ['new'], 'ready_replicas': 1, 'deployment_uid': 'uid', 'revision': '4', 'image': REFERENCE}
+        with (patch.object(deploy, 'image_tag', return_value=IMAGE), patch.object(deploy, 'build_image', return_value=CONFIG),
+              patch.object(deploy, 'remote_image', return_value=observed), patch.object(deploy, 'Kubernetes') as kube,
+              patch.object(deploy, 'verify_mcp_health') as health, patch.object(deploy, 'deploy_mcp') as mcp):
+            api = kube.return_value
+            api.uid = 'uid'
+            api.preflight.return_value = api.current_image.return_value = 'old'
+            api.verify_rollout.return_value = proof
+            receipt = deploy.publish(self.request)
+            self.assertTrue(deployed_receipt_matches(receipt, 'smart-geo', SHA, target))
+            self.assertEqual(deploy.verify_published_release(receipt)['provider'], 'rancher_api')
+            api.update.assert_called_once_with('old', REFERENCE)
+            self.assertEqual(api.verify_rollout.call_count, 2)
+            self.assertEqual(health.call_count, 2)
+            mcp.assert_not_called()
+
     def test_existing_tag_with_different_config_cannot_be_pushed_or_deployed(self):
         with (
             patch.object(deploy, 'image_tag', return_value=IMAGE),
@@ -264,7 +286,7 @@ class BackendDeployTests(unittest.TestCase):
             'spec': deployment['spec'],
         }]}
         pods = {'items': [{
-            'metadata': {'ownerReferences': [{'kind': 'ReplicaSet', 'uid': 'rs-uid', 'controller': True}]},
+            'metadata': {'name': 'ready-pod', 'ownerReferences': [{'kind': 'ReplicaSet', 'uid': 'rs-uid', 'controller': True}]},
             'status': {'containerStatuses': [{'name': 'app', 'ready': True, 'imageID': f'docker://{PLATFORM_DIGEST}'}]},
         }]}
         for digest, pass_check in ((PLATFORM_DIGEST, True), (DIGEST, False)):

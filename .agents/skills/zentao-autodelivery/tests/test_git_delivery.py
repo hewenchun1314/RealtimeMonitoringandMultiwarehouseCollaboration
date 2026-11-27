@@ -179,7 +179,6 @@ class GitDeliveryWorkerTests(unittest.TestCase):
         execute.assert_not_called()
         self.assertEqual((result['outcome'], result['disposition']), ('skipped', 'close'))
 
-    @unittest.skipUnless(os.name == 'nt', 'Git delivery uses Windows Job Objects')
     def test_frontend_push_runs_in_controlled_process(self):
         _, remote, sha = self.setup_item('frontend', ['shell-hub'])['shell-hub']
         result = run_git_delivery(self.marker, self.database, self.config_path, self.root)

@@ -15,7 +15,6 @@ RUNNER = Path(__file__).resolve().parents[1] / 'scripts' / 'stage_runner.py'
 sys.path.insert(0, str(RUNNER.parent))
 
 
-@unittest.skipUnless(os.name == 'nt', 'Windows stage workers require Windows Job Objects')
 class StageRunnerTests(unittest.TestCase):
     def invoke(self, folder, attempt, seconds, command, phase='verify'):
         deadline = datetime.now(timezone.utc) + timedelta(seconds=seconds)
@@ -54,7 +53,8 @@ class StageRunnerTests(unittest.TestCase):
                               ['codex.exe', 'exec', '--ephemeral', '-'])
 
             self.assertEqual(spawn.call_args.kwargs['cwd'], worktree)
-            self.assertEqual(spawn.call_args.args[0][5:], [
+            worker_argv = spawn.call_args.args[0]
+            self.assertEqual(worker_argv[worker_argv.index('codex.exe'):], [
                 'codex.exe', '-c', 'model="gpt-6.1-sol"', '-c', 'model_reasoning_effort="xhigh"',
                 'exec', '--ephemeral', '-',
             ])
@@ -78,6 +78,12 @@ class StageRunnerTests(unittest.TestCase):
             self.assertGreaterEqual(evidence['owned_processes_at_stop'], 3)
             self.assertEqual(result, json.loads(Path(result['receipt_path']).read_text(encoding='utf-8')))
             pids = json.loads(Path(result['stdout_path']).read_text(encoding='utf-8'))
+            if os.name != 'nt':
+                table = subprocess.check_output(['ps', '-axo', 'pid=,stat='], text=True)
+                live = {int(pid) for pid, state in (r.split() for r in table.splitlines()) if not state.startswith('Z')}
+                self.assertFalse(set(pids.values()) & live)
+                self.assertIsNone(external.poll())
+                return
             kernel = ctypes.WinDLL('kernel32', use_last_error=True)
             kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
             kernel.OpenProcess.restype = ctypes.c_void_p
@@ -95,6 +101,34 @@ class StageRunnerTests(unittest.TestCase):
                     self.assertEqual(ctypes.get_last_error(), 87)
             self.assertIsNone(external.poll())
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX service may start a new session')
+    def test_timeout_cleans_service_child_that_changed_its_session(self):
+        payload = ('import subprocess, sys, time; '
+                   'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True); '
+                   'print(child.pid, flush=True); time.sleep(30)')
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(Path(directory), 'detached-child', 2, [sys.executable, '-c', payload])
+            self.assertTrue(result['stop_confirmed'])
+            pid = Path(result['stdout_path']).read_text().strip()
+            status = subprocess.run(['ps', '-p', pid, '-o', 'stat='], capture_output=True, text=True)
+            try:
+                self.assertTrue(status.returncode or status.stdout.strip().startswith('Z'))
+            finally:
+                if status.returncode == 0 and not status.stdout.strip().startswith('Z'):
+                    import signal
+                    os.kill(int(pid), signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == 'posix', 'nested POSIX stage scope')
+    def test_nested_stage_with_its_own_subprocess_reports_complete_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            nested = [sys.executable, '-B', str(RUNNER), '--attempt-id', 'inner', '--phase', 'verify',
+                      '--deadline-at', (datetime.now(timezone.utc) + timedelta(seconds=8)).isoformat(),
+                      '--cwd', directory, '--evidence-dir', directory, '--', sys.executable, '-c', 'print("ok")']
+            result = self.invoke(folder, 'outer', 12, nested)
+            self.assertTrue(result['stop_confirmed'])
+            self.assertEqual(json.loads((folder / 'inner/verify/result.json').read_text())['stop_confirmed'], True)
+
     def test_expired_attempt_never_launches_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -104,6 +138,14 @@ class StageRunnerTests(unittest.TestCase):
             self.assertTrue(result['stop_confirmed'])
             self.assertEqual(result['stop_evidence']['owned_processes_at_stop'], 0)
             self.assertFalse((folder / 'marker').exists())
+
+    def test_missing_executable_fails_with_verified_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            result = self.invoke(folder, 'missing-cli', 8, [str(folder / 'uninstalled-binary')])
+            self.assertEqual(result['outcome'], 'failed')
+            self.assertTrue(result['stop_confirmed'])
+            self.assertFalse(result['stop_evidence']['worker_started'])
 
     def test_successful_worker_cleans_up_its_remaining_background_process(self):
         payload = (

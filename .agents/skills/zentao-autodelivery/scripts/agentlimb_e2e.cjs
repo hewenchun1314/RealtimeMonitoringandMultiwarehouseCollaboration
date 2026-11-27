@@ -154,9 +154,42 @@ function loadedDigest(target, expectedGateway) {
   return observed.size ? { digest: observed.size === 1 ? [...observed][0] : null } : null;
 }
 
+function loadedLaunch(proof, expectedGateway) {
+  const frames = [window];
+  const observations = [];
+  for (const frame of frames) {
+    try {
+      for (let index = 0; index < frame.frames.length; index += 1) frames.push(frame.frames[index]);
+      for (const entry of frame.performance.getEntriesByType('resource')) {
+        const address = new URL(entry.name);
+        const port = Number(address.port || (address.protocol === 'https:' ? 443 : 80));
+        if (!['http:', 'https:'].includes(address.protocol) || !['localhost', '127.0.0.1', '[::1]'].includes(address.hostname)
+            || !proof.ports.includes(port)) continue;
+        const timings = entry.serverTiming || [];
+        const mark = timings.find(metric => metric.name === 'zentao-launch')?.description;
+        if (!mark && !/\.(?:[cm]?js|css|vue|tsx?)(?:$|[?#])/i.test(entry.name)) continue;
+        const gateway = timings.find(metric => metric.name === 'zentao-gateway')?.description;
+        const app = proof.apps.find(candidate => mark === proof.token + '.' + candidate);
+        observations.push({ url: entry.name, port, app: !expectedGateway || gateway === expectedGateway ? app : null });
+      }
+    } catch {
+      // Different-origin frames may have inaccessible timing entries.
+    }
+  }
+  const resources = [];
+  for (const app of proof.apps) {
+    const current = observations.filter(row => row.app === app);
+    if (!current.length) return { missing: [app] };
+    const ports = new Set(current.map(row => row.port));
+    if (observations.some(row => ports.has(row.port) && !row.app)) return { stale: app };
+    resources.push({ app, url: current[0].url });
+  }
+  return { resources };
+}
+
 async function checkPage(browser, options, scenario) {
-  const { baseUrl, loginPath, platformPath, entryPath, workArea, username, checks, resources, postMerge } = options;
-  if (!checks?.length) throw new Blocked('test-data-profile');
+  const { baseUrl, loginPath, platformPath, entryPath, workArea, username, checks, resources, postMerge, launchProof } = options;
+  if (!launchProof && !checks?.length) throw new Blocked('test-data-profile');
   const platform = new URL(platformPath, baseUrl).href;
   const login = new URL(loginPath, baseUrl).href;
   const entry = new URL(entryPath, baseUrl).href;
@@ -166,6 +199,53 @@ async function checkPage(browser, options, scenario) {
     const clicked = await evaluate(`(() => { const target = composedMatches(${JSON.stringify(selector)})[0]; if (!target) return false; target.click(); return true; })()`);
     return clicked;
   };
+  if (options.workAreaPath) {
+    const areaPage = new URL(options.workAreaPath, baseUrl).href;
+    await browser.navigate(login);
+    let submitted = false;
+    let redirected = false;
+    await until(async () => {
+      const state = await inspect();
+      if (state.url === areaPage && !state.login) {
+        return evaluate("composedMatches('.work-area-list-wrapper .el-table__body').length > 0");
+      }
+      if (state.login && state.url === login && !submitted) {
+        if (!state.autofilled) {
+          let credentials;
+          try { credentials = JSON.parse(readFileSync(options.loginFile, 'utf8').replace(/^\uFEFF/, '')); }
+          catch { throw new Blocked('waiting-login'); }
+          if (credentials.username !== username || !credentials.password) throw new Blocked('waiting-login');
+          const filled = await evaluate(`(() => {
+            if (location.href !== ${JSON.stringify(login)}) return false;
+            const user = composedMatches('.login-form-wrapper .large-username input')[0];
+            const password = composedMatches('.login-form-wrapper input[type=password]')[0];
+            if (!user || !password) return false;
+            for (const [field, value] of [[user,${JSON.stringify(username)}],[password,${JSON.stringify(credentials.password)}]]) {
+              field.value = value;
+              field.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            return true;
+          })()`).catch(() => false);
+          if (!filled) return false;
+        }
+        submitted = await click('.login-form-wrapper .large-button');
+      } else if (!state.login && state.url === platform && !redirected) {
+        redirected = true;
+        await browser.navigate(areaPage);
+      }
+      return false;
+    }, 'waiting-login', undefined, 30000);
+    const rowName = '.work-area-list-wrapper .el-table__body tbody tr td:first-child span';
+    const match = `(${exactText})(${JSON.stringify(rowName)},${JSON.stringify(workArea)})`;
+    await until(() => evaluate(`(() => { const node = ${match}; if (!node) return false; node.click(); return true; })()`),
+      'work-area', 'work-area-row');
+    await until(() => evaluate(`Boolean((${exactText})('.work-area-list-wrapper tr.current-row td:first-child span',${JSON.stringify(workArea)}))`),
+      'work-area', 'work-area-selection');
+    // ResizeObserver-backed lists can initialize at height zero in a background tab.
+    if (scenario && browser.activate && await browser.evaluate('document.visibilityState') === 'hidden') {
+      await browser.activate();
+    }
+  }
   await browser.navigate(entry);
   let submitted = false;
   let checkedLoginPage = false;
@@ -192,7 +272,9 @@ async function checkPage(browser, options, scenario) {
     throw error;
   }
 
-  if (workArea && session.workArea !== workArea) {
+  if (options.workAreaPath) {
+    await until(async () => (await inspect()).workArea === workArea, 'work-area', 'business-page-work-area');
+  } else if (workArea && session.workArea !== workArea) {
     await browser.navigate(platform);
     await until(() => click('.work-area-selector .selector-trigger'), 'work-area', 'work-area-trigger');
     const item = `(${exactText})('.work-area-selector-dropdown [role="menuitem"]',${JSON.stringify(workArea)})`;
@@ -233,6 +315,21 @@ async function checkPage(browser, options, scenario) {
   }
 
   const verifyResources = async () => {
+    if (launchProof) {
+      const query = '(' + loadedLaunch + ')(' + JSON.stringify(launchProof) + ',' +
+        JSON.stringify(options.gatewayHash || '') + ')';
+      let app = launchProof.apps[0];
+      const observed = await until(async () => {
+        const result = await browser.evaluate(query);
+        if (result?.stale) throw new Blocked('candidate-resource', result.stale);
+        if (result?.missing) app = result.missing[0];
+        return result?.resources;
+      }, 'candidate-resource').catch(error => {
+        if (!error.check) error.check = app;
+        throw error;
+      });
+      return observed;
+    }
     const verified = [];
     for (const { app, url, sha256 } of resources || []) {
       const target = JSON.stringify(url);
@@ -255,7 +352,9 @@ async function checkPage(browser, options, scenario) {
     }
     return verified;
   };
-  const verifiedResources = await verifyResources();
+  const evidence = launchProof ? { version_attestation: 'launch' } :
+    { candidate_resources: await verifyResources() };
+  if (options.workAreaPath) evidence.work_area = workArea;
   let scenarioCases;
   if (scenario) {
     let scenarioError;
@@ -265,13 +364,15 @@ async function checkPage(browser, options, scenario) {
       scenarioError = error;
     }
     await authenticatedLocation();
-    if (postMerge) await verifyResources();
-    if (scenarioError) return { ...scenarioResult(scenarioError), checks: passedChecks, candidate_resources: verifiedResources };
+    if (launchProof && scenarioError?.stage === 'candidate-resource') return scenarioResult(scenarioError);
+    if (postMerge) evidence.candidate_resources = await verifyResources();
+    if (scenarioError) return { ...scenarioResult(scenarioError), checks: passedChecks, ...evidence };
   }
   return { status: 'passed', stage: scenario ? 'acceptance' : 'preflight', checks: passedChecks,
+    ...(options.workAreaPath ? { work_area: workArea } : {}),
     ...(foregroundRetry ? { foreground_retry: true } : {}),
     ...(Array.isArray(scenarioCases) ? { scenario_cases: scenarioCases } : {}),
-    ...(scenario ? { candidate_resources: verifiedResources } : {}) };
+    ...(scenario ? evidence : {}) };
 }
 
 async function runSession(call, options, scenario) {
@@ -292,7 +393,18 @@ async function runSession(call, options, scenario) {
       if (destination.origin !== options.baseUrl) throw new Blocked('entry');
       return send('navigate', { url: destination.href });
     },
-    click: selector => send('computer', { action: 'click', selector }),
+    async click(selector) {
+      // The host's CSS click addresses the top document. Micro-frontend controls
+      // can live in an iframe or shadow root even though they are visible.
+      const nested = await this.evaluate(`(() => {
+        const nodes = (${composedMatches})(${JSON.stringify(selector)});
+        const el = nodes.find(node => node.getClientRects().length && getComputedStyle(node).visibility === 'visible');
+        if (!el || el.getRootNode() === document) return false;
+        el.click();
+        return true;
+      })()`);
+      if (!nested) await send('computer', { action: 'click', selector });
+    },
     input: (selector, value) => send('form_input', { selector, value }),
     wait: args => send('wait', args),
     async activate() {

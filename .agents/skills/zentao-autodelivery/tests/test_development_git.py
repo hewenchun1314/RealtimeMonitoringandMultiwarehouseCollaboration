@@ -57,11 +57,44 @@ class DevelopmentGitTests(unittest.TestCase):
         return run_development_git(marker, self.d.database, self.config_path, self.d.root, recover=True)
 
     def test_branch_prepare_is_a_status_only_batch_handoff(self):
-        with patch('workflow.prepare_local_worktree') as mutate:
-            result = self.request('branch_prepare', application=self.d.key,
-                                  desktop_reconciliation={'status': 'unavailable', 'evidence': 'fixture'})
+        result = self.request('branch_prepare', application=self.d.key)
         self.assertEqual(result['status'], 'host_git_worker_required')
-        mutate.assert_not_called()
+        self.assertFalse((self.d.database.parent / 'worktrees').exists())
+
+    def test_host_broker_returns_real_prepared_worktree_without_finishing_chat(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        import os
+        import git_broker
+
+        request = self.request('branch_prepare')
+        database = self.d.database
+        with closing(sqlite3.connect(database)) as conn:
+            conn.row_factory = sqlite3.Row
+            item = dict(conn.execute('SELECT * FROM work_items WHERE item_id=17').fetchone())
+        git_broker.prepare(database)
+        fields = {'item': self.d.item, **self.d.binding, 'attempt_id': self.attempt['attempt_id'],
+                  'phase': self.attempt['phase']}
+        stop = Event()
+        key = 'ZENTAO_GIT_BROKER_TURN'
+        previous = os.environ.get(key)
+        if previous is None:
+            self.addCleanup(os.environ.pop, key, None)
+        else:
+            self.addCleanup(os.environ.__setitem__, key, previous)
+        os.environ[key] = 'live-turn'
+        with patch('desktop_runtime.runtime_check', return_value={'status': 'runtime_unattended'}), \
+                ThreadPoolExecutor(1) as executor:
+            broker = executor.submit(git_broker.service, 'live-turn', item, database, self.config_path,
+                                     self.d.root, stop)
+            try:
+                receipt = git_broker.wait_for_receipt(request, fields, database, self.d.config, self.d.root)
+                self.assertEqual(receipt['status'], 'host_git_completed', receipt)
+                proof = receipt['repositories'][self.d.key]
+                self.assertEqual(git(Path(proof['worktree']), 'rev-parse', 'HEAD'), proof['base_commit'])
+            finally:
+                stop.set()
+            broker.result(timeout=5)
 
     def test_host_preparation_returns_verified_deterministic_worktree(self):
         request = self.request('branch_prepare')
@@ -90,6 +123,7 @@ class DevelopmentGitTests(unittest.TestCase):
     def begin_coding(self):
         self.request('branch_prepare')
         prepared = self.host()
+        self.assertEqual(prepared['status'], 'host_git_completed', prepared)
         proof = prepared['repositories'][self.d.key]
         self.d.worktrees[self.side] = Path(proof['worktree'])
         self.d.finish(self.side + '.branch_check', self.attempt, {'repositories': prepared['repositories']})

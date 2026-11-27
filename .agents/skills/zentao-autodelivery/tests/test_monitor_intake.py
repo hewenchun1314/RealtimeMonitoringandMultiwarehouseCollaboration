@@ -198,11 +198,7 @@ class MonitorIntakeTests(WorkflowFixture):
         with closing(sqlite3.connect(self.database)) as conn:
             self.assertEqual(json.loads(conn.execute('SELECT source FROM work_item_sources').fetchone()[0]), latest)
 
-    def test_product_only_story_review_and_worker_use_original_source(self):
-        from story_review_remote import StoryReviewRemote
-        remote = StoryReviewRemote.__new__(StoryReviewRemote)
-        remote.config = self.config
-        self.assertTrue(remote.in_project({'project_id': '1', 'item_id': '2'}, {'product': 2}))
+    def test_product_only_worker_uses_original_source(self):
         self.scan('baseline', [])
         row = {**self.row(2, kind='bug'), 'source': {'project_id': '0', 'product_id': '2'}}
         self.scan('first', [row])
@@ -236,9 +232,7 @@ class MonitorIntakeTests(WorkflowFixture):
               patch.object(monitor, 'DATABASE_PATH', self.database),
               patch.object(monitor, 'PROJECT_ROOT', self.fixture),
               patch.object(monitor, 'run', side_effect=invoke),
-              patch.object(monitor, 'get_remote', return_value=SimpleNamespace(session=Session(self.lists))),
-              patch.object(monitor, '_credentials', return_value=('Test-user', 'secret')),
-              patch.object(monitor, 'os', SimpleNamespace(environ={'CODEX_THREAD_ID': 'fixture-chat'})),
+              patch.object(monitor, 'get_remote', return_value=SimpleNamespace(session=Session(self.lists), account='Test-user')),
               patch('sys.argv', ['monitor.py']), redirect_stdout(output)):
             self.assertEqual(monitor.main(), 1)
         result = json.loads(output.getvalue())

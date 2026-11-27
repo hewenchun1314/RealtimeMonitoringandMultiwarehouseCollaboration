@@ -36,6 +36,20 @@ class RouteExecutionTests(WorkflowFixture):
         self.assertEqual(result['route']['source'], 'config')
         self.assertEqual(result['route']['material']['markers'], ['前后端'])
 
+    def test_reviewing_story_with_material_can_go_straight_to_local_development(self):
+        self.config['zentao']['accepted_statuses']['story'].append('reviewing')
+        self.scan('baseline', [])
+        self.scan('next', [{**self.row(2), 'status': 'reviewing'}])
+        context = {'request_id': self.reserve(2, status='reviewing')['request_id'], 'chat_id': 'chat-2'}
+        self.record('bind', **context, desktop_project_id='desktop-1')
+        self.record('start', **context)
+        step = self.finish_stage(context, 'material_check', evidence={'path': 'example/intent.md'})
+        self.assertEqual(step['next_stage'], 'split', step)
+        split = {'tasks': {'frontend': [{'id': 'F1', 'description': 'Render', 'acceptance': ['Visible']}]}}
+        self.assertEqual(self.finish_stage(context, 'split', evidence=split)['next_stage'], 'frontend.design')
+        with closing(sqlite3.connect(self.database)) as conn:
+            self.assertEqual(conn.execute('SELECT DISTINCT operation_type FROM writebacks').fetchall(), [('comment',)])
+
     def configure_backend_dependencies(self):
         self.config['workspaces']['backend'] = 'backend'
         service = {'branch': 'main', 'build_command': 'build', 'test_command': 'test',

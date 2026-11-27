@@ -1,7 +1,6 @@
 {
   "zentao": {
     "base_url": "http://127.0.0.1:8088",
-    "credential_ref": "windows-dpapi:dotflow/zentao",
     "project_name": "海能发地质工程一体化",
     "scope_mode": "project_or_product",
     "product_id": "2",
@@ -25,14 +24,10 @@
     "codex_model": "gpt-6.1-sol",
     "codex_reasoning_effort": "xhigh",
     "sync_requirement_before_review": true,
-    "story_review_sync": true,
     "streamlined_bug_intake": true,
-    "split_task_sync": true,
-    "split_task_progress_sync": true,
     "git_push_enabled": true,
-    "desktop_project_id": "452b5f3f-e0a2-4860-b706-90cd094b37d0",
     "require_unattended_approval": true,
-    "worker_cache_paths": ["~/.m2/repository", "%LOCALAPPDATA%/npm-cache"],
+    "worker_cache_paths": ["~/.m2/repository"],
     "worker_git_write_repositories": [
       "backend:smart-geo",
       "backend:model-manage-srv",
@@ -73,9 +68,9 @@
         "image_repository": "hzhub.tracyenergy.cn:6443/internalrd/tet-micro-data-pool-web-new",
         "base_image": "hzhub.tracyenergy.cn:6443/internalrd/tet-micro-data-pool-web-new@sha256:f7016bb60da56ef4e188f62d63d7e9bec72746122a8595c039acf6a468c0d09b",
         "platform": "linux/amd64",
-        "local_ports": [5000, 5001, 5002, 5004, 5005, 5006, 5010, 5013, 5150, 5151, 30001, 30042, 30043, 30044, 30046, 30047, 30049, 30102, 30103, 30112],
         "rancher": {
-          "mcp_url": "http://10.10.4.183:40140/mcp",
+          "kube_server": "https://10.10.4.151/k8s/clusters/c-m-wh2j6p2w",
+          "kube_context": "tet-k8s",
           "cluster_id": "c-m-wh2j6p2w",
           "namespace": "internalrd",
           "deployment": "cnooced-suite-web",
@@ -147,10 +142,10 @@
         "smart-geo": {
           "repository": "smart-geo",
           "branch": "AI-development",
-          "build_command": "mvn -B -pl smart-geo/smart-geo-server -am -DskipTests package",
-          "test_command": "mvn -B -pl smart-geo/smart-geo-server -am test",
-          "start_command": "java -jar (Get-Item 'smart-geo-server/target/smart-geo-server-*.jar').FullName --server.address=127.0.0.1 --server.port=18081",
-          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18081/tet/smart-geo/actuator/health'",
+          "build_command": ["mvn", "-B", "-pl", "smart-geo/smart-geo-server", "-am", "-DskipTests", "package"],
+          "test_command": ["mvn", "-B", "-pl", "smart-geo/smart-geo-server", "-am", "test"],
+          "start": {"argv": ["java", "-jar", "{jar}", "--server.address=127.0.0.1", "--server.port=18081"], "jar": "smart-geo-server/target/smart-geo-server-*.jar"},
+          "acceptance": {"url": "http://127.0.0.1:18081/tet/smart-geo/actuator/health", "timeout_seconds": 10},
           "deployment": {
             "enabled": true,
             "target": "internalrd-test",
@@ -164,7 +159,8 @@
                 "image_repository": "internalrd/smart-geo-srv",
                 "platform": "linux/amd64",
                 "cluster_id": "c-m-wh2j6p2w",
-                "mcp_url": "http://10.10.4.183:40140/mcp",
+                "kube_server": "https://10.10.4.151/k8s/clusters/c-m-wh2j6p2w",
+                "kube_context": "tet-k8s",
                 "namespace": "internalrd",
                 "deployment": "smart-geo-new",
                 "container": "smart-geo-new",
@@ -177,34 +173,34 @@
         "model-manage-srv": {
           "repository": "model-manage-srv",
           "branch": "AI-development",
-          "build_command": "mvn -B -pl model-manage-srv/app -am -DskipTests package",
-          "test_command": "mvn -B -pl model-manage-srv/app -am test",
-          "start_command": "java -jar (Get-Item 'app/target/app-*.jar').FullName --server.address=127.0.0.1 --server.port=18082",
-          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18082/tet/model-manage/api/v3/api-docs'"
+          "build_command": ["mvn", "-B", "-pl", "model-manage-srv/app", "-am", "-DskipTests", "package"],
+          "test_command": ["mvn", "-B", "-pl", "model-manage-srv/app", "-am", "test"],
+          "start": {"argv": ["java", "-jar", "{jar}", "--server.address=127.0.0.1", "--server.port=18082"], "jar": "app/target/app-*.jar"},
+          "acceptance": {"url": "http://127.0.0.1:18082/tet/model-manage/api/v3/api-docs", "timeout_seconds": 10}
         },
         "task-manage-grpc": {
           "repository": "task-manage-grpc",
           "branch": "AI-development",
-          "build_command": "mvn -B -pl task-manage-server -am -DskipTests package",
-          "test_command": "mvn -B -pl task-manage-server -am test",
-          "start_command": "java -jar (Get-Item 'task-manage-server/target/task-manage-server-*.jar').FullName --server.address=127.0.0.1 --server.port=18083",
-          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:18083/actuator/health'"
+          "build_command": ["mvn", "-B", "-pl", "task-manage-server", "-am", "-DskipTests", "package"],
+          "test_command": ["mvn", "-B", "-pl", "task-manage-server", "-am", "test"],
+          "start": {"argv": ["java", "-jar", "{jar}", "--server.address=127.0.0.1", "--server.port=18083"], "jar": "task-manage-server/target/task-manage-server-*.jar"},
+          "acceptance": {"url": "http://127.0.0.1:18083/actuator/health", "timeout_seconds": 10}
         },
         "tet-task-manager": {
           "repository": "tet-task-manager",
           "branch": "AI-development",
-          "build_command": "dotnet build Tet.TaskManager.sln",
-          "test_command": "dotnet test Tet.TaskManager.Tests/Tet.TaskManager.Tests.csproj",
-          "start_command": "dotnet run --no-build --project Tet.TaskManager.WebApi/Tet.TaskManager.WebApi.csproj --launch-profile http",
-          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1/swagger/v1/swagger.json'"
+          "build_command": ["dotnet", "build", "Tet.TaskManager.sln"],
+          "test_command": ["dotnet", "test", "Tet.TaskManager.Tests/Tet.TaskManager.Tests.csproj"],
+          "start": {"argv": ["dotnet", "run", "--no-build", "--project", "Tet.TaskManager.WebApi/Tet.TaskManager.WebApi.csproj", "--launch-profile", "http"]},
+          "acceptance": {"url": "http://127.0.0.1:5166/swagger/v1/swagger.json", "timeout_seconds": 10}
         },
         "model-python": {
           "repository": "model-python",
           "branch": "AI-development",
-          "build_command": "uv run --frozen python -m compileall -q app",
-          "test_command": "uv run --frozen pytest -q",
-          "start_command": "uv run --frozen uvicorn app.main:app --host 127.0.0.1 --port 5111",
-          "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:5111/version'"
+          "build_command": ["uv", "run", "--frozen", "python", "-m", "compileall", "-q", "app"],
+          "test_command": ["uv", "run", "--frozen", "pytest", "-q"],
+          "start": {"argv": ["uv", "run", "--frozen", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "5111"]},
+          "acceptance": {"url": "http://127.0.0.1:5111/version", "timeout_seconds": 10}
         }
       }
     },
@@ -229,21 +225,32 @@
       "used_by": ["smart-geo"],
       "delivery": {
         "branch": "AI-development",
-        "build_command": "dotnet build DPWebApi/DPWebApi.csproj --configuration Release",
-        "test_command": "dotnet test Tet.UnitTests/Tet.UnitTests.csproj --configuration Release",
-        "start_command": "$env:DOTNET_ENVIRONMENT='localzzg'; $env:ASPNETCORE_ENVIRONMENT='localzzg'; $env:useSwagger='true'; dotnet run --no-build --no-launch-profile --configuration Release --project DPWebApi/DPWebApi.csproj -- --urls http://127.0.0.1:19085",
-        "acceptance_command": "Invoke-RestMethod -TimeoutSec 10 'http://127.0.0.1:19085/swagger/v1/swagger.json'"
+        "build_command": ["dotnet", "build", "DPWebApi/DPWebApi.csproj", "--configuration", "Release"],
+        "test_command": ["dotnet", "test", "Tet.UnitTests/Tet.UnitTests.csproj", "--configuration", "Release"],
+        "start": {"argv": ["dotnet", "run", "--no-build", "--no-launch-profile", "--configuration", "Release", "--project", "DPWebApi/DPWebApi.csproj", "--", "--urls", "http://127.0.0.1:19085"], "env": {"DOTNET_ENVIRONMENT": "localzzg", "ASPNETCORE_ENVIRONMENT": "localzzg", "useSwagger": "true"}},
+          "acceptance": {"url": "http://127.0.0.1:19085/swagger/v1/swagger.json", "timeout_seconds": 10}
       }
     }
   },
+  "e2e_attestation": "launch",
   "e2e": {
     "enabled": true,
     "after_integration": true,
     "startup_ports": [5000, 5001, 5004, 5006, 5010, 5150, 30001, 30042, 30043, 30044, 30046, 30047, 30049, 30102, 30103, 30105, 30112],
     "workspace": "frontend",
-    "start_command": "npm run serve-shell-hub --gateway=http://10.10.4.140:31111/",
+    "start_command": ["npm", "run", "serve-shell-hub", "--gateway=http://10.10.4.140:31111/"],
+    "startup_routes": {
+      "/aggregation-platform/shell-hub/data-preprocessing?preprocessingTab=crossplot": {
+        "aggregation-platform": ["serve", 5000],
+        "sso": ["serve", 5150],
+        "shell-hub": ["dev", 5010],
+        "tet-smart-log": ["serve", 30043],
+        "micro-pure-model-page": ["serve", 30044]
+      }
+    },
     "ready_url": null,
     "platform_entry_path": "/aggregation-platform/sso/home-page/platform",
+    "work_area_path": "/aggregation-platform/sso/home-page/work-area",
     "agentlimb": {
       "browser": "Profile-744b45",
       "intake_gate": false,
@@ -275,29 +282,28 @@
     "zentao": {
       "base_url / project_name": "禅道实例地址和要监测的项目名称。",
       "scope_mode / product_id / product_name": "project_or_product 表示所属项目匹配 project_name，或所属产品匹配 product_id 与 product_name，任一成立即可接收；不填 scope_mode 时仍仅按项目。原单项目可为空，不修改原始归属；指派人、状态及类型过滤继续生效。",
-      "credential_ref": "访问禅道时使用的本机凭据引用。",
       "assigned_to_accounts": "只接收指派给所列账号的工单，账号区分大小写。空数组暂停领取新单。",
       "accepted_statuses": "story 填需求状态，bug 填缺陷状态。某类的状态数组为空时跳过该类扫描。"
     },
     "workspaces": "路径相对于本配置文件所在的 .agents 目录。requirement 指向需求材料仓库，frontend 指向前端工作区，backend 指向 srv-workspace 后端父仓。",
     "backend_dependencies": "后端的按需依赖。access 省略时为 read_only。writable 需要 delivery 登记目标分支、构建、单测、验收及启动命令或服务地址，工单按依赖键选择修改目标。source_path 相对于本配置文件，api_source 相对于依赖目录，used_by 填消费方服务键。",
-    "monitor": "enabled 控制新单扫描和领取。interval_minutes 以分钟表示期望的监测间隔；实际唤醒时间由 Codex 桌面定时任务决定。",
-    "runtime": "desktop_project_id 用于绑定工单会话。require_unattended_approval 启用无人值守权限核验。streamlined_bug_intake 让新领取的 Bug 由主工单在接单时一次核对范围，随后直接准备分支。split_task_sync 控制拆分任务建单、关闭及重开。split_task_progress_sync 为新领取 Story 增加实际开工和阻塞备注回写。已领工单沿用快照。",
+    "monitor": "enabled 控制新单扫描和领取。interval_minutes 是持续监测时两轮扫描之间的分钟数。",
+    "runtime": "require_unattended_approval 核验工单会话的无人值守权限。streamlined_bug_intake 允许直接核对 Bug 后准备分支。",
     "development": {
       "max_concurrent_items": "同时占用执行名额的工单上限。",
       "max_retries_per_step": "每一步首次尝试失败后允许重试的次数。填 3 表示首次执行加最多 3 次重试。",
       "frontend_bundle": "name 是前端应用组名称。applications 的键供开发计划引用；每个应用的 repository 相对于 workspaces.frontend，点号表示工作区根仓库。branch 是分支核验和最终合回的目标分支。",
-      "backend_bundle": "services 登记可独立运行的服务。repository 相对于 workspaces.backend，branch 取自 srv-workspace/submodule-branch.txt。当前纯前端配置下跳过这些服务。",
+      "backend_bundle": "services 登记可独立运行的服务。repository 相对于 workspaces.backend，branch 取自 srv-workspace/submodule-branch.txt。",
       "backend_bundle.build_command / test_command": "smart-geo 和 model-manage-srv 的 Maven 命令在本单的 reactor 根目录运行，以 srv-workspace/pom.xml 为聚合清单，并将相应模块指向已核验的候选工作树。其余服务在各自工单工作树根目录运行。tet-common-java 和 tet-dbprovider-java 的跟踪分支均为 AI-development，作为公共库按需解析。",
-      "backend_bundle.start_command / acceptance_command": "启动命令使用 PowerShell，从相应服务的候选工作树根目录执行。Java 服务需先完成打包。验收命令是本地连通性检查；工单测试另按改动验证业务场景及实际运行版本。model-python 的默认入口为 HTTP API，涉及训练 Worker 的工单按该仓库 ReadMe.md 启动和验证 gRPC Worker。",
+      "backend_bundle.start / acceptance": "在服务候选工作树执行启动参数 argv，env 传递环境变量，Java 的 jar 指定唯一产物。验收读取 acceptance.url，业务验证另按本单用例执行。",
       "step_timeout_minutes": "每个阶段单次尝试的最长分钟数。默认拆分用 plan 时限，后端功能验收用 e2e 时限，跨端交接用 integration 时限。"
     },
     "e2e": {
       "enabled": "true 执行前端页面验收，false 跳过页面验收并继续合回。缺省为 true。仅对新领取工单生效，已领取工单沿用原配置快照。",
-      "workspace / start_command": "前端页面验收使用的工作区键，以及服务尚未运行时的启动命令。",
+      "workspace / start_command": "前端页面验收使用的工作区键，以及启动本单前端服务的命令参数。",
       "ready_url / platform_entry_path": "ready_url 可指定前端服务地址；为 null 时从启动输出或现有页面确认。platform_entry_path 是登录后进入平台的页面路径。",
       "agentlimb": "browser 是此工作区在 AgentLimb 中指定的 Chrome 配置 ID 或名称。intake_gate 控制派发前是否强制通过浏览器诊断。preflight_origin、preflight_entry_path、preflight_checks 和 preflight_startup_ports 用于诊断。正式验收使用本轮候选服务和资源指纹。",
-      "login": "path 是登录页路径，username 是测试账号，credential_ref 指向该账号的本机凭据。",
+      "login": "path 是登录页路径，username 是测试账号，浏览器使用已配对的登录会话。",
       "default_work_area": "页面验收默认进入的业务工区，id 用于定位，name 用于核对名称。"
     }
   }

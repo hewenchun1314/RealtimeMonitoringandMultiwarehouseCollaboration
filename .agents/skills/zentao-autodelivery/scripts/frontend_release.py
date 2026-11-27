@@ -10,7 +10,8 @@ import subprocess
 import tarfile
 import tempfile
 
-from backend_deploy import DeploymentError, command, remote_image, required_digest
+from runtime_paths import LOCAL_DIRECTORY
+from backend_deploy import DeploymentError, Kubernetes, command, remote_image, required_digest
 from deploy_state import COMMIT, FRONTEND_PROFILE, TAG
 from rancher_mcp import RancherMcpError, current_image, update_and_verify
 from stage_runner import write_json
@@ -79,20 +80,6 @@ def synchronize_branch(root, branch, sha, *, allow_push=True):
     return remote
 
 
-def verify_ports_stopped(ports):
-    table = command('netstat', '-ano', timeout=20).stdout
-    occupied = []
-    for line in table.splitlines():
-        fields = line.split()
-        if len(fields) != 5 or fields[0] != 'TCP' or fields[2] not in ('0.0.0.0:0', '[::]:0'):
-            continue
-        number = fields[1].rpartition(':')[2]
-        if number.isdecimal() and int(number) in ports:
-            occupied.append(f'{number} (PID {fields[-1]})')
-    if occupied:
-        raise DeploymentError('本地前端端口仍被占用：' + '、'.join(sorted(set(occupied))))
-
-
 def verify_toolchain(request):
     tools = Path(request['release_dir'])
     for name in ('bundle-build.cjs', 'patch_image_html_dirs.py'):
@@ -141,7 +128,8 @@ def build_archive(request, folder):
             '--non-interactive', '--skip-checkout', '--skip-pull', '--skip-preselect-fetch',
             '--no-cache', '--install', '--no-push', '--image-tar', str(base),
             '--image-tar-out', str(archive), '--out', str(folder / 'bundle')]
-    result = subprocess.run(argv, cwd=bundle, stdin=subprocess.DEVNULL, check=False)
+    env = {**os.environ, 'npm_config_cache': str(LOCAL_DIRECTORY / 'npm-cache')}
+    result = subprocess.run(argv, cwd=bundle, env=env, stdin=subprocess.DEVNULL, check=False)
     if result.returncode:
         raise DeploymentError(f'customized-release 构建失败 (exit {result.returncode})')
     return archive
@@ -164,18 +152,19 @@ def tag_for(request):
     return f'{settings["image_repository"]}:{fingerprint}-{FRONTEND_PROFILE}'
 
 
-def release_base(settings, saved):
+def release_base(settings, saved, kube=None):
     target = settings.get('rancher')
     if not target:
         return settings['base_image'], None
     if saved:
         return saved['base_image'], saved['expected_previous_image']
-    before = current_image(target, settings['base_image'])
+    before = kube.preflight() if kube else current_image(target, settings['base_image'])
     repo = settings['image_repository']
-    if before.startswith(repo + '@'):
-        required_digest(before.partition('@')[2])
-    elif not TAG.fullmatch(before) or before.rsplit(':', 1)[0] != repo:
+    name, separator, digest = before.partition('@')
+    if not (separator and name == repo) and not (TAG.fullmatch(name) and name.rsplit(':', 1)[0] == repo):
         raise DeploymentError('Rancher 当前前端镜像不属于配置的 Harbor 仓库')
+    if separator:
+        required_digest(digest)
     current = remote_image(before, settings['platform'])
     if not current:
         raise DeploymentError('Harbor 中找不到 Rancher 当前前端镜像')
@@ -189,7 +178,12 @@ def publish(request, journal):
         saved = json.loads(journal.read_text(encoding='utf-8'))
     except FileNotFoundError:
         saved = {}
-    base_image, previous_image = release_base(settings, saved)
+    target = settings.get('rancher', {})
+    kube = Kubernetes(target) if target.get('kube_server') else None
+    if kube and saved:
+        kube.uid = saved['deployment_uid']
+        kube.preflight()
+    base_image, previous_image = release_base(settings, saved, kube)
     settings = {**settings, 'base_image': base_image}
     request = {**request, 'settings': settings}
     image = tag_for(request)
@@ -197,6 +191,8 @@ def publish(request, journal):
         raise DeploymentError('Existing release receipt does not match the requested image or versions')
     expected = saved.get('config_digest')
     result = {'image': image, 'versions': versions, 'remote_versions': {}, 'base_image': base_image}
+    if kube:
+        result['deployment_uid'] = kube.uid
     if previous_image:
         result['expected_previous_image'] = previous_image
     for key in ('digest', 'mcp_baseline', 'rancher'):
@@ -215,8 +211,6 @@ def publish(request, journal):
         except DeploymentError as error:
             raise DeploymentError(f'{key}: {error}') from error
         write_json(journal, result)
-    verify_ports_stopped(settings['local_ports'])
-    result['stopped_ports'] = settings['local_ports']
     write_json(journal, result)
     observed = remote_image(image, settings['platform'])
     if observed and observed['config_digest'] != expected:
@@ -250,7 +244,15 @@ def publish(request, journal):
             result.update(fields)
             write_json(journal, result)
 
-        proof = update_and_verify(target, ref, result, record)
+        if kube:
+            current = kube.current_image()
+            if current != ref:
+                kube.update(previous_image, ref)
+            elif not saved.get('digest') or previous_image == ref:
+                raise DeploymentError('Deployment already uses the candidate without a prior release receipt')
+            proof = kube.verify_rollout(ref, {observed['digest'], observed['platform_digest'], expected})
+        else:
+            proof = update_and_verify(target, ref, result, record)
         record(rancher={'target': target, 'pod_verification': proof})
 
 

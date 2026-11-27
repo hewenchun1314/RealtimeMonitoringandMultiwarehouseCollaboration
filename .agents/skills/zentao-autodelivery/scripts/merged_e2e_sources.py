@@ -1,8 +1,11 @@
 """Pin the frontend sources used by a formal post-merge browser run."""
 
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import shutil
+import tempfile
 
 from branch_check import git
 
@@ -19,11 +22,32 @@ def check_merged_checkout(repository, branch, sha):
         raise ValueError('The recorded frontend repository or merged version has changed')
 
 
+def scenario_services(options, routes, versions):
+    if not options.get('automaticAttestation') or options.get('entryPath') not in routes:
+        return {}
+    scenario = json.loads(Path(options['scenario']).read_text(encoding='utf-8-sig'))
+    pages = {options['entryPath']}
+    for case in scenario.get('cases', [scenario]):
+        pages.update(step['path'] for step in case['steps'] if step['action'] == 'navigate')
+    if not pages.issubset(routes):
+        return {}
+    services = {}
+    for page in sorted(pages):
+        services.update(routes[page])
+    return services if versions.keys() <= services.keys() else {}
+
+
 def merged_workspace(options, config, branches, versions):
     root = Path(options['workspace']).resolve(strict=True)
     if not versions or branches.keys() != versions.keys():
         raise ValueError('Acceptance requires the recorded merged versions')
     applications = config['development']['frontend_bundle']['applications']
+    routes = config.get('e2e', {}).get('startup_routes', {})
+    services = scenario_services(options, routes, versions)
+    options.pop('startupServices', None)
+    if services:
+        options['startupServices'] = [
+            (applications[app]['repository'], script, port) for app, (script, port) in services.items()]
     planned = {}
     for app, sha in versions.items():
         application, proof = applications[app], branches[app]
@@ -33,14 +57,14 @@ def merged_workspace(options, config, branches, versions):
             raise ValueError('Merged checkout must match the configured application and target branch')
         planned[checkout] = (application['branch'], sha)
 
-    # The shell's npm script starts sibling applications even for a one-app task.
-    # Record every installed configured repository, including the host shell.
+    # The default startup command also serves the installed sibling applications.
     roots = {root, *planned}
-    for application in applications.values():
+    for app in services or applications:
+        application = applications[app]
         checkout = (root / application['repository']).resolve()
         if not checkout.is_relative_to(root):
             raise ValueError('Frontend application is outside the configured workspace')
-        if (checkout / '.git').exists():
+        if services or (checkout / '.git').exists():
             roots.add(checkout)
     result = {}
     for checkout in sorted(roots, key=lambda path: (len(path.parts), path)):
@@ -68,26 +92,35 @@ def checkout_matches_runtime(root, sha, *, include_untracked):
                    '--ignore-submodules=untracked', timeout=60)
 
 
-def prepare_committed_sources(options, destination):
+def short_checkout_paths(stage_folder):
+    # A recovery process can derive the same paths without trusting an absolute
+    # deletion target from a receipt. Different host attempts never share them.
+    identity = os.fsencode(os.path.normcase(str(stage_folder.resolve(strict=True))))
+    suffix = sha256(identity).hexdigest()[:24]
+    root = Path(tempfile.gettempdir()).resolve(strict=True)
+    return root / ('zt-src-' + suffix), root / ('zt-git-' + suffix)
+
+
+def prepare_committed_sources(options, stage_folder):
     checkouts = options.get('mergedCheckouts', {})
-    if not options.get('forceCommittedSources') and all(
-            checkout_matches_runtime(row['repository'], row['sha'], include_untracked=True) for row in checkouts.values()):
-        return None
     main = Path(options['workspace']).resolve(strict=True)
-    if destination.exists() or destination.resolve() != destination:
+    # Legacy profiles include absolute checkout paths in Vite response hashes.
+    short = options.get('automaticAttestation')
+    destination, git_storage = (short_checkout_paths(stage_folder) if short else
+                                (stage_folder / 'frontend-source', stage_folder / 'frontend-git'))
+    ownership = stage_folder / ('frontend-short.owner' if short else 'frontend-source.owner')
+    if os.path.lexists(ownership) or os.path.lexists(destination) or destination.resolve() != destination:
         raise ValueError('Formal frontend sources require a new attempt-owned directory')
-    destination.mkdir()
-    ownership = destination.parent / 'frontend-source.owner'
+    destination.mkdir(mode=0o700)
     with ownership.open('x', encoding='ascii') as receipt:
         receipt.write(str(destination.stat().st_ino))
     # Keep Git's object/alternates paths short even for long application names.
     # This sibling belongs to the same host attempt and has independent proof.
-    git_storage = destination.parent / 'frontend-git'
-    git_ownership = destination.parent / 'frontend-git.owner'
+    git_ownership = stage_folder / 'frontend-git.owner'
     if (git_storage.resolve() != git_storage or os.path.lexists(git_storage)
             or os.path.lexists(git_ownership)):
         raise ValueError('Formal frontend Git storage requires a new attempt-owned directory')
-    git_storage.mkdir()
+    git_storage.mkdir(mode=0o700)
     with git_ownership.open('x', encoding='ascii') as receipt:
         receipt.write(str(git_storage.stat().st_ino))
     for index, row in enumerate(checkouts.values()):
@@ -119,15 +152,19 @@ def prepare_committed_sources(options, destination):
 
 def remove_committed_sources(stage_folder):
     """Called by the host after all processes in the stage job have stopped."""
-    destination = stage_folder / 'frontend-source'
-    ownership = stage_folder / 'frontend-source.owner'
+    ownership = stage_folder / 'frontend-short.owner'
+    if os.path.lexists(ownership):
+        destination, git_storage = short_checkout_paths(stage_folder)
+    else:
+        destination = stage_folder / 'frontend-source'
+        git_storage = stage_folder / 'frontend-git'
+        ownership = stage_folder / 'frontend-source.owner'
     if not ownership.is_file():
         return None
     try:
         if (destination.resolve() != destination or ownership.resolve() != ownership
                 or ownership.read_text(encoding='ascii') != str(destination.stat().st_ino)):
             return 'ownership-changed'
-        git_storage = stage_folder / 'frontend-git'
         git_ownership = stage_folder / 'frontend-git.owner'
         if os.path.lexists(git_storage) or os.path.lexists(git_ownership):
             if git_ownership.resolve() != git_ownership or not git_ownership.is_file():

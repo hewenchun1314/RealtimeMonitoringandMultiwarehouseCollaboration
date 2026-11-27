@@ -7,12 +7,15 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 from shutil import copy2, which
 import subprocess
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
+
+
+from runtime_paths import LOCAL_DIRECTORY
+from service_runtime import command_args
 
 
 COMMIT = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})\Z')
@@ -134,7 +137,7 @@ def build_image(request, tag):
     with TemporaryDirectory(prefix='zentao-publish-') as temp:
         root = Path(temp)
         reactor, worktree = build_workspace(request, root)
-        args = shlex.split(request['service_config']['build_command'])
+        args = command_args(request['service_config']['build_command'])
         if not args or args[0] not in ('mvn', 'mvn.cmd') or not set(args) & {'package', 'verify', 'install'}:
             raise DeploymentError('The publisher requires a configured Maven packaging command')
         command(*args, cwd=reactor)
@@ -206,13 +209,20 @@ def owned_by(resource, kind, uid):
 class Kubernetes:
     def __init__(self, target):
         self.context = target['kube_context']
+        self.connection = []
+        if server := target.get('kube_server'):
+            config = LOCAL_DIRECTORY / 'rancher-kubeconfig.yaml'
+            if not config.is_file():
+                raise DeploymentError('Missing .local/rancher-kubeconfig.yaml')
+            # Pin the API endpoint even if the local context or default config changes.
+            self.connection = ['--kubeconfig', str(config), '--server', server]
         self.namespace = target['namespace']
         self.name = target['deployment']
         self.container = target['container']
         self.uid = None
 
     def run(self, *args, timeout=90):
-        return command('kubectl', '--context', self.context, '--namespace', self.namespace, *args,
+        return command('kubectl', '--context', self.context, '--namespace', self.namespace, *args, *self.connection,
                        timeout=timeout).stdout
 
     def deployment(self):
@@ -285,7 +295,8 @@ class Kubernetes:
                 raise DeploymentError('A ready pod does not match the published image digest')
         if self.current_image() != reference:
             raise DeploymentError('Deployment image changed during runtime verification')
-        return {'deployment_uid': metadata['uid'], 'revision': revision, 'ready_replicas': desired}
+        return {'deployment_uid': metadata['uid'], 'revision': revision, 'ready_replicas': desired,
+                'image': reference, 'pods': sorted(pod['metadata']['name'] for pod in current)}
 
 
 def verify_http(target, sha):
@@ -303,13 +314,15 @@ def verify_http(target, sha):
     if credential:
         if origin.scheme != 'https' or not target.get('http_username'):
             raise DeploymentError('HTTP verification credentials require an HTTPS gateway and username')
-        from windows_credentials import windows_credential
+        credentials_file = LOCAL_DIRECTORY / 'backend-credentials.json'
         try:
-            auth = windows_credential(credential, target['http_username'])
-        except (OSError, AttributeError, ValueError):
+            auth = json.loads(credentials_file.read_text(encoding='utf-8-sig'))[credential]
+            if (auth['base_url'].rstrip('/') != gateway.rstrip('/')
+                    or auth['username'] != target['http_username']
+                    or not isinstance(auth['password'], str) or not auth['password']):
+                raise ValueError('Invalid version probe credential')
+        except (OSError, KeyError, TypeError, AttributeError, ValueError):
             raise DeploymentError('Version endpoint credential unavailable') from None
-        if not auth:
-            raise DeploymentError('Version endpoint credential unavailable')
         value = f'{auth["username"]}:{auth["password"]}'.encode('utf-8')
         headers['Authorization'] = 'Basic ' + b64encode(value).decode('ascii')
     connect = HTTPSConnection if origin.scheme == 'https' else HTTPConnection
@@ -382,6 +395,13 @@ def verify_published_release(receipt):
     from deploy_state import release_verification
 
     target = receipt['target']
+    if target.get('kube_server'):
+        verification = release_verification(receipt)
+        kube = Kubernetes(target)
+        kube.uid = receipt['pod_verification']['deployment_uid']
+        kube.verify_rollout(verification['image'], {receipt[key] for key in ('digest', 'platform_digest', 'config_digest')})
+        verify_mcp_health(target['health_url'])
+        return verification
     if not target.get('mcp_url'):
         return verify_http(target, receipt['sha'])
     verification = release_verification(receipt)
@@ -472,7 +492,12 @@ def publish(request):
             record('deployment_verification')
             pod = kube.verify_rollout(reference, {digest, platform_digest, config})
             record('gateway_verification', pod_verification=pod)
-            verification = verify_http(target, sha)
+            if target.get('kube_server'):
+                from deploy_state import release_verification
+                verify_mcp_health(target['health_url'])
+                verification = release_verification(receipt)
+            else:
+                verification = verify_http(target, sha)
         receipt.update(status='deployed', verification=verification, stage='complete')
         save_receipt(path, receipt)
         return receipt

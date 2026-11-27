@@ -1,41 +1,15 @@
-# Windows 工单启动器
+# 工单启动器
 
-领取后主会话读取该单快照与当前有效尝试。新单先检查材料、拆分任务，再执行账本选中的端；后端与前端各由开发、测试 Agent 交付证据，主会话负责两端分支核验和合回。跨端依赖与恢复细节见[步骤指引](stages.md)。沿原工单聊天续接时按账本阶段派工。
+从项目根目录执行 `python -B .agents/skills/zentao-autodelivery/scripts/worker.py` 并选择以下操作。启动器使用已登录 Codex，查找配置的 CLI 或系统 PATH，对实际工单启用非交互执行和配置的工作区权限。
 
-从项目根目录运行。启动器使用本机已安装并登录的 Codex App Server 发行版 CLI。每次 CLI 开工或恢复都显式传入 `--ask-for-approval never`。启动器持有工单锁，阶段运行器保留 stdout、stderr、终态和 Windows 进程清理证据。
+| 操作 | 用途 |
+|---|---|
+| `probe` | 在临时会话里实际读取项目文件，核对命令、退出码、回合结束及进程清理。 |
+| `git-preflight` | 非交互核对需求 Git 上游和读取权限。 |
+| `e2e-preflight` | 诊断本机的前端服务、测试浏览器和登录状态。 |
+| `prepare --marker <marker>` | 只对已预占且尚未绑定的工单创建就绪会话，从启动回执读回会话 ID。 |
+| `run --marker <marker>` | 恢复账本绑定的原会话，核对本单锁、权限、尝试和阶段后继续。 |
 
-Windows MXC 在可写工作区内仍会保护 Git 元数据。用 `runtime.worker_git_write_repositories` 按 `backend:服务键`、`frontend:应用键` 登记普通业务服务和前端应用。启动器仅对当前配置和快照中位置一致的本仓 `.git` 或对应子模块目录授权，不扩大只读依赖及父仓库其他 Git 路径。宿主对这些普通仓库也尊重登记：任一配置曾声明时，两者都须保留对应键，删除或清空会撤销授权；两者均从未声明的旧配置沿用计划与仓库配置授权。后端依赖使用现有独立规则，由两份配置中相同的 `access:writable`、路径和交付目标授权，不要求出现在普通 bundle 仓库登记内；改为只读或删除即撤销。
+监测入口自动完成准备、绑定与派发。每张单只有一份有效执行权。进程中断后用同一工单与原请求核对；未能确认停止时保留证据。阶段进程归属仅限本次执行，其他本地服务保留原状态。
 
-Git 认证和 hooks 在本机普通 Windows 宿主进程运行，仓库物理位置不变；代码编辑、构建、测试仍在 MXC。主聊天通过 `branch_prepare`、`candidate_commit`、`integration_merge` 请求固定操作，不能从沙箱直接提交、检出、合并或补取分支。阶段 Agent 返回准备好的修改信息，主聊天登记请求并结束本轮，启动器确认原 CLI、阶段子进程和 Task 同步器全部停止后执行，再恢复同一聊天。完整请求和状态见[账本命令](workflow-cli.md)与[分支流程](branches.md)。
-
-启用 `runtime.sync_requirement_before_review` 时，需求仓库的认证、fetch 和仅快进更新由宿主受控执行器完成，物理仓库路径保持配置值。工单 CLI 对当前配置和领取快照里的需求仓库及 `.git` 只读；不再授予其写权限，也不向沙箱传递 Git 凭据。同步成功后只交付已核验的分支、上游及提交回执。
-
-配置了 `backend_dependencies` 时，启动器为该工单 CLI 启用 Windows MXC 权限配置。只有当前项目配置和工单快照均将同一依赖路径设为 `writable` 时，启动器才会为其授予写权限。项目、已配置的前后端工作区、Codex 运行目录及临时目录提供正常的写入空间，`runtime.worker_cache_paths` 另外登记工作区外的构建缓存目录，支持 `~` 和系统环境变量。阶段 CLI 由本工单入口在同一受限进程树内启动。新增依赖后可以先跑 `probe` 确认配置可加载。MXC 无法启动时按现有权限阻断规则处理。
-
-- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py probe` 运行一次只读的实机探针。它要求 CLI 实际调用 shell 检查项目文件，根据工具输出和进程回执验证通过。不接单、不访问禅道。
-- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py git-preflight` 在宿主执行最长 30 秒的受控只读 Git 认证及上游查询，禁止交互，不 fetch、不改工作区。领取 Story 前要求本轮 `git_preflight_passed`，禁用材料同步可为 `git_preflight_skipped`；失败或忙时保留队列。`prepare` 与尚未开工的 `run` 强制复核，不依赖是否开启页面 E2E。确定失败且进程已停止时，仅释放尚未开工的原预占，保留已绑定聊天；未知停止状态保留名额。每个需求仓库的预检和材料同步共用一个未核实宿主 Git 运行标识；任一后续预检或同步先查询原命名 Job Object，确认退出后才能启动新的宿主 Git 进程，不能用新 UUID、不同工单或切换操作类型绕过旧进程对账。
-- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py e2e-preflight` 执行 AgentLimb 页面诊断。已有本地前端时复用，端口空闲时按项目启动命令拉起服务，再用已配对的 Chrome 配置核验登录、工区及页面控件。退出码 `0` 且回执为 `e2e_preflight_passed` 表示通过。`--profile <JSON路径>` 可诊断指定业务页面。仅当 `e2e.agentlimb.intake_gate` 开启时阻挡接单。 [E2E 阶段指引](e2e.md#agentlimb-浏览器)
-- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py prepare --marker <marker>` 仅用于已预占且未绑定的工单。以 `worker_ready` 返回的实际聊天 ID 为准。核对该聊天工作目录和实际桌面项目，尚未归组时用桌面项目工具挂载并读回，随后登记 `record bind`。遇到不明回执，先按账本待核对派发流程处理，再使用原有证据；只有确认没有创建聊天且该进程已停止，才允许新的派发请求重新准备。
-- `python -B .agents/skills/zentao-autodelivery/scripts/worker.py run --marker <marker>` 在已绑定工单的原有会话里开始或续接。工单 Agent 用 `record runtime_check` 核对本轮实际策略，用 `record start` 领取执行权。已有活动尝试的情况下，先核对对应进程和账本，禁止重复启动。命令运行期间持续等待其回执；其他轮次遇到 `worker_busy` 时仅对账。回执缺失时根据受控进程和账本确认是否可恢复。
-
-材料评审的 `record material_sync` 仅读取结果；返回 `material_sync_worker_required` 时原聊天立即结束本轮。启动器核实原 CLI 与 Task 同步器的停止回执，再按同一材料评审尝试的原截止时间在宿主启动固定同步操作，沿用当前及快照中相同的需求仓库。子进程只计算结果；外层确认 Windows Job Object 全部停止并复核绑定、截止时间及 HEAD 后，原子发布成功回执与终态。成功或确定失败都恢复同一聊天读取结果；失败沿原尝试重试，不能记为材料缺失。启动器重启先核对稳定证据目录和命名 Job Object；停止不明时禁止重复同步或释放名额。即使正式禅道评审关闭，材料同步交接的 CLI 和 Task 进程也使用可恢复命名 Job Object。
-
-开发 Git 请求返回 `host_git_worker_required` 后走同一受控交接。仓库锁以 canonical common Git directory 归一化，源仓库和 linked worktree 共用停止门禁。每个批次及恢复计算都使用原绝对截止时间和独立命名 Job Object，未知停止状态保留原占用；不能用新事件、重试或另一工单绕过。子进程记录逐仓效果，外层确认实际批次及恢复进程停止、当前绑定和工作版本仍有效后才发布 `host_git_completed` 或 `host_git_failed`。恢复丢失回执时核对已有提交和逐仓日志，失败 hooks 的重验义务跨尝试保留，迟到结果不能推进新尝试。失败日志包含具体检查和证据路径，原 hooks 必须通过。
-
-所有正式工单操作均由此入口启动。桌面聊天可以用来查看记录和核对状态。桌面发送消息工具不能覆盖工单轮次的实际审批策略。
-
-当阶段进入 `backend.deploy`（含 E2E 返工分段）或 `frontend.deploy`，启动器在工单 Agent 轮次停止后驱动对应的独立发布执行器。发布执行器自行认领账本尝试、启动受控发布脚本并提交结果。已核实的结束证据可以续接原尝试，缺少停止证据时保留占用并报告阻断。发布结果入账后，启动器从原会话继续联调或收尾。
-
-合回后正式前端 E2E 使用同一宿主交接。工单会话按当前尝试的 `host_e2e.request` 路径准备 [JSON 验收请求和场景](e2e.md#宿主请求和场景) 后结束本轮。启动器检查工单绑定、验收阶段、交付占用和原轮次停止证据，再用原尝试 ID 及截止时间执行固定的 AgentLimb 入口。已确认宿主并行进程全部停止后，在原尝试目录发布 `agentlimb.json`，随后恢复原聊天记录实际验收结果。正式验收与预检共用宿主运行锁。共用交付资源时等待现有工单收尾，再进入合回。
-
-## 拆分任务同步
-
-已启用任务同步的新 Story 在 `run` 期间，由启动器同时监管研发 CLI 和拆分 Agent 的 Task 同步进程。同步进程核对固定会话、工单执行状态和会话无人值守权限，使用独立 Windows Job Object。研发 CLI 返回后，启动器停止同步进程，核实其进程树退出；回执中的 `task_sync_receipt` 指向本轮证明文件。若外部请求尚未核实，操作留待后续对账。
-
-每轮正式监测在原聊天执行：
-
-```powershell
-python -B .agents/skills/zentao-autodelivery/scripts/worker.py sync-tasks
-```
-
-命令从当前会话的 `CODEX_THREAD_ID` 核对实际权限，并按本项目最近确认的禅道实例及项目身份筛选待办，包括已收尾工单。一个批次最多处理 32 项，截止时间为 3 分钟。可在命令返回的回执目录查看执行结果。工单同步和监测补办共用逐项租约，允许同时推进各自有权领取的操作。
+材料同步、分支准备、候选提交和合回均由宿主接收固定 Git 操作并重新核对授权，在截止时间内返回结果。实际 Git 权限和凭据留在宿主。主会话拿到逐仓回执后继续。前端 E2E 和推送部署的交接由账本阶段和执行器控制，发布前后核对实际版本。工单输出保存在账本所在目录的 `items/<marker>/`。

@@ -117,7 +117,7 @@ def recover_attempt(root, checkpoint, claim):
         try:
             batch = json.loads(checkpoint.with_name('batch.json').read_text(encoding='utf-8'))
         except FileNotFoundError:
-            # The current Windows worker holds the exclusive work-item lock.
+            # The current worker holds the exclusive work-item lock.
             # Publication cannot start without durable batch and launch files.
             if checkpoint.parent.exists() and any(
                     path.name.startswith('publish-') or path.name.endswith('.request.json')

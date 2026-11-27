@@ -67,6 +67,26 @@ class FrontendHostTests(unittest.TestCase):
     def run_host(self):
         return runner.run_frontend_e2e(self.marker, self.database, self.config, self.root)
 
+    def test_new_item_host_builds_inputs_from_one_business_scenario(self):
+        with closing(sqlite3.connect(self.database)) as conn, conn:
+            cfg = json.loads(self.config.read_text('utf-8'))
+            cfg['e2e_attestation'] = 'launch'
+            conn.execute('UPDATE work_items SET config_snapshot=?', (json.dumps(cfg),))
+        scenario = self.folder / 'scenario.json'
+        scenario.write_text(json.dumps({'entry_path': '/charts',
+                                        'steps': [{'action': 'assert-visible', 'selector': '#fixture'}]}),
+                            encoding='utf-8')
+        request = {'attempt_id': self.attempt, 'scenario': scenario.relative_to(self.item).as_posix()}
+        (self.folder / 'host-request.json').write_text(json.dumps(request), encoding='utf-8')
+        job = runner._active_job(self.marker, self.database, self.config)
+        self.assertTrue(job.automatic)
+        stage_root = self.folder / 'host-run'
+        command = runner._command(self.marker, job, stage_root)
+        self.assertIn('http://localhost:5000', command)
+        self.assertEqual(json.loads((stage_root / 'inputs/profile.json').read_text('utf-8')),
+                         {'entry_path': '/charts'})
+        self.assertEqual(list(json.loads((stage_root / 'inputs/scenario.json').read_text('utf-8'))), ['steps'])
+
     def test_external_code_out_of_scope_is_rejected_without_host_process(self):
         self.request(scenario='../other/scenario.cjs')
         with patch.object(runner, 'run_stage') as stage:

@@ -1,4 +1,4 @@
-"""Supervise one local stage worker and its process tree on Windows."""
+"""Supervise one local stage worker and its owned processes on Windows, Linux and macOS."""
 
 import argparse
 from contextlib import nullcontext
@@ -10,11 +10,12 @@ import os
 from pathlib import Path
 import re
 from socket import gethostname
-import sqlite3
 import subprocess
 import sys
 import time
 from uuid import uuid4
+
+from runtime_paths import LOCAL_DIRECTORY
 
 
 class BasicLimit(ctypes.Structure):
@@ -104,7 +105,22 @@ class Job:
 
 
 def recover_job_stop(launch):
-    """Return read-only stop evidence for a named Job Object on this Windows host."""
+    """Recover only observable stop evidence for a run on the original host."""
+    if launch.get('job_host') != gethostname():
+        return None
+    if os.name == 'posix':
+        from posix_stage import members
+        pid, scope = launch.get('launcher_pid'), launch.get('posix_scope')
+        if launch.get('mechanism') != 'posix_session' or type(pid) is not int or pid <= 1 or scope not in ('session', 'group'):
+            return None
+        try:
+            cleanup = Path(launch['receipt_path']).with_name('guard-stopped')
+            if members(pid, scope) or cleanup.read_text(encoding='ascii') != str(pid):
+                return None
+        except (KeyError, OSError, ValueError, subprocess.SubprocessError):
+            return None
+        return {'mechanism': 'posix_session', 'job_host': gethostname(), 'launcher_pid': pid,
+                'owned_processes_active_after_stop': 0, 'verified_at': utc_now().isoformat()}
     name = launch.get('job_name')
     if (os.name != 'nt' or launch.get('job_host') != gethostname() or not isinstance(name, str)
             or not re.fullmatch(r'Global\\ZentaoDeploy-[0-9a-f]{32}', name)):
@@ -167,47 +183,33 @@ def parse_session(path):
     return session
 
 
-def coding_start_callback(attempt_id, phase, deadline):
-    chat_id = os.environ.get('CODEX_THREAD_ID')
-    if not chat_id or phase not in ('verify', 'backend.coding', 'frontend.coding'):
-        return None
-    from task_sync import coding_attempt, record_coding_start
-    from workflow import DATABASE_PATH
-
-    try:
-        if not coding_attempt(DATABASE_PATH, attempt_id, phase, chat_id):
-            return None
-    except (OSError, sqlite3.Error) as error:
-        print(f'Could not read the coding attempt {attempt_id}: {error}', file=sys.stderr)
-        return None
-
-    def record(started_at):
-        record_coding_start(DATABASE_PATH, attempt_id, phase, deadline, started_at, chat_id)
-
-    return record
-
-
-def bootstrap(prompt, command):
+def bootstrap(prompt, pid_path, command):
     # A closed pipe means the supervisor failed before the process was contained.
     if sys.stdin.buffer.read(1) != b'G':
         return 125
     with open(prompt, 'rb') if prompt else nullcontext(subprocess.DEVNULL) as input_stream:
-        return subprocess.call(command, stdin=input_stream)
+        with subprocess.Popen(command, stdin=input_stream) as child:
+            Path(pid_path).write_text(str(child.pid), encoding='ascii')
+            return child.wait()
 
 
-def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None, recoverable=False):
+def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *, stop_event=None, recoverable=False, agent=None, env=None):
     directory = evidence_dir / attempt_id / phase
     directory.mkdir(parents=True, exist_ok=False)
     receipt_path = directory / 'result.json'
     stdout_path = directory / 'stdout.log'
     stderr_path = directory / 'stderr.log'
     hosted_agent = Path(command[0]).name.lower() in ('codex', 'codex.exe') and 'exec' in command[1:]
-    record_start = coding_start_callback(attempt_id, phase, deadline) if hosted_agent else None
+    if agent is not None:
+        hosted_agent = agent
     result = {
         'attempt_id': attempt_id, 'phase': phase, 'deadline_at': deadline.isoformat(),
         'receipt_path': str(receipt_path), 'stdout_path': str(stdout_path), 'stderr_path': str(stderr_path),
     }
-    evidence = {'mechanism': 'windows_job_object', 'working_directory': str(cwd)}
+    mechanism = 'windows_job_object' if os.name == 'nt' else 'posix_session'
+    evidence = {'mechanism': mechanism, 'working_directory': str(cwd), 'job_host': gethostname()}
+    environment = dict(os.environ if env is None else env)
+    environment['npm_config_cache'] = str(LOCAL_DIRECTORY / 'npm-cache')
     if utc_now() >= deadline:
         result.update(outcome='timed_out', stop_confirmed=True,
                       stop_evidence={**evidence, 'worker_started': False, 'owned_processes_at_stop': 0,
@@ -226,6 +228,17 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
                 overrides.extend(['-c', f'{setting}={json.dumps(value)}'])
         command = [command[0], *overrides, *command[1:]]
 
+    if os.name == 'posix':
+        from posix_stage import run as run_posix
+        with stdout_path.open('wb') as stdout, stderr_path.open('wb') as stderr:
+            outcome, confirmed = run_posix(command, prompt, cwd, directory, stdout, stderr, environment,
+                deadline, utc_now, evidence, lambda: write_json(directory / 'launch.json', {**result, **evidence}), stop_event)
+        if hosted_agent:
+            evidence['codex_session'] = parse_session(stdout_path)
+        result.update(outcome=outcome, stop_confirmed=confirmed, stop_evidence=evidence)
+        write_json(receipt_path, result)
+        return result
+
     job_name = 'Global\\ZentaoDeploy-' + uuid4().hex if recoverable else None
     if job_name is not None:
         evidence.update(job_name=job_name, job_host=gethostname())
@@ -233,9 +246,10 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
     process = None
     try:
         with stdout_path.open('wb') as stdout, stderr_path.open('wb') as stderr:
-            argv = [sys.executable, '-B', __file__, '--bootstrap', str(prompt) if prompt else '', *command]
+            pid_path = directory / 'worker-pid'
+            argv = [sys.executable, '-B', __file__, '--bootstrap', str(prompt) if prompt else '', str(pid_path), *command]
             process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
-                                       creationflags=subprocess.CREATE_NO_WINDOW)
+                                       env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
             job.assign(process.pid)
             evidence.update(supervisor_pid=os.getpid(), launcher_pid=process.pid,
                             launch_timestamp=utc_now().isoformat(), worker_started=False)
@@ -245,16 +259,7 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
                 process.stdin.write(b'G')
                 process.stdin.flush()
             process.stdin.close()
-            observed_start = None
             while utc_now() < deadline:
-                if record_start and (observed_start or parse_session(stdout_path).get('turn_started')):
-                    observed_start = observed_start or utc_now()
-                    try:
-                        record_start(observed_start)
-                    except (OSError, sqlite3.Error) as error:
-                        print(f'Could not record coding start for {attempt_id}: {error}', file=sys.stderr)
-                    else:
-                        record_start = None
                 if process.poll() is not None:
                     break
                 if stop_event is not None and stop_event.is_set():
@@ -262,7 +267,7 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
                 remaining = max(0, (deadline - utc_now()).total_seconds())
                 try:
                     wait = min(0.25, remaining) if stop_event is not None else remaining
-                    process.wait(timeout=min(1, wait) if record_start else wait)
+                    process.wait(timeout=wait)
                 except subprocess.TimeoutExpired:
                     continue
             timed_out = utc_now() >= deadline
@@ -275,7 +280,7 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
                 owned_processes_at_stop=before.active,
                 owned_processes_active_after_stop=after.active,
                 owned_processes_total=after.total,
-                worker_started=after.total > 1,
+                worker_started=pid_path.is_file(),
                 verified_at=utc_now().isoformat(),
                 launcher_exit_code=process.returncode,
             )
@@ -300,7 +305,7 @@ def run_stage(attempt_id, phase, deadline, cwd, evidence_dir, prompt, command, *
 
 def main(argv):
     if argv and argv[0] == '--bootstrap':
-        return bootstrap(argv[1], argv[2:])
+        return bootstrap(argv[1], argv[2], argv[3:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--attempt-id', required=True)
     parser.add_argument('--phase', required=True)
@@ -312,8 +317,8 @@ def main(argv):
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command and args.command[0] == '--' else args.command
     try:
-        if os.name != 'nt' or not command:
-            raise ValueError('A Windows host and an explicit worker command are required')
+        if not command:
+            raise ValueError('An explicit worker command is required')
         if (not re.fullmatch(r'[a-zA-Z0-9_-]{1,96}', args.attempt_id) or len(args.phase) > 96
                 or not re.fullmatch(r'(?:(?:backend|frontend)\.)?[a-zA-Z0-9_-]+', args.phase)):
             raise ValueError('Invalid attempt identifier or phase')

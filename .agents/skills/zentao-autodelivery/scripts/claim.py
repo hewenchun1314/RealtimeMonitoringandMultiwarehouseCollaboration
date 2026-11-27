@@ -1,9 +1,10 @@
 """Queue a complete scan and reserve its current, freshly verified candidate."""
 
+from datetime import datetime, timezone
 import hashlib
 from uuid import uuid4
 
-from ledger import encode, item_identity, item_key, message, observed, require_mapping, require_text, source_id, source_kind
+from ledger import stamp, encode, item_identity, item_key, message, observed, require_mapping, require_text, source_id, source_kind
 from intake_scope import matches_source, normalize_source, product_scope
 
 
@@ -13,10 +14,11 @@ def save_source(store, item, source):
                        (item['seq'], encode(source)))
 
 
-def candidate(conn, instance, project_id):
+def candidate(conn, instance, project_id, now=None):
     return conn.execute('''SELECT * FROM work_items WHERE instance=? AND project_id=?
-                           AND state='queued' AND eligible=1
-                           ORDER BY priority IS NULL, priority, seq LIMIT 1''', (instance, project_id)).fetchone()
+                           AND state='queued' AND eligible=1 AND NOT EXISTS (
+                               SELECT 1 FROM intake_retries WHERE item_seq=work_items.seq AND retry_at>?)
+                           ORDER BY priority IS NULL, priority, seq LIMIT 1''', (instance, project_id, stamp(now or datetime.now(timezone.utc)))).fetchone()
 
 
 def eligible(zentao, kind, assigned, status):
@@ -53,7 +55,7 @@ def save_scan(store, data):
     latest = store.conn.execute('SELECT * FROM scans WHERE instance=? AND project_id=?', scope).fetchone()
     if not store.fresh_observation(received_at) or (latest and (
             latest['scan_id'] == scan_id or received_at <= latest['observed_at'])):
-        current = candidate(store.conn, *scope)
+        current = candidate(store.conn, *scope, now=store.now)
         return message('stale', candidate=item_identity(current) if current else None)
 
     items = data.get('items')
@@ -108,7 +110,7 @@ def save_scan(store, data):
                           ON CONFLICT(instance,project_id) DO UPDATE SET
                               project_name=excluded.project_name, scan_id=excluded.scan_id,
                               observed_at=excluded.observed_at''', (*scope, data['project_name'], scan_id, received_at))
-    current = candidate(store.conn, *scope)
+    current = candidate(store.conn, *scope, now=store.now)
     return message('baseline' if latest is None else 'scanned',
                    candidate=item_identity(current) if current else None)
 
@@ -123,10 +125,10 @@ def reserve(store, data):
     if scope is None or scope['project_name'] != zentao['project_name']:
         return message('scope_mismatch')
     in_use = store.conn.execute('''SELECT COUNT(*) FROM work_items
-                                  WHERE state IN ('reserved','bound','running','closing','review_handoff')''').fetchone()[0]
+                                  WHERE state IN ('reserved','bound','running','closing')''').fetchone()[0]
     if in_use >= store.config['development']['max_concurrent_items']:
         return message('busy')
-    head = candidate(store.conn, *requested[:2])
+    head = candidate(store.conn, *requested[:2], now=store.now)
     if head is None:
         return message('no_candidate')
     if item_key(item_identity(head)) != requested:
@@ -149,13 +151,13 @@ def reserve(store, data):
             store.update_item(head, state='ineligible', eligible=0, observed_at=check_time)
             save_source(store, head, source)
             return message('not_eligible')
-    if not eligible(zentao, head['kind'], assigned, status):
+    if data.get('eligible') is False or not eligible(zentao, head['kind'], assigned, status):
         store.update_item(head, state='ineligible', eligible=0, assigned_to=assigned,
                           source_status=status, observed_at=check_time)
         if source is not None:
             save_source(store, head, source)
         return message('not_eligible')
-    desktop_project = require_text(data.get('desktop_project_id'), 'desktop_project_id')
+    desktop_project = data.get('desktop_project_id') or store.config.get('runtime', {}).get('desktop_project_id')
     expected = store.config.get('runtime', {}).get('desktop_project_id') or head['desktop_project_id']
     if expected and desktop_project != expected:
         return message('desktop_project_mismatch')
@@ -163,6 +165,9 @@ def reserve(store, data):
     expires_at = store.expiry('dispatch_lease_seconds', 300)
     store.conn.execute('''INSERT INTO dispatches(request_id,item_seq,desktop_project_id,state,expires_at)
                          VALUES(?,?,?,'reserved',?)''', (request_id, head['seq'], desktop_project, expires_at))
+    if 'materials' in data:
+        store.conn.execute('INSERT OR REPLACE INTO intake_materials(item_seq,materials) VALUES (?,?)',
+                           (head['seq'], encode(require_mapping(data['materials'], 'materials'))))
     # Keep configuration for the original admission across retries and recovery rounds.
     snapshot = head['config_snapshot'] or encode({**store.config, 'workflow_version': 2})
     state = 'bound' if head['chat_id'] else 'reserved'

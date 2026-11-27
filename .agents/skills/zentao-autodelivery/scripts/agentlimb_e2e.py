@@ -14,9 +14,12 @@ import subprocess
 from time import monotonic, sleep
 from types import SimpleNamespace
 from urllib.parse import urlsplit
+from uuid import uuid4
 
+from portable_lock import file_lock
+from runtime_paths import CONFIG_PATH, DATABASE_PATH, LOCAL_DIRECTORY, PROJECT_ROOT
+from service_runtime import command_args, resolve_command
 from merged_e2e_sources import RuntimeSourcesChanged, merged_workspace, prepare_committed_sources, verify_runtime_sources
-from workflow import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 
 
 def browser_config(config):
@@ -43,7 +46,7 @@ def relative_url(value):
 def read_config(marker):
     if marker is None:
         return json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
-    with sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True) as conn:
+    with closing(sqlite3.connect(DATABASE_PATH.as_uri() + '?mode=ro', uri=True)) as conn:
         row = conn.execute('SELECT config_snapshot FROM work_items WHERE marker=?', (marker,)).fetchone()
     if not row or not row[0]:
         raise ValueError('The work item has no configuration snapshot')
@@ -78,12 +81,24 @@ def browser_options(config, args):
         'workArea': profile.get('work_area') or e2e['default_work_area']['name'], 'checks': checks,
         'username': e2e['login'].get('username', ''),
     }
+    if e2e.get('work_area_path'):
+        options['workAreaPath'] = relative_url(e2e['work_area_path'])
+        options['loginFile'] = str(LOCAL_DIRECTORY / 'e2e-login.json')
     if args.scenario:
         scenario = args.scenario.resolve(strict=True)
-        if not (args.marker and args.base_url and args.startup_log and checks and scenario.is_relative_to(PROJECT_ROOT)):
-            raise ValueError('Acceptance requires a work item, candidate startup, a profile and a local scenario')
+        item_dir = DATABASE_PATH.parent / 'items' / (args.marker or '')
+        local_scenario = scenario.is_relative_to(PROJECT_ROOT) or (
+            re.fullmatch(r'HNF-[0-9a-f]{20}', args.marker or '') and scenario.is_relative_to(item_dir))
+        automatic = config.get('e2e_attestation') == 'launch' and e2e.get('after_integration') is True
+        if not (args.marker and args.base_url and args.startup_log and local_scenario and (checks or automatic)):
+            raise ValueError('Acceptance requires a work item, candidate startup and a local scenario')
         options['scenario'] = str(scenario)
-        options['resources'] = resource_profile(profile.get('candidate_resources'))
+        if automatic:
+            if not profile.get('entry_path'):
+                raise ValueError('Specify the entry page in the scenario')
+            options['automaticAttestation'] = True
+        else:
+            options['resources'] = resource_profile(profile.get('candidate_resources'))
     elif args.marker or args.base_url:
         raise ValueError('Candidate parameters require an acceptance scenario')
     return options
@@ -163,7 +178,12 @@ def acceptance_setup(config, options, args):
     else:
         versions = stages['frontend.coding']['evidence']['versions']
         options['startupWorkspace'] = candidate_workspace(options, config, branches, versions, args.candidate_workspace)
-    if {row['app'] for row in options['resources']} != versions.keys():
+    if options.get('automaticAttestation'):
+        if not options.get('postMerge'):
+            raise ValueError('Automatic version proof requires isolated merged sources')
+        applications = config['development']['frontend_bundle']['applications']
+        options['appPaths'] = {app: applications[app]['repository'] for app in versions}
+    elif {row['app'] for row in options['resources']} != versions.keys():
         raise ValueError('Candidate resources must identify every changed frontend application')
     options['candidateVersions'] = versions
     options['candidateBranches'] = branches
@@ -220,134 +240,111 @@ def http_ready(url):
         connection.close()
 
 
-def stop_frontend_ports(ports):
-    port_numbers = ','.join(str(port) for port in sorted(ports))
-    script = f'''
-$ErrorActionPreference = 'Stop'
-$ports = @({port_numbers})
-$listeners = @(Get-NetTCPConnection -State Listen | Where-Object {{ $_.LocalPort -in $ports }})
-foreach ($group in @($listeners | Group-Object OwningProcess)) {{
-    $owner = [int]$group.Name
-    if ($owner -le 4 -or $owner -eq {os.getpid()} -or $owner -eq $PID) {{ throw "Protected listener: $owner" }}
-    $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
-    if ($null -eq $process) {{ continue }}
-    $started = $process.StartTime
-    if (-not (Get-NetTCPConnection -State Listen | Where-Object {{ $_.OwningProcess -eq $owner -and $_.LocalPort -in $ports }})) {{ continue }}
-    $current = Get-Process -Id $owner -ErrorAction SilentlyContinue
-    if ($null -ne $current -and $current.StartTime -eq $started) {{ Stop-Process -InputObject $current -Force }}
-}}
-for ($i = 0; $i -lt 25; $i++) {{
-    if (-not (Get-NetTCPConnection -State Listen | Where-Object {{ $_.LocalPort -in $ports }})) {{
-        ConvertTo-Json -InputObject @($listeners | ForEach-Object {{ @{{port = $_.LocalPort; pid = $_.OwningProcess}} }}) -Compress
-        exit 0
-    }}
-    Start-Sleep -Milliseconds 200
-}}
-throw 'Configured frontend ports remain occupied'
-'''
-    completed = subprocess.run(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-                               check=True, capture_output=True, timeout=30)
-    return json.loads(completed.stdout)
-
-
 def get_port(url):
     return url.port or (443 if url.scheme == 'https' else 80)
 
 
-def prepare_frontend(config, options, startup_log, *, restart=False):
+def prepare_frontend(config, options, startup_log):
     origin = urlsplit(options['baseUrl'])
     entry_port = get_port(origin)
-    gateway = options.get('gatewayUrl')
-    candidate = bool(options.get('startupWorkspace') or gateway)
-    post_merge = options.get('postMerge', False)
-    if not post_merge and port_open(origin.hostname, entry_port):
-        return ({'mode': 'start-failed', 'reason': 'candidate-port-in-use'} if candidate else {'mode': 'reused'})
+    formal = bool(options.get('startupWorkspace') or options.get('gatewayUrl'))
+    required = browser_config(config).get('preflight_startup_ports', [])
+    if options.get('automaticAttestation'):
+        required = []
+    elif options.get('resources'):
+        required = [get_port(urlsplit(row['url'])) for row in options['resources']]
+    if not isinstance(required, list) or any(type(p) is not int or not 1 <= p <= 65535 for p in required):
+        raise ValueError('Invalid frontend readiness ports')
+    ready_ports = sorted({entry_port, *required})
+    startup_ports = config.get('startup_ports', ready_ports)
+    services = options.get('startupServices')
+    if services:
+        startup_ports = sorted({port for _, _, port in services})
+        ready_ports = sorted({entry_port, *startup_ports})
+    if (not isinstance(startup_ports, list) or any(type(p) is not int or not 1 <= p <= 65535 for p in startup_ports)
+            or not set(ready_ports).issubset(startup_ports)):
+        raise ValueError('All frontend readiness ports must be in the configured startup ports')
+    if not formal and port_open(origin.hostname, entry_port):
+        return {'mode': 'reused'}
+    occupied = [port for port in sorted(set(startup_ports)) if port_open(origin.hostname, port)]
+    if occupied:
+        return {'mode': 'start-failed', 'reason': 'candidate-port-in-use', 'ports': occupied}
 
-    extra_ports = browser_config(config).get('preflight_startup_ports', [])
-    if options.get('resources'):
-        resource_origins = [urlsplit(row['url']) for row in options['resources']]
-        extra_ports = sorted({get_port(url) for url in resource_origins})
-    if not isinstance(extra_ports, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in extra_ports):
-        raise ValueError('Preflight startup ports must be valid TCP port numbers')
-    ports = dict.fromkeys([entry_port, *extra_ports])
-    command = config['start_command']
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError('Preflight requires a frontend start command')
-    start_options = {}
-    reclaimed = None
+    gateway = options.get('gatewayUrl')
+    argv = command_args(config['start_command'])
+    if gateway:
+        gateway = deployment_gateway(gateway)
+        if argv[-1].startswith('--gateway='):
+            argv.pop()
+        elif len(argv) >= 2 and argv[-2] == '--gateway':
+            del argv[-2:]
+        if any(arg == '--gateway' or arg.startswith('--gateway=') for arg in argv):
+            raise ValueError('Use a single terminal --gateway option')
+        argv.append('--gateway=' + gateway)
+    if services:
+        configured_gateway = next((arg.split('=', 1)[1] for arg in argv if arg.startswith('--gateway=')), None)
+    workspace = options.get('startupWorkspace', options['workspace'])
+    environment = dict(os.environ)
+    environment['npm_config_cache'] = str(LOCAL_DIRECTORY / 'npm-cache')
     source_workspace = None
-    if post_merge:
-        configured_ports = config.get('startup_ports')
-        if (not isinstance(configured_ports, list) or not configured_ports
-                or any(type(port) is not int or not 1 <= port <= 65535 for port in configured_ports)
-                or not ports.keys() <= set(configured_ports)):
-            raise ValueError('All formal E2E ports must be in the configured startup ports')
+    if options.get('postMerge'):
         if options.get('mergedCheckouts'):
             try:
-                source_workspace = prepare_committed_sources(options, startup_log.resolve().parent / 'frontend-source')
+                source_workspace = prepare_committed_sources(options, startup_log.resolve().parent)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 return {'mode': 'start-failed', 'reason': 'merged-source-preparation', 'detail': str(error)}
-        if (not restart and not source_workspace and all(port_open(origin.hostname, port) for port in ports)
-                and http_ready(options['baseUrl'] + options['loginPath'])):
-            return {'mode': 'reused', **({'gateway': gateway} if gateway else {})}
-        try:
-            reclaimed = stop_frontend_ports(sorted(set(configured_ports)))
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return {'mode': 'start-failed', 'reason': 'frontend-ports-not-released', 'ports': sorted(set(configured_ports))}
+            workspace = source_workspace
         witness = Path(__file__).with_name('agentlimb_resource_witness.cjs').resolve()
-        environment = dict(os.environ)
         environment['NODE_OPTIONS'] = f'{environment.get("NODE_OPTIONS", "")} --require="{witness.as_posix()}"'.strip()
         witness_config = {'origin': options['baseUrl'], 'resources': options.get('resources', [])}
+        if options.get('automaticAttestation'):
+            roots = {}
+            for app, path in options['appPaths'].items():
+                actual = (Path(source_workspace) / path).resolve(strict=True)
+                if not actual.is_relative_to(Path(source_workspace)) or str(actual) in roots:
+                    raise ValueError('The candidate application needs a unique isolated source directory')
+                roots[str(actual)] = app
+            options['launchProof'] = {'token': uuid4().hex, 'apps': sorted(roots.values()),
+                                      'ports': sorted(set(startup_ports))}
+            witness_config['launch'] = {**options['launchProof'], 'roots': roots}
         if gateway:
             witness_config['gatewayHash'] = options['gatewayHash']
         environment['ZENTAO_E2E_WITNESS'] = json.dumps(witness_config)
-        if source_workspace:
-            environment['ZENTAO_E2E_SOURCE'] = source_workspace
-        start_options['env'] = environment
-    elif candidate and any(port_open(origin.hostname, port) for port in set(extra_ports) - {entry_port}):
-        return {'mode': 'start-failed', 'reason': 'candidate-port-in-use'}
-    if gateway:
-        gateway = deployment_gateway(gateway)
-        # Keep the configured command. Only replace its declared gateway option.
-        flag = r'\s+--gateway(?:=|\s+)(?:"[^"]*"|\x27[^\x27]*\x27|[^\s"\x27]+)'
-        command = re.sub(flag + r'\s*$', '', command)
-        if re.search(r'(?<!\S)--gateway\b', command):
-            raise ValueError('Use a single terminal --gateway option in the frontend start command')
-        command = f"{command.rstrip()} --gateway='{gateway}'"
-    if source_workspace:
-        # npm runs the pinned package's lifecycle in its own tree; the host
-        # launcher still starts in the main workspace with its configured options.
-        if re.fullmatch(r"npm(?:\.cmd)?\s+run\s+[\w:-]+(?:\s+--[\w.=/:'-]+)*", command):
-            command = re.sub(r'^(npm(?:\.cmd)?)', r'\1 --prefix "$env:ZENTAO_E2E_SOURCE"', command, count=1)
-        else:
-            command = 'Set-Location -LiteralPath $env:ZENTAO_E2E_SOURCE -ErrorAction Stop\n' + command
+
     with startup_log.open('wb') as output:
         try:
-            # The Windows stage runner owns the candidate process tree.
-            process = launch_frontend(command, options.get('startupWorkspace', options['workspace']), output, start_options)
+            if services:
+                if configured_gateway:
+                    environment.update(GATEWAY_URL=configured_gateway, npm_config_gateway=configured_gateway)
+                processes = []
+                for directory, script, _ in services:
+                    processes.append(launch_frontend(['npm', 'run', script], Path(workspace) / directory,
+                                                     output, {'env': environment}))
+            else:
+                processes = [launch_frontend(argv, workspace, output, {'env': environment})]
         except OSError:
             return {'mode': 'start-failed', 'reason': 'start-command-unavailable', 'log': str(startup_log)}
-    launched = {'pid': process.pid, 'log': str(startup_log)}
+    launched = {'pid': processes[0].pid, 'log': str(startup_log)}
+    if services:
+        launched['services'] = [directory for directory, _, _ in services]
     if source_workspace:
         launched['source_workspace'] = source_workspace
-    if reclaimed:
-        launched['released_listeners'] = reclaimed
     if gateway:
         launched['gateway'] = gateway
     deadline = monotonic() + 120
     while monotonic() < deadline:
-        if (exit_code := process.poll()) is not None:
-            return {'mode': 'start-failed', 'reason': 'start-command-exited', 'exit_code': exit_code, **launched}
-        if all(port_open(origin.hostname, port) for port in ports) and http_ready(options['baseUrl'] + options['loginPath']):
+        for process in processes:
+            if (exit_code := process.poll()) is not None:
+                return {'mode': 'start-failed', 'reason': 'start-command-exited', 'exit_code': exit_code, **launched}
+        if all(port_open(origin.hostname, port) for port in ready_ports) and http_ready(options['baseUrl'] + options['loginPath']):
             return {'mode': 'started', **launched}
         sleep(1)
     return {'mode': 'start-failed', 'reason': 'startup-timeout', **launched}
 
 
-def launch_frontend(command, workspace, output, start_options):
-    return subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
-                            cwd=workspace, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-                            **start_options)
+def launch_frontend(argv, workspace, output, start_options):
+    return subprocess.Popen(resolve_command(argv), cwd=workspace, stdin=subprocess.DEVNULL, stdout=output,
+                            stderr=subprocess.STDOUT, **start_options)
 
 
 def browser_result(options, args):
@@ -374,15 +371,6 @@ def run_browser(config, options, args, *, deployment=None):
             return {'status': 'blocked', 'stage': 'backend-deployment', 'frontend': frontend,
                     'reason': 'backend-version-unverified'}
     result = browser_result(options, args)
-    if (options.get('postMerge') and frontend and frontend['mode'] == 'reused'
-            and result.get('status') == 'blocked' and not result.get('candidate_resources')
-            and result.get('stage') in ('candidate-resource', 'entry', 'test-data')):
-        fallback_stage = result['stage']
-        frontend = prepare_frontend(config['e2e'], options, args.startup_log, restart=True)
-        frontend['reuse_blocker'] = fallback_stage
-        if frontend['mode'] == 'start-failed':
-            return {'status': 'blocked', 'stage': 'frontend-startup', 'frontend': frontend}
-        result = browser_result(options, args)
     if frontend is not None:
         result['frontend'] = frontend
     if options.get('candidateVersions') and result.get('status') in ('passed', 'failed'):
@@ -395,14 +383,6 @@ def run_browser(config, options, args, *, deployment=None):
             elif any(check_candidate(options['candidateBranches'][app], sha) for app, sha in versions.items()):
                 raise ValueError('Candidate changed during acceptance')
         except RuntimeSourcesChanged:
-            business_result = result['status'] == 'passed' or (
-                result.get('repair_required') is True and result.get('stage') == 'acceptance')
-            if business_result and frontend and not frontend.get('source_workspace') and not options.get('forceCommittedSources'):
-                # A hot-reloading main service may have run a mixture of versions.
-                # Rerun the same cases once in the same deadline and job.
-                retry = run_browser(config, {**options, 'forceCommittedSources': True}, args, deployment=deployment)
-                retry['source_retry'] = {'reason': 'main-workspace-edited', 'previous_result': result['status']}
-                return retry
             return {'status': 'blocked', 'stage': 'candidate-version', 'reason': 'runtime-sources-changed'}
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             return {'status': 'blocked', 'stage': 'candidate-version', 'reason': 'candidate-changed-during-acceptance'}
@@ -419,17 +399,8 @@ def run_browser(config, options, args, *, deployment=None):
 
 
 def run_serialized(config, options, args, deployment):
-    import msvcrt
-
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with (DATABASE_PATH.parent / 'agentlimb-e2e.lock').open('a+b') as lock:
-        if lock.tell() == 0:
-            lock.write(b'0')
-            lock.flush()
-        lock.seek(0)
-        try:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+    with file_lock(DATABASE_PATH.parent / 'agentlimb-e2e.lock') as acquired:
+        if not acquired:
             return {'status': 'blocked', 'stage': 'agentlimb-busy'}
         return run_browser(config, options, args, deployment=deployment)
 

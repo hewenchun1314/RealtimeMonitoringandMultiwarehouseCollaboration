@@ -12,6 +12,7 @@ const FIELDS = {
   'assert-hidden': ['selector'],
   'assert-text': ['selector', 'text'],
   'assert-count': ['selector', 'count'],
+  'assert-style': ['selector', 'property', 'value'],
 };
 const MAX_TIMEOUT = 30000;
 
@@ -19,14 +20,19 @@ function validStep(step) {
   if (!step || typeof step !== 'object' || !Object.hasOwn(FIELDS, step.action)) return false;
   const fields = FIELDS[step.action];
   const polled = step.action.startsWith('assert-') || step.action === 'wait-for';
-  const allowed = [...fields, 'action', 'name', ...(polled ? ['timeout_ms'] : [])];
+  const allowed = [...fields, 'action', 'name', ...(polled ? ['timeout_ms'] : []),
+    ...(step.action === 'wait-for' ? ['scroll_container'] : [])];
   if (Object.keys(step).some(key => !allowed.includes(key))) return false;
+  if (step.scroll_container !== undefined &&
+      (typeof step.scroll_container !== 'string' || !step.scroll_container.trim() || step.scroll_container.length > 4000)) return false;
   if (step.name !== undefined && (typeof step.name !== 'string' || !/^[a-z0-9-]{1,60}$/.test(step.name))) return false;
   if (step.timeout_ms !== undefined && (!Number.isInteger(step.timeout_ms) || step.timeout_ms < 0 ||
       step.timeout_ms > MAX_TIMEOUT)) return false;
   for (const field of fields) {
     const value = step[field];
-    if (field === 'count') {
+    if (field === 'property') {
+      if (typeof value !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(value)) return false;
+    } else if (field === 'count') {
       if (!Number.isInteger(value) || value < 0 || value > 10000) return false;
     } else if (typeof value !== 'string' || value.length > 4000 ||
                (!['value', 'text'].includes(field) && !value.trim())) return false;
@@ -35,31 +41,49 @@ function validStep(step) {
     (step.path.startsWith('/') && !step.path.startsWith('//') && !/[\\\x00-\x1f]/.test(step.path));
 }
 
-function matches(selector, action, expected) {
-  const collect = root => [
-    ...root.querySelectorAll(selector),
-    ...[...root.querySelectorAll('*')].flatMap(node => node.shadowRoot ? collect(node.shadowRoot) : []),
-  ];
-  const elements = collect(document);
+function matches(selector, action, expected, property, scrollContainer) {
+  const roots = new Set([document]);
+  const found = new Set();
+  for (const root of roots) {
+    for (const el of root.querySelectorAll(selector)) found.add(el);
+    for (const node of root.querySelectorAll('*')) {
+      if (node.shadowRoot) roots.add(node.shadowRoot);
+      if (node.tagName === 'IFRAME' && node.contentDocument) roots.add(node.contentDocument);
+    }
+  }
+  const elements = [...found];
   const visible = element => {
     const style = getComputedStyle(element);
     return element.getClientRects().length > 0 && style.visibility !== 'hidden' && style.visibility !== 'collapse';
   };
   if (action === 'assert-count') return elements.length === expected;
+  if (action === 'assert-style') {
+    return elements.some(element => visible(element) && getComputedStyle(element).getPropertyValue(property) === expected);
+  }
   if (action === 'assert-text') {
     return elements.some(element => visible(element) && element.textContent.trim() === expected);
+  }
+  if (scrollContainer && !elements.some(visible)) {
+    for (const root of roots) {
+      const pane = [...root.querySelectorAll(scrollContainer)].find(visible);
+      if (pane && pane.scrollHeight > pane.clientHeight) {
+        pane.scrollTop += Math.max(24, Math.floor(pane.clientHeight * 0.75));
+        break;
+      }
+    }
+    return false;
   }
   return action === 'assert-hidden' ? !elements.some(visible) : elements.some(visible);
 }
 
 async function runStep(browser, step, index) {
-  const { action, selector, path, value, count, text, timeout_ms = 10000 } = step;
+  const { action, selector, path, value, count, text, property, timeout_ms = 10000 } = step;
   if (action === 'navigate') return browser.navigate(path);
   if (action === 'click') return browser.click(selector);
   if (action === 'input') return browser.input(selector, value);
 
   const deadline = Date.now() + timeout_ms;
-  const expression = '(' + matches.toString() + ')(' + [selector, action, text ?? count ?? null]
+  const expression = '(' + matches.toString() + ')(' + [selector, action, text ?? count ?? value ?? null, property ?? null, step.scroll_container ?? null]
     .map(value => JSON.stringify(value)).join(',') + ')';
   do {
     if (await browser.evaluate(expression) === true) return;

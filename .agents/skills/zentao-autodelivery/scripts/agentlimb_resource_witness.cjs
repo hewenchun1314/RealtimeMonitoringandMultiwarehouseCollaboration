@@ -1,4 +1,5 @@
 const { createHash } = require('node:crypto');
+const { realpathSync } = require('node:fs');
 const { Server } = require('node:http');
 const { Server: SecureServer } = require('node:https');
 const { brotliDecompressSync, gunzipSync, inflateSync } = require('node:zlib');
@@ -85,7 +86,42 @@ function witnessResponse(response, origin, gatewayHash) {
   };
 }
 
+// For a new run the isolated checkout already gives us the expected versions.
+// Mark each successful script or style response from the app's own server.
+function stampLaunchResponse(response, origin, identity, gatewayHash) {
+  const { writeHead } = response;
+  response.writeHead = function (status, message, headers) {
+    if (typeof message !== 'string') headers = message;
+    if (status !== 200) return writeHead.apply(response, arguments);
+    const inline = Array.isArray(headers)
+      ? headers.reduce((pairs, value, index) => {
+          if (index % 2 === 0) pairs.push([value, headers[index + 1]]);
+          return pairs;
+        }, [])
+      : Object.entries(headers || {});
+    const pairs = name => inline.filter(([key]) => key.toLowerCase() === name).map(([, value]) => value);
+    const contentType = pairs('content-type').at(-1) ?? response.getHeader('content-type') ?? '';
+    if (!/^(?:text\/css|(?:text|application)\/(?:x-)?(?:java|ecma)script)\b/i.test(contentType) ||
+        pairs('content-range').length || response.hasHeader('content-range')) {
+      return writeHead.apply(response, arguments);
+    }
+
+    const timing = [...(pairs('server-timing').length ? pairs('server-timing') : [response.getHeader('server-timing')]),
+      'zentao-launch;desc="' + identity + '"'];
+    if (gatewayHash) timing.push('zentao-gateway;desc="' + gatewayHash + '"');
+    const overrides = { 'server-timing': timing.filter(Boolean).flat().join(', '),
+      'timing-allow-origin': origin, 'cache-control': 'no-store' };
+    const changed = inline.filter(([name]) => !Object.hasOwn(overrides, name.toLowerCase())).flat();
+    for (const [name, value] of Object.entries(overrides)) changed.push(name, value);
+    return typeof message === 'string' ? writeHead.call(response, status, message, changed)
+      : writeHead.call(response, status, changed);
+  };
+}
+
 function enableWitness(settings) {
+  const launch = settings.launch;
+  const app = launch?.roots[realpathSync.native(process.cwd())];
+  if (launch && !app) return;
   const resources = new Set(settings.resources.map(resource => {
     const url = new URL(resource.url);
     return JSON.stringify([Number(url.port || (url.protocol === 'https:' ? 443 : 80)), url.pathname + url.search]);
@@ -93,11 +129,14 @@ function enableWitness(settings) {
   for (const server of [Server, SecureServer]) {
     const emit = server.prototype.emit;
     server.prototype.emit = function (event, request, response) {
-      if (event === 'request' && request.method === 'GET' &&
-          resources.has(JSON.stringify([request.socket.localPort, request.url]))) {
-        delete request.headers['if-none-match'];
-        delete request.headers['if-modified-since'];
-        witnessResponse(response, settings.origin, settings.gatewayHash);
+      if (event === 'request' && request.method === 'GET') {
+        const port = request.socket.localPort;
+        if (launch ? launch.ports.includes(port) : resources.has(JSON.stringify([port, request.url]))) {
+          delete request.headers['if-none-match'];
+          delete request.headers['if-modified-since'];
+          if (launch) stampLaunchResponse(response, settings.origin, launch.token + '.' + app, settings.gatewayHash);
+          else witnessResponse(response, settings.origin, settings.gatewayHash);
+        }
       }
       return emit.apply(this, arguments);
     };
@@ -106,4 +145,4 @@ function enableWitness(settings) {
 
 if (process.env.ZENTAO_E2E_WITNESS) enableWitness(JSON.parse(process.env.ZENTAO_E2E_WITNESS));
 
-module.exports = { witnessResponse };
+module.exports = { witnessResponse, stampLaunchResponse };

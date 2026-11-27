@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
 from delivery_scope import route_stages
 from deploy_control import deployment_action
-from frontend_release import DeploymentError, publish, read_remote, tag_for, verify_ports_stopped
+from frontend_release import DeploymentError, publish, read_remote, release_base, tag_for
 from ledger import Ledger, encode, transaction
 from execution import attempt_start
 from frontend_release_runner import run_frontend_release
@@ -97,7 +97,7 @@ class FrontendPublisherTests(unittest.TestCase):
         'marker': 'fixture',
         'settings': {'image_repository': 'registry.example.test/internalrd/web',
                      'base_image': 'registry.example.test/internalrd/web@sha256:' + 'b' * 64,
-                     'platform': 'linux/amd64', 'local_ports': [5000, 5001]},
+                     'platform': 'linux/amd64'},
         'applications': {
             'aggregation-platform': {'repository': 'root', 'branch': 'AI-development', 'sha': 'a' * 40},
             'shell-hub': {'repository': 'child', 'branch': 'AI-development', 'sha': 'b' * 40},
@@ -110,7 +110,7 @@ class FrontendPublisherTests(unittest.TestCase):
         self.journal = Path(directory.name) / 'receipt.json'
         self.events = []
 
-    def test_push_then_stop_then_build_and_retry_from_registry(self):
+    def test_push_then_build_and_retry_from_registry(self):
         observed = {'digest': self.digest, 'config_digest': self.config_digest}
 
         def synchronize(root, branch, sha):
@@ -128,7 +128,6 @@ class FrontendPublisherTests(unittest.TestCase):
 
         with (patch('frontend_release.verify_toolchain'),
               patch('frontend_release.synchronize_branch', side_effect=synchronize),
-              patch('frontend_release.verify_ports_stopped', side_effect=lambda _: self.events.append('stopped')),
               patch('frontend_release.build_archive',
                     side_effect=lambda *_: self.events.append('build') or Path('fixture.tar')) as build,
               patch('frontend_release.archive_config', return_value=self.config_digest),
@@ -138,30 +137,73 @@ class FrontendPublisherTests(unittest.TestCase):
                 publish(self.request, self.journal)
             reuse = {**self.request, 'settings': {**self.request['settings'], 'image_mode': 'reuse'}}
             publish(reuse, self.journal)
-        self.assertEqual(self.events, ['source:root', 'source:child', 'stopped', 'build', 'load', 'image',
-                                       'tag', 'push', 'source:root', 'source:child', 'stopped'])
+        self.assertEqual(self.events, ['source:root', 'source:child', 'build', 'load', 'image',
+                                       'tag', 'push', 'source:root', 'source:child'])
         build.assert_called_once()
         receipt = json.loads(self.journal.read_text(encoding='utf-8'))
         self.assertEqual(receipt['digest'], self.digest)
         self.assertTrue(receipt['image'].endswith('-zentao-ai-development'))
 
-    def test_occupied_port_blocks_build_and_preserves_pushed_versions(self):
-        with (patch('frontend_release.verify_toolchain'),
+    def test_build_permitted_with_unrelated_live_frontend(self):
+        import socket
+        with (socket.socket() as external, patch('frontend_release.verify_toolchain'),
               patch('frontend_release.synchronize_branch', side_effect=lambda _, __, sha: sha),
-              patch('frontend_release.command', return_value=SimpleNamespace(stdout=
-                    'TCP    [::]:5001    [::]:0    LISTENING    42\n')),
-              patch('frontend_release.build_archive') as build):
-            with self.assertRaisesRegex(DeploymentError, r'5001 \(PID 42\)'):
-                publish(self.request, self.journal)
-        build.assert_not_called()
-        result = json.loads(self.journal.read_text(encoding='utf-8'))
-        self.assertEqual(result['remote_versions'], result['versions'])
-        self.assertNotIn('stopped_ports', result)
+              patch('frontend_release.remote_image', return_value=None),
+              patch('frontend_release.build_archive', side_effect=DeploymentError('reached build')) as build):
+            external.bind(('127.0.0.1', 0))
+            external.listen()
+            request = {**self.request, 'settings': {**self.request['settings'], 'local_ports': [external.getsockname()[1]]}}
+            with self.assertRaisesRegex(DeploymentError, 'reached build'):
+                publish(request, self.journal)
+            build.assert_called_once()
+            with socket.create_connection(external.getsockname(), timeout=1):
+                pass
 
-    def test_active_connection_is_not_a_listening_port(self):
-        with patch('frontend_release.command', return_value=SimpleNamespace(stdout=
-                   'TCP    127.0.0.1:5000    127.0.0.1:5002    ESTABLISHED    42\n')):
-            verify_ports_stopped([5000])
+    def test_tag_and_digest_baseline_keeps_the_original_template_for_rollout(self):
+        settings = {**self.request['settings'], 'rancher': {'container': 'web'}}
+        repo = settings['image_repository']
+        before = repo + ':100.1.16-release@' + self.digest
+        with (patch('frontend_release.current_image', return_value=before),
+              patch('frontend_release.remote_image', return_value={'digest': self.digest}) as read):
+            self.assertEqual(release_base(settings, {}), (repo + '@' + self.digest, before))
+            read.assert_called_once_with(before, settings['platform'])
+        for invalid in [before.replace(repo, repo + '-other'), before + '!', repo + ':@' + self.digest]:
+            with (self.subTest(invalid=invalid), patch('frontend_release.current_image', return_value=invalid),
+                  patch('frontend_release.remote_image') as read, self.assertRaises(DeploymentError)):
+                try:
+                    release_base(settings, {})
+                finally:
+                    read.assert_not_called()
+
+    def test_direct_rollout_resumes_after_patch_without_pushing_or_patching_twice(self):
+        target = {'kube_server': 'https://rancher.example/k8s/clusters/test', 'kube_context': 'test'}
+        settings = {**self.request['settings'], 'rancher': target}
+        request = {**self.request, 'settings': settings}
+        repo = settings['image_repository']
+        base_digest = 'sha256:' + 'e' * 64
+        before, after = repo + '@' + base_digest, repo + '@' + self.digest
+        observed = {'digest': self.digest, 'config_digest': self.config_digest, 'platform_digest': self.digest}
+        with (patch('frontend_release.Kubernetes') as kubernetes,
+              patch('frontend_release.verify_toolchain'), patch('frontend_release.synchronize_branch', return_value='a'*40),
+              patch('frontend_release.build_archive', return_value=Path('fixture.tar')) as build,
+              patch('frontend_release.archive_config', return_value=self.config_digest),
+              patch('frontend_release.command', return_value=SimpleNamespace(stdout=self.config_digest + ' linux/amd64')) as command,
+              patch('frontend_release.remote_image', side_effect=[{'digest': base_digest}, None, observed, observed]),
+              patch('frontend_release.update_and_verify') as mcp):
+            kube = kubernetes.return_value
+            kube.uid = 'original'
+            kube.preflight.return_value = before
+            kube.current_image.side_effect = [before, after]
+            kube.verify_rollout.side_effect = [DeploymentError('read interrupted'), {'image': after}]
+            with self.assertRaisesRegex(DeploymentError, 'read interrupted'):
+                publish(request, self.journal)
+            publish(request, self.journal)
+            kube.update.assert_called_once_with(before, after)
+            self.assertEqual(kube.verify_rollout.call_count, 2)
+            self.assertEqual(sum(call.args[:2] == ('docker', 'push') for call in command.call_args_list), 1)
+            self.assertEqual(json.loads(self.journal.read_text())['deployment_uid'], 'original')
+            build.assert_called_once()
+            mcp.assert_not_called()
 
     def test_partial_bundle_uses_live_base_and_reuses_harbor_after_rollout_failure(self):
         settings = {**self.request['settings'], 'rancher': {
@@ -191,7 +233,6 @@ class FrontendPublisherTests(unittest.TestCase):
 
         with (patch('frontend_release.verify_toolchain'),
               patch('frontend_release.synchronize_branch', side_effect=lambda _, __, sha: sha),
-              patch('frontend_release.verify_ports_stopped'),
               patch('frontend_release.current_image', return_value=old_ref) as current,
               patch('frontend_release.build_archive', side_effect=build) as archive,
               patch('frontend_release.archive_config', return_value=self.config_digest),
@@ -293,7 +334,6 @@ class FrontendLedgerTests(unittest.TestCase):
             self.assertEqual(sha, self.sha)
             receipt = {'status': 'published', 'image': tag_for(request),
                        'versions': {'shell-hub': sha}, 'remote_versions': {'shell-hub': sha},
-                       'stopped_ports': request['settings']['local_ports'],
                        'base_image': request['settings']['base_image'],
                        'config_digest': FrontendPublisherTests.config_digest, 'digest': FrontendPublisherTests.digest}
             Path(argv[-1]).write_text(encode(receipt), encoding='utf-8')

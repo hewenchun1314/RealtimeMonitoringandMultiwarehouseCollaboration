@@ -29,13 +29,22 @@ def frontend_release_config(config):
     return config['development'].get('frontend_bundle', {}).get('deployment', {})
 
 
-def validate_mcp_target(target, field):
+def validate_rancher_target(target, field):
     if not isinstance(target, dict):
         raise ValueError(f'{field} must be an object')
     for key in ('cluster_id', 'namespace', 'deployment', 'container'):
         value = target.get(key)
         if not isinstance(value, str) or not re.fullmatch(TARGET_FIELDS[key], value):
             raise ValueError(f'{field}.{key} is invalid')
+    if 'kube_server' in target:
+        server = target['kube_server']
+        url = urlsplit(server) if isinstance(server, str) else None
+        if (not url or url.scheme != 'https' or not url.hostname or url.username is not None
+                or url.path != '/k8s/clusters/' + target['cluster_id'] or url.query or url.fragment
+                or not re.fullmatch(TARGET_FIELDS['kube_context'], target.get('kube_context') or '')
+                or 'mcp_url' in target):
+            raise ValueError(f'{field} requires a matching HTTPS Rancher cluster URL and context')
+        return
     address = target.get('mcp_url')
     url = urlsplit(address) if isinstance(address, str) else None
     if (not url or url.scheme not in ('http', 'https') or not url.hostname
@@ -56,10 +65,22 @@ def mcp_rollout_matches(proof, image):
             and len(set(pods)) == ready and set(pods).isdisjoint(previous))
 
 
+def rollout_matches(target, proof, image):
+    if not target.get('kube_server'):
+        return mcp_rollout_matches(proof, image)
+    if not isinstance(proof, dict) or proof.get('image') != image:
+        return False
+    pods, ready = proof.get('pods'), proof.get('ready_replicas')
+    return (bool(proof.get('deployment_uid') and proof.get('revision')) and type(ready) is int and ready > 0
+            and isinstance(pods, list) and len(pods) == ready and all(isinstance(p, str) and p for p in pods)
+            and len(set(pods)) == ready)
+
+
 def release_verification(receipt):
     target = receipt['target']
-    if target.get('mcp_url'):
-        return {'sha': receipt['sha'], 'url': target['health_url'], 'provider': 'rancher_mcp',
+    if target.get('kube_server') or target.get('mcp_url'):
+        provider = 'rancher_api' if target.get('kube_server') else 'rancher_mcp'
+        return {'sha': receipt['sha'], 'url': target['health_url'], 'provider': provider,
                 'image': receipt['image'].rsplit(':', 1)[0] + '@' + receipt['digest']}
     return {'sha': receipt['sha'], 'url': target['gateway_url'].rstrip('/') + target['verification_path']}
 
@@ -81,13 +102,8 @@ def validate_frontend_release(config):
         raise ValueError('frontend_bundle.deployment.base_image must pin the repository digest')
     if release.get('platform') not in ('linux/amd64', 'linux/arm64'):
         raise ValueError('frontend_bundle.deployment.platform is invalid')
-    ports = release.get('local_ports')
-    if (not isinstance(ports, list) or not ports
-            or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
-            or len(set(ports)) != len(ports)):
-        raise ValueError('frontend_bundle.deployment.local_ports must contain unique TCP ports')
     if 'rancher' in release:
-        validate_mcp_target(release['rancher'], 'frontend_bundle.deployment.rancher')
+        validate_rancher_target(release['rancher'], 'frontend_bundle.deployment.rancher')
 
 
 def project_services(config):
@@ -141,8 +157,8 @@ def validate_configured_targets(config):
             if (url.scheme not in ('http', 'https') or not url.hostname or url.username is not None
                     or url.path not in ('', '/') or url.query or url.fragment):
                 raise ValueError(f'{prefix}.gateway_url must be an HTTP origin')
-            if use_mcp:
-                validate_mcp_target(target, prefix)
+            if use_mcp or 'kube_server' in target:
+                validate_rancher_target(target, prefix)
                 health = target.get('health_url')
                 probe = urlsplit(health) if isinstance(health, str) else None
                 if (not probe or probe.scheme not in ('http', 'https') or not probe.hostname
@@ -176,10 +192,10 @@ def deployed_receipt_matches(receipt, service, sha, target):
             and isinstance(image, str) and TAG.fullmatch(image) is not None
             and image.rsplit(':', 1)[0] == f'{target["registry"]}/{target["image_repository"]}'
             and isinstance(probe, dict) and probe.get('sha') == sha)
-    if not common or not target.get('mcp_url'):
+    if not common or not (target.get('mcp_url') or target.get('kube_server')):
         return common
     expected = release_verification(receipt)
-    return probe == expected and mcp_rollout_matches(receipt.get('pod_verification'), expected['image'])
+    return probe == expected and rollout_matches(target, receipt.get('pod_verification'), expected['image'])
 
 
 def release_locks(store, item, *, tags_only=False):

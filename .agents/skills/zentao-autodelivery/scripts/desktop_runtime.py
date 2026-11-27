@@ -1,4 +1,4 @@
-"""Read the effective approval policy of a local Codex desktop chat."""
+"""Read the effective approval policy of a local Codex session."""
 
 import json
 import os

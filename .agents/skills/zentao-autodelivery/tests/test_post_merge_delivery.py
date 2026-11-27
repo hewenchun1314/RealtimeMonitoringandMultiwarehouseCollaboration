@@ -101,13 +101,13 @@ class PostMergeDeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp)
             item = {'marker': 'fixture'}
-            stage = project / '.local/zentao-delivery/items/fixture/frontend/e2e-123'
+            stage = project / '.local/zentao-delivery-v2/items/fixture/frontend/e2e-123'
             stage.mkdir(parents=True)
             config_directory = project / '.agents'
             blocker = {'e2e_blocker': {'stage': 'login', 'reason': 'login unavailable', 'cases': 'not-run'}}
             self.assertIsNone(host_e2e_blocker_error(item, '123', blocker, config_directory, 'failed'))
             (stage / 'host-request.json').write_text('{}', encoding='utf-8')
-            self.assertIn('Wait for the Windows host',
+            self.assertIn('Wait for the host',
                           host_e2e_blocker_error(item, '123', blocker, config_directory, 'failed'))
             (stage / 'host-run/123/e2e-host').mkdir(parents=True)
             receipt = {'marker': 'fixture', 'attempt_id': '123', 'runner': 'agentlimb', 'status': 'blocked',

@@ -3,14 +3,13 @@
 import argparse
 import json
 import sqlite3
-import subprocess
 import sys
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from backend_dependencies import dependency_locations, writable_dependencies
-from branch_check import BRANCH_STAGES, branch_context, inspect_branches, prepare_local_worktree, valid_evidence
+from branch_check import BRANCH_STAGES, branch_context, inspect_branches, valid_evidence
 from claim import reserve, save_scan
 from desktop_runtime import runtime_check
 from dingtalk_notify import dispatch as dispatch_dingtalk, enabled as dingtalk_enabled, enqueue_notification
@@ -21,19 +20,14 @@ from execution import (
 from ledger import Ledger, encode, message, require_mapping, require_text, transaction, validate_config
 from material_sync import requirement_checkout, sync_requirement
 from route_execution import snapshot
+from runtime_paths import CONFIG_PATH, DATABASE_PATH, PROJECT_ROOT
 from status_board import publish_status
-from task_sync import reconcile_missing
 from development_git import ACTIONS as HOST_GIT_ACTIONS, request_host_git, host_git_status
-from writeback import authorize_writeback, claim_writeback, confirm_writeback, find_entry, reconcile_writeback
+from writeback import authorize_writeback, claim_writeback, confirm_writeback, reconcile_writeback
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-CONFIG_PATH = PROJECT_ROOT / '.agents' / 'zentao-project.json'
-DATABASE_PATH = PROJECT_ROOT / '.local' / 'zentao-delivery' / 'workflow.sqlite3'
 
 CLAIM_ACTIONS = {'scan': save_scan, 'reserve': reserve}
 RECORD_ACTIONS = {
-    'task_reconcile_missing': reconcile_missing,
     'bind': bind,
     'start': start,
     'attempt_start': attempt_start,
@@ -203,25 +197,10 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
     if command == 'record' and action == 'material_sync':
         return sync_material_attempt(database, config, data, now, config_directory)
     check_time = now or datetime.now(timezone.utc)
-    if command == 'record' and action in ('branch_inspect', 'branch_prepare'):
+    if command == 'record' and action == 'branch_inspect':
         context = read_branch_attempt(database, config, data, check_time, config_directory)
         if context is None:
             return message('branch_attempt_inactive')
-        if action == 'branch_prepare':
-            reconciliation = data.get('desktop_reconciliation')
-            if (not isinstance(reconciliation, dict) or reconciliation.get('status') not in
-                    ('no_receipt', 'failed', 'unavailable') or not reconciliation.get('evidence')):
-                return message('desktop_reconciliation_required')
-            field = 'service' if context.get('side') == 'backend' else 'application'
-            app = require_text(data.get(field), field)
-            budget = (datetime.fromisoformat(context['deadline_at']) - check_time).total_seconds()
-            try:
-                repo = prepare_local_worktree(context, config_directory, database, app, budget)
-            except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
-                return message('branch_prepare_failed', **{field: app}, reason=str(exc))
-            status = 'branch_prepared' if repo['status'] == 'verified' else 'branch_prepare_blocked'
-            return message(status, **{field: app}, repository=repo, backend='git',
-                           desktop_reconciliation=reconciliation)
         worktrees = require_mapping(data.get('worktrees', {}), 'worktrees')
         if worktrees.keys() - context['branch_targets'].keys():
             raise ValueError('Every worktree must match a planned application')
@@ -263,12 +242,6 @@ def run(command, data, config, database, *, now=None, config_directory=CONFIG_PA
                 response['replayed'] = True
             return response
         item = store.find_item(data.get('item'))
-        if action.startswith('writeback_'):
-            operation_type = find_entry(store, item, data)['operation_type']
-            if operation_type.startswith('task_'):
-                return message('task_sync_required')
-            if operation_type == 'story_review':
-                return message('story_review_worker_required')
         if action == 'attempt_finish':
             response = attempt_finish(store, item, data, branches_verified=branches_verified,
                                       config_directory=config_directory)
@@ -295,6 +268,9 @@ def main(argv=None):
         config = json.loads(args.config.read_text(encoding='utf-8-sig'))
         data = json.loads(sys.stdin.buffer.read().decode('utf-8-sig'))
         response = run(args.command, data, config, args.database, config_directory=args.config.resolve().parent)
+        if args.command == 'record':
+            from git_broker import wait_for_receipt
+            response = wait_for_receipt(response, data, args.database, config, args.config.resolve().parent)
         if data['action'] != 'runtime_check' and args.database.resolve() == DATABASE_PATH and args.database.is_file():
             try:
                 publish_status(DATABASE_PATH, config)

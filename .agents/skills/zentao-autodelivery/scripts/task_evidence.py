@@ -72,15 +72,27 @@ def validate_merge_tests(mapping, changed, reviews, success):
     return None
 
 
+def register_split(store, item, route):
+    from ledger import encode
+
+    entries = [(task['id'], side, task) for side, tasks in route['tasks'].items() for task in tasks]
+    owners = {key: side for key, side, _ in entries}
+    existing = store.conn.execute('SELECT task_key,side FROM split_tasks WHERE item_seq=?', (item['seq'],))
+    if any(owners.get(row['task_key']) != row['side'] for row in existing):
+        raise ValueError('A revised split must retain every registered task ID on its original side')
+    for key, side, task in entries:
+        store.conn.execute("""INSERT INTO split_tasks(item_seq,task_key,side,definition)
+                              VALUES(?,?,?,?) ON CONFLICT(item_seq,task_key)
+                              DO UPDATE SET definition=excluded.definition""",
+                           (item['seq'], key, side, encode(task)))
+
+
 def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_blockers=None):
     """Validate and enrich a receipt before the existing transaction records the stage."""
-    import task_sync
     from branch_check import git
     from route_evidence import frontend_acceptance_versions, repository_evidence
     from route_execution import blocked_tasks, handoff_tasks, read_history, stage_evidence
 
-    if not task_sync.enabled(item):
-        return None
     if stage == 'split' and success:
         for side, tasks in route['tasks'].items():
             for task in tasks:
@@ -90,12 +102,14 @@ def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_b
         # Registration must remain atomic even when invalid revisions return an evidence response.
         store.conn.execute('SAVEPOINT register_tasks')
         try:
-            task_sync.register_split(store, item, route)
+            register_split(store, item, route)
         except ValueError as error:
             store.conn.execute('ROLLBACK TO register_tasks')
             return str(error)
         finally:
             store.conn.execute('RELEASE register_tasks')
+        return None
+    if not store.conn.execute('SELECT 1 FROM split_tasks WHERE item_seq=? LIMIT 1', (item['seq'],)).fetchone():
         return None
     side, _, leaf = stage.partition('.')
     if leaf not in ('plan', 'e2e', 'acceptance', 'integration') or not isinstance(evidence, dict):
@@ -104,12 +118,27 @@ def prepare_receipt(store, item, stage, evidence, success, route=None, *, task_b
     if task_blockers:
         stages[stage] = {'task_blockers': task_blockers}
     blocked = blocked_tasks(route, stages)
+    if success and leaf == 'plan' and 'task_repositories' not in evidence:
+        # An aggregate plan makes every active task depend on the whole repository set.
+        # Explicit mappings allow partial delivery when only some repositories are ready.
+        keys = set(_tasks(route, side)) - set(blocked)
+        if side == 'frontend':
+            keys.update(key for key, task in _tasks(route, 'backend').items()
+                        if task.get('joint_acceptance') and key not in blocked)
+        repositories = evidence.get('services' if side == 'backend' else 'applications')
+        if isinstance(repositories, list):
+            evidence['task_repositories'] = {key: list(repositories) for key in sorted(keys)}
+    if (success and leaf in ('e2e', 'acceptance') and 'task_results' not in evidence
+            and isinstance(evidence.get('verified_tasks'), list) and _nonblank(evidence.get('verification'))):
+        evidence['task_results'] = {key: {'outcome': 'passed', 'verification': evidence['verification']}
+                                    for key in evidence['verified_tasks']}
     reason = validate_task_fields(route, stage, evidence, success, blocked)
     if reason:
         return reason
     # The existing successful acceptance path checks these versions. Failed stages can
     # still contribute independent passed tasks, so they need the same version checks.
-    if not success and leaf in ('e2e', 'acceptance') and evidence.get('task_results'):
+    if (not success and leaf in ('e2e', 'acceptance') and any(
+            entry['outcome'] == 'passed' for entry in (evidence.get('task_results') or {}).values())):
         coding = stage_evidence(store, item, side + '.coding') or {}
         expected = frontend_acceptance_versions(store, item, route) if leaf == 'e2e' else coding.get('versions')
         if not expected or expected != evidence.get('versions'):
@@ -257,7 +286,7 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
                      'dependencies': task.get('depends_on', [])}
             if key in blocked:
                 facts['blocked'] = blocked[key]
-                decisions[key] = ('open', blocked[key]['reason'], facts)
+                decisions[key] = ('open', progress_note(key, side, stages, blocked), facts)
                 continue
             previous = (history or {}).get(key, {})
             if any(previous.get(field) != value for field, value in facts.items()):
@@ -308,16 +337,9 @@ def evaluate(route, stages, history=None, *, deployment_targets=None):
     return decisions
 
 
-def progress_note(task, side, facts, stages, blocked):
-    """Describe an evidenced blocker without turning a dependency wait into an actual start."""
-    block = facts.get('blocked')
-    if not block:
-        for stage in ('frontend.e2e', 'backend.acceptance'):
-            receipt = stages.get(stage, {})
-            result = _receipt(stages, stage, partial=True).get('task_results', {}).get(task, {})
-            if receipt.get('terminal_step') and result.get('outcome') in ('failed', 'pending'):
-                return '联调或验收待通过：' + result['verification'][:300] + '。待问题处理后复验。'
-        return None
+def progress_note(task, side, stages, blocked):
+    """Describe the local task's blocker and retain any verified deployment progress."""
+    block = blocked[task]
     dependencies = block.get('depends_on')
     if dependencies:
         reasons = ['%s（%s）' % (key, blocked[key]['reason']) for key in dependencies]
@@ -340,24 +362,20 @@ def progress_note(task, side, facts, stages, blocked):
 
 
 def refresh(store, item):
-    import task_sync
     from deploy_state import configured_targets
     from route_execution import read_history, snapshot
 
-    if not task_sync.enabled(item):
-        return
     route, stages = read_history(store, item)
     if not route:
         return
+    if not store.conn.execute('SELECT 1 FROM split_tasks WHERE item_seq=? LIMIT 1', (item['seq'],)).fetchone():
+        return
     prior = {row['task_key']: row for row in store.conn.execute(
-        '''SELECT e.*,t.side,t.remote_status FROM task_evidence e JOIN split_tasks t USING(item_seq,task_key)
+        '''SELECT e.*,t.side FROM task_evidence e JOIN split_tasks t USING(item_seq,task_key)
            WHERE e.item_seq=?''', (item['seq'],))}
     history = {key: json.loads(row['evidence']) for key, row in prior.items()}
     targets = configured_targets(snapshot(item)) if DEPLOY_STAGE in route['stages'] else {}
     decisions = evaluate(route, stages, history, deployment_targets=targets)
-    progress = task_sync.progress_enabled(item)
-    blocked = {key: facts['blocked'] for key, (_, _, facts) in decisions.items() if 'blocked' in facts}
-    sides = {task['id']: side for side, tasks in route['tasks'].items() for task in tasks}
     for task, (desired, reason, facts) in decisions.items():
         previous = prior.get(task)
         if previous:
@@ -378,7 +396,7 @@ def refresh(store, item):
             changed_scope = any(
                 component in facts and set(facts[component]['repositories']) != set(old.get(component, {}).get('repositories', []))
                 for component in ('backend', 'frontend'))
-            if (previous['disposition'] == 'closed' and (previous['remote_status'] == 'closed' or not changed_versions)
+            if (previous['disposition'] == 'closed' and not changed_versions
                     and same_criteria and not changed_scope and desired == 'open' and not facts.get('joint_failure')
                     and not facts.get('deployment_pending') and not facts.get('push_pending') and not facts.get('blocked')
                     and acceptance.get('outcome') != 'failed'):
@@ -387,19 +405,13 @@ def refresh(store, item):
             VALUES(?,?,?,?,?) ON CONFLICT(item_seq,task_key) DO UPDATE SET disposition=excluded.disposition,
             reason=excluded.reason,evidence=excluded.evidence''',
                            (item['seq'], task, desired, reason, json.dumps(facts, ensure_ascii=False)))
-        task_sync.set_desired(store, item, task, desired)
-        if desired == 'open' and progress:
-            note = progress_note(task, sides[task], facts, stages, blocked)
-            if note:
-                task_sync.record_note(store, item, task, note)
+        store.conn.execute('UPDATE split_tasks SET desired=? WHERE item_seq=? AND task_key=?',
+                           (desired, item['seq'], task))
 
 
 def first_unverified_stage(store, item):
-    import task_sync
     from route_execution import get_split
 
-    if not task_sync.enabled(item):
-        return None
     task = store.conn.execute('''SELECT t.side,e.evidence FROM split_tasks t LEFT JOIN task_evidence e
         USING(item_seq,task_key) WHERE t.item_seq=? AND COALESCE(e.disposition,'open') <> 'closed'
         ORDER BY t.side,t.task_key LIMIT 1''', (item['seq'],)).fetchone()

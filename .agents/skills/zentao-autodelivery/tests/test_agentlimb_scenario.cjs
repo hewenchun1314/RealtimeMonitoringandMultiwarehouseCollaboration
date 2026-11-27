@@ -36,6 +36,33 @@ test('declared actions call browser operations and evaluate an escaped selector'
   ]);
 });
 
+test('a visible title cannot pass a case when required page data is missing', async t => {
+  const run = scenario(t, [{ action: 'navigate', path: '/plot' },
+    { action: 'wait-for', selector: '.depth', name: 'crossplot-profile-depth', timeout_ms: 0 },
+    { action: 'assert-visible', selector: 'h2' }]);
+  const browser = { navigate: async () => {}, evaluate: async expression => !expression.includes('".depth"') };
+  await assert.rejects(run({ browser }), error =>
+    error.scenario_cases[0].status === 'blocked' && error.scenario_cases[0].check === 'crossplot-profile-depth');
+  const results = await run({ browser: { ...browser, evaluate: async () => true } });
+  assert.equal(results[0].status, 'passed');
+});
+
+test('a case can reveal data in a virtual list inside an iframe', async t => {
+  const run = scenario(t, [
+    { action: 'wait-for', selector: '.sample', scroll_container: '.list', timeout_ms: 2000 },
+    { action: 'assert-count', selector: '.sample', count: 1 }]);
+  const pane = { scrollHeight: 200, clientHeight: 40, scrollTop: 0, getClientRects: () => [1] };
+  const sample = { getClientRects: () => [1] };
+  const frame = { tagName: 'IFRAME', contentDocument: { querySelectorAll(selector) {
+    if (selector === '.list') return [pane];
+    return selector === '.sample' && pane.scrollTop > 0 ? [sample] : [];
+  } } };
+  const globals = { document: { querySelectorAll: selector => selector === '*' ? [frame] : [] },
+    getComputedStyle: () => ({ visibility: 'visible' }) };
+  const result = await run({ browser: { evaluate: async expression => require('node:vm').runInNewContext(expression, globals) } });
+  assert.equal(result[0].status, 'passed');
+});
+
 test('unsupported script, navigation, and unexpected arguments are rejected', t => {
   for (const step of [
     { action: 'eval', expression: "require('node:fs')" },
@@ -96,4 +123,22 @@ test('each page is attested before business assertions are allowed', async t => 
     evaluate: async () => { calls.push('assert'); return true; },
   }, verifyResources: async () => calls.push('attest') });
   assert.deepEqual(calls, ['/one', 'attest', 'assert', '/two', 'attest', 'assert']);
+});
+
+
+test('scenario can assert computed font size and weight', async t => {
+  const { runInNewContext } = require('node:vm');
+  const run = scenario(t, [
+    { action: 'assert-style', selector: 'h2', property: 'font-size', value: '14px', timeout_ms: 0 },
+    { action: 'assert-style', selector: 'h2', property: 'font-weight', value: '400', timeout_ms: 0 },
+  ]);
+  const title = { getClientRects: () => [1] };
+  const browser = { async evaluate(expression) {
+    return runInNewContext(expression, {
+      document: { querySelectorAll: selector => selector === 'h2' ? [title] : [] },
+      getComputedStyle: () => ({ visibility: 'visible',
+        getPropertyValue: name => ({ 'font-size': '14px', 'font-weight': '400' })[name] }),
+    });
+  } };
+  assert.deepEqual(await run({ browser }), [{ name: 'scenario', status: 'passed' }]);
 });

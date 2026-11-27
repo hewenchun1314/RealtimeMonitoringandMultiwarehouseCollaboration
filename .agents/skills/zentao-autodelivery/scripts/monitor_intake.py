@@ -35,6 +35,10 @@ def normalized(kind, row):
     assigned = row.get('assignedTo')
     if isinstance(assigned, dict):
         assigned = assigned.get('account')
+    if assigned is None:
+        assigned = ''
+    if not isinstance(assigned, str):
+        raise ValueError('Invalid assignee in ZenTao response')
     return {'kind': kind, 'id': object_id(row.get('id')), 'title': row['title'],
             'assigned_to': assigned, 'status': row['status'], 'priority': row.get('pri'),
             'source': source_of(row, project_optional=kind == 'story'),
@@ -110,7 +114,8 @@ def verify_candidate(config, session, item):
     kind = item['kind']
     plural = {'story': 'stories', 'bug': 'bugs'}[kind]
     data = session._v2('GET', f'/{plural}/{item["id"]}')
-    row = normalized(kind, data.get(kind, data))
+    original = data.get(kind, data)
+    row = normalized(kind, original)
     if row['id'] != str(item['id']) or item['instance'].rstrip('/') != config['zentao']['base_url'].rstrip('/'):
         raise ValueError('Candidate detail identity mismatch')
     if (kind == 'story' and row['source']['project_id'] is None and
@@ -118,5 +123,16 @@ def verify_candidate(config, session, item):
         members = pages(session, f'/projects/{item["project_id"]}/stories', 'stories', [])
         if any(object_id(member.get('id')) == row['id'] for member in members):
             row['source']['project_id'] = str(item['project_id'])
-    return {**{key: value for key, value in row.items() if key != 'deleted'},
-            'eligible': eligible(config['zentao'], item['project_id'], row)}
+    admitted = eligible(config['zentao'], item['project_id'], row)
+    result = {**{key: value for key, value in row.items() if key != 'deleted'}, 'eligible': admitted}
+    if admitted:
+        fields = ('title', 'spec', 'verify') if kind == 'story' else ('title', 'steps')
+        materials = {key: original[key] for key in fields if isinstance(original.get(key), str)}
+        files = original.get('files') or []
+        if isinstance(files, dict):
+            files = files.values()
+        materials['files'] = [{'id': str(f['id']), 'title': f['title']} for f in files
+                              if isinstance(f, dict) and str(f.get('id', '')).isdecimal()
+                              and isinstance(f.get('title'), str)]
+        result['materials'] = materials
+    return result

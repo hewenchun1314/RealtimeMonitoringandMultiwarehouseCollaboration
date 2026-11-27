@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { once } = require('node:events');
-const { mkdtempSync, rmSync, writeFileSync } = require('node:fs');
+const { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } = require('node:fs');
 const { createServer } = require('node:http');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
@@ -224,4 +224,119 @@ test('a page that mounts only in the foreground is checked and the original tab 
   const result = await runSession(call, profile);
   assert.equal(result.status, 'passed');
   assert.deepEqual(actions, [['tab_activate', 41], ['tab_activate', 9], ['tab_close', 41]]);
+});
+
+test('automatic version proof observes both apps from the current launch without refetching', async () => {
+  let url;
+  const token = 'a'.repeat(32);
+  const asset = (app, port, launched = token) => ({
+    name: 'http://localhost:' + port + '/' + app + '.js',
+    serverTiming: [{ name: 'zentao-launch', description: launched + '.' + app }],
+  });
+  const assets = [asset('shell', 5000), asset('charts', 30043)];
+  const browser = {
+    async navigate(value) { url = value; },
+    async evaluate(expression) {
+      if (expression.includes('workArea:')) return { url, workArea: 'QA' };
+      if (expression.includes('fetch(')) assert.fail('separate request');
+      if (expression.includes('serverTiming')) {
+        return runInNewContext(expression, { URL, window: {
+          frames: [], performance: { getEntriesByType: () => assets },
+        } });
+      }
+      return true;
+    },
+  };
+  const options = { ...profile, postMerge: true, checks: [],
+    launchProof: { token, apps: ['shell', 'charts'], ports: [5000, 30043] } };
+  const outcome = await checkPage(browser, options, async ({ verifyResources }) => {
+    assert.equal((await verifyResources()).length, 2);
+  });
+  assert.deepEqual(Array.from(outcome.candidate_resources, resource => resource.app), ['shell', 'charts']);
+  assets.push(asset('charts', 30043, 'older-launch'));
+  const stale = await checkPage(browser, options, async ({ verifyResources }) => {
+    await verifyResources();
+    assert.fail('verified a stale cached asset');
+  });
+  assert.deepEqual(stale, { status: 'blocked', stage: 'candidate-resource', repair_required: false, check: 'charts' });
+});
+
+test('automatic version proof never starts assertions if the candidate app is missing', async () => {
+  let url;
+  const browser = {
+    async navigate(value) { url = value; },
+    async evaluate(expression) {
+      if (expression.includes('workArea:')) return { url, workArea: 'QA' };
+      if (expression.includes('serverTiming')) return { missing: ['charts'] };
+      return true;
+    },
+  };
+  const missing = await checkPage(browser, { ...profile, postMerge: true,
+    launchProof: { token: 'a'.repeat(32), apps: ['charts'], ports: [30043] },
+  }, async ({ verifyResources }) => {
+    await verifyResources();
+    assert.fail('verified absent application');
+  });
+  assert.deepEqual(missing, { status: 'blocked', stage: 'candidate-resource', repair_required: false, check: 'charts' });
+});
+
+test('the current launch marks JavaScript responses without buffering or changing their bytes', async () => {
+  const { stampLaunchResponse } = require('../scripts/agentlimb_resource_witness.cjs');
+  const token = 'a'.repeat(32);
+  const server = createServer((request, response) => {
+    stampLaunchResponse(response, 'http://localhost:5000', token + '.charts', '');
+    response.writeHead(200, { 'Content-Type': request.url === '/app.js' ? 'text/javascript' : 'text/html',
+      'Server-Timing': 'compile;dur=2', 'Cache-Control': 'public' });
+    response.write('window.');
+    response.end('charts = true');
+  }).listen(0, '127.0.0.1');
+  try {
+    await once(server, 'listening');
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    const response = await fetch(origin + '/app.js');
+    assert.equal(response.headers.get('server-timing'), 'compile;dur=2, zentao-launch;desc="' + token + '.charts"');
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(await response.text(), 'window.charts = true');
+    const html = await fetch(origin + '/index.html');
+    assert.equal(html.headers.get('server-timing'), 'compile;dur=2');
+    await html.text();
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+
+test('inherited preload attests only the app served from the isolated checkout', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'agentlimb-launch-'));
+  t.after(() => rmSync(directory, { recursive: true }));
+  const checkout = join(directory, 'app');
+  mkdirSync(checkout);
+  const probe = createServer().listen(0, '127.0.0.1');
+  await once(probe, 'listening');
+  const { port } = probe.address();
+  await new Promise(resolve => probe.close(resolve));
+  const token = 'a'.repeat(32);
+  const script = [
+    "const { createServer } = require('node:http');",
+    "const server = createServer((req,res) => { res.setHeader('Content-Type','text/javascript'); res.end('ok'); });",
+    "server.listen(" + port + ", '127.0.0.1', async () => {",
+    "  const reply = await fetch('http://127.0.0.1:" + port + "/app.js', { headers: { 'If-None-Match': 'old' } });",
+    "  await reply.text();",
+    "  console.log(reply.headers.get('server-timing')); server.close();",
+    "});",
+  ].join('\n');
+  const env = { ...process.env, ZENTAO_E2E_WITNESS: JSON.stringify({
+    origin: 'http://localhost:5000', resources: [],
+    launch: { token, ports: [port], roots: { [realpathSync.native(checkout)]: 'charts' } },
+  }) };
+  const witness = require.resolve('../scripts/agentlimb_resource_witness.cjs');
+  function run(cwd) {
+    const processResult = spawnSync(process.execPath, ['--require', witness, '-e', script], {
+      cwd, env, encoding: 'utf8', timeout: 5000,
+    });
+    assert.equal(processResult.status, 0, processResult.stderr || String(processResult.error));
+    return processResult.stdout.trim();
+  }
+  assert.equal(run(checkout), 'zentao-launch;desc="' + token + '.charts"');
+  assert.equal(run(directory), 'null');
 });

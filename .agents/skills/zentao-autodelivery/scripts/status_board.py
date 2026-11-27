@@ -16,16 +16,13 @@ from route_execution import read_history
 
 
 SECTIONS = (
-    ('执行中', ('reserved', 'bound', 'running', 'closing', 'review_handoff')),
-    ('等待禅道评审', ('review_wait', 'review_ready')),
+    ('执行中', ('reserved', 'bound', 'running', 'closing')),
     ('排队中', ('queued', 'dispatch_uncertain')),
     ('已收尾', ('completed',)),
 )
 STATES = {
     'reserved': '已领取', 'bound': '待启动', 'running': '执行中', 'closing': '收尾中',
-    'queued': '排队中', 'dispatch_uncertain': '待核对派发', 'completed': '已收尾',
-    'review_wait': '等待禅道评审', 'review_ready': '评审已核对，待续接',
-    'review_handoff': '等待评审执行交接',
+    'queued': '排队中', 'dispatch_uncertain': '待核对原会话创建回执', 'completed': '已收尾',
 }
 
 
@@ -35,63 +32,47 @@ def local_time(value):
     return datetime.fromisoformat(value).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
 
 
-def task_progress(tasks, base_url):
+def task_progress(tasks):
     if not tasks:
         return '—'
     delivered = sum(task['desired'] == 'closed' for task in tasks)
-    closed = sum(task['remote_status'] == 'closed' for task in tasks)
     details = []
     for task in tasks:
-        task_id = task['remote_id']
-        link = '待建单'
-        if task_id:
-            url = base_url + '/index.php?' + urlencode({'m': 'task', 'f': 'view', 'taskID': task_id})
-            link = f'<a href="{escape(url, quote=True)}">#{escape(str(task_id))}</a>'
-        status = task['remote_status'] or '待建单'
-        pending = ''
-        if task_id and task['desired'] == 'closed' and status != 'closed':
-            pending = ' · 待关闭'
-        elif task_id and task['desired'] == 'open' and status == 'closed':
-            pending = ' · 待重开'
-        description = json.loads(task['definition']).get('description', '')
-        remote = {'closed': '已关闭', 'done': '已完成', 'wait': '未开始', 'doing': '进行中'}.get(status, status)
-        state = '待交付'
-        if task['desired'] == 'closed':
-            state = '已合回，页面验收已跳过' if task.get('e2e_skipped') else '已验收并合回'
-        reason = task.get('evidence_reason') or ''
-        error = task['last_error'] or ''
         side = '前端' if task['side'] == 'frontend' else '后端'
-        fields = [task['task_key'], side, description, state, reason, '迭代 ' + str(task['execution_id'] or '待定'),
-                  '指派 ' + (task['assignee'] or '待定'), remote + pending, error]
-        details.append('<li>' + link + ' · ' + ' · '.join(escape(str(part)) for part in fields if part) + '</li>')
-    return (f'<details><summary>研发 {delivered}/{len(tasks)} · 禅道已关闭 {closed}/{len(tasks)}</summary>'
+        description = json.loads(task['definition']).get('description', '')
+        fields = [task['task_key'], side, description, task['reason'] or '待交付']
+        details.append('<li>' + ' · '.join(escape(str(part)) for part in fields if part) + '</li>')
+    return (f'<details><summary>已交付 {delivered}/{len(tasks)}</summary>'
             f'<ul>{"".join(details)}</ul></details>')
 
 
 def table_row(item, base_url, delivery='', tasks=()):
+    item = dict(item)
     kind = item['kind']
     url = f'{base_url}/index.php?' + urlencode({'m': kind, 'f': 'view', f'{kind}ID': item['item_id']})
     item_type = 'Bug' if kind == 'bug' else '需求'
     label = f'{item_type} #{item["item_id"]} {item["title"] or ""}'.rstrip()
     status = item['conclusion'] or STATES[item['state']]
-    if item['state'] == 'queued' and item['dispatch_state'] == 'runtime_blocked':
+    if item['state'] == 'queued' and item.get('dispatch_state') == 'runtime_blocked':
         status = '待核验无人值守权限'
+    if item['state'] == 'queued' and item.get('intake_retry'):
+        status = item['intake_retry']
     progress = STAGE_NAMES.get(item['stage'], '—')
-    if item['state'] in ('review_wait', 'review_ready') and item['review_receipt']:
-        review = json.loads(item['review_receipt'])
-        if review.get('progress') == 'waiting_votes':
-            progress = '已提交通过，等待其他评审结果'
-        elif review.get('reason'):
-            progress = review['reason']
     if item['retry_number'] is not None:
         progress += f'（第 {item["retry_number"] + 1} 次尝试）'
         if item['phase'] and item['phase'] != 'verify':
             progress += ' → ' + STAGE_NAMES.get(item['phase'], item['phase'])
     pending = str(item['pending']) if item['pending'] else '—'
+    if item.get('pending_reasons'):
+        pending += '<br>' + '<br>'.join(escape(line) for line in item['pending_reasons'].splitlines())
+    log = ''
+    if item.get('marker') and item.get('request_id'):
+        marker = escape(item['marker'], quote=True)
+        log = f'<br><a href="items/{marker}/dispatch.log">派单日志</a>'
     return (
         f'<tr><td><a href="{escape(url, quote=True)}">{escape(label)}</a></td>'
-        f'<td>{escape(status)}</td><td>{escape(progress)}</td><td>{escape(delivery) or "—"}</td>'
-        f'<td>{task_progress(tasks, base_url)}</td><td>{pending}</td></tr>'
+        f'<td>{escape(status)}{log}</td><td>{escape(progress)}</td><td>{escape(delivery) or "—"}</td>'
+        f'<td>{task_progress(tasks)}</td><td>{pending}</td></tr>'
     )
 
 
@@ -104,12 +85,13 @@ def publish_status(database, config):
         scan = conn.execute('SELECT project_id,observed_at FROM scans WHERE instance=? AND project_name=?',
                             scope).fetchone()
         rows = [] if scan is None else conn.execute('''
-            SELECT w.*, a.retry_number, a.phase, d.state AS dispatch_state,
-                   (SELECT b.receipt FROM writebacks b WHERE b.item_seq=w.seq AND b.run_round=w.run_round
-                    AND b.operation_type='story_review' LIMIT 1) AS review_receipt,
+            SELECT w.*, r.reason AS intake_retry, a.retry_number, a.phase, d.state AS dispatch_state,
+                   (SELECT group_concat(b.operation_id || ' ' || b.last_error, char(10)) FROM writebacks b
+                    WHERE b.item_seq=w.seq AND b.state IN ('pending','leased','sending') AND b.last_error IS NOT NULL) AS pending_reasons,
                    (SELECT COUNT(*) FROM writebacks b WHERE b.item_seq=w.seq
-                    AND b.state NOT IN ('confirmed','superseded')) AS pending
+                    AND b.state IN ('pending','leased','sending')) AS pending
             FROM work_items w
+            LEFT JOIN intake_retries r ON r.item_seq=w.seq
             LEFT JOIN attempts a ON a.item_seq=w.seq AND a.outcome IS NULL
             LEFT JOIN dispatches d ON d.request_id=w.request_id
             WHERE w.instance=? AND w.project_id=? AND w.kind IN ('story', 'bug')
@@ -118,16 +100,11 @@ def publish_status(database, config):
         summaries = {row['seq']: delivery_summary(*read_history(store, row)) for row in rows
                      if row['config_snapshot'] and json.loads(row['config_snapshot']).get('workflow_version') == 2}
         tasks = {}
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if scan and 'split_tasks' in tables:
-            join = ('LEFT JOIN task_evidence e ON e.item_seq=t.item_seq AND e.task_key=t.task_key'
-                    if 'task_evidence' in tables else '')
-            reason = 'e.reason' if join else 'NULL'
-            skipped = "json_extract(e.evidence, '$.e2e_skipped')" if join else 'NULL'
-            for task in conn.execute(f'''SELECT t.*, {reason} AS evidence_reason, {skipped} AS e2e_skipped
-                    FROM split_tasks t
-                    JOIN work_items w ON w.seq=t.item_seq {join}
-                    WHERE w.instance=? AND w.project_id=? AND w.kind='story'
+        if scan:
+            for task in conn.execute('''SELECT t.*, e.reason FROM split_tasks t
+                    JOIN work_items w ON w.seq=t.item_seq
+                    LEFT JOIN task_evidence e USING(item_seq,task_key)
+                    WHERE w.instance=? AND w.project_id=?
                     ORDER BY t.item_seq,t.task_key''', (scope[0], scan['project_id'])):
                 tasks.setdefault(task['item_seq'], []).append(dict(task))
     sections = []
@@ -169,6 +146,6 @@ table{{border-collapse:collapse;width:100%;text-align:left}}th,td{{padding:10px;
 
 
 if __name__ == '__main__':
-    root = Path(__file__).resolve().parents[4]
-    config = json.loads((root / '.agents/zentao-project.json').read_text(encoding='utf-8-sig'))
-    print(publish_status(root / '.local/zentao-delivery/workflow.sqlite3', config))
+    from workflow import CONFIG_PATH, DATABASE_PATH
+    config = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
+    print(publish_status(DATABASE_PATH, config))
